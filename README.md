@@ -29,7 +29,7 @@ and put it under the `./data` directory.
 converts them to instances of `MoleculeDesign` (the class in `molecule_design.py`, which takes the role of the molecular graph environment).
 The pickled molecules are saved in `./data/pretrain_data.pickle`.
 3. Run `$ python pretrain.py` to perform pretraining of the model. The general config to use (e.g., architecture) is under `config.py`.
-In `pretrain.py`, you can specify pretrain-specific options directly at the entrypoint, i.e.:
+In `pretrain.py`, you can specify pretrain-specific options directly at the entrypoint to adjust to your hardware, i.e.:
 ```python
 if __name__ == '__main__':
     pretrain_train_dataset = "./data/pretrain_data.pickle"  # Path to the pretraining dataset
@@ -37,6 +37,7 @@ if __name__ == '__main__':
     batch_size = 128  # Minibatch size
     num_batches_per_epoch = 2500   # Number of minibatches per epoch.
     training_device = "cuda:0"  # Device on which to train. Set to "cpu" if no CUDA available.
+    num_dataloader_workers = 30  # Number of dataloader workers for creating batches for training
     load_checkpoint_from_path = None   # Path to checkpoint if training should be continued from existing weights.
 ```
 4. The terminal output will show under which subdirectory (named after timestamp) in `./results` the script will save the model checkpoints.

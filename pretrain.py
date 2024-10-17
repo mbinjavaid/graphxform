@@ -3,6 +3,7 @@ import copy
 import importlib
 import os
 import time
+import gc
 
 from torch.nn import CrossEntropyLoss
 from torch.optim.lr_scheduler import LambdaLR
@@ -31,7 +32,7 @@ def train_for_one_epoch(epoch: int, config: MoleculeConfig, network: MoleculeTra
     print("---- Loading dataset")
 
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=config.num_dataloader_workers,
-                            pin_memory=True, persistent_workers=True)
+                            pin_memory=False, persistent_workers=True)
     metrics = dict()
     # Train for one epoch
     network.train()
@@ -90,15 +91,19 @@ def train_for_one_epoch(epoch: int, config: MoleculeConfig, network: MoleculeTra
     metrics["loss_level_one"] = accumulated_loss_lvl_one / num_batches
     metrics["loss_level_two"] = accumulated_loss_lvl_two / num_batches
 
+    torch.cuda.empty_cache()
+    gc.collect()
+
     return metrics
 
 
 if __name__ == '__main__':
-    pretrain_train_dataset = "./data/pretrain_data.pickle"
-    pretrain_num_epochs = 1000
-    batch_size = 128
-    num_batches_per_epoch = 2500
-    training_device = "cuda:0"
+    pretrain_train_dataset = "./data/pretrain_data.pickle"  # Path to the pretraining dataset
+    pretrain_num_epochs = 1000  # For how many epochs to train
+    batch_size = 128  # Minibatch size. Adjust to your resources. (~32 for 24GB VRAM)
+    num_batches_per_epoch = 2500  # Number of minibatches per epoch.
+    training_device = "cuda:0"  # Device on which to train. Set to "cpu" if no CUDA available.
+    num_dataloader_workers = 30  # Number of dataloader workers for creating batches for training
     load_checkpoint_from_path = None
 
     print(">> Pretraining Molecule Design")
@@ -114,6 +119,7 @@ if __name__ == '__main__':
     config = MoleculeConfig()
     print(f"Results path: {config.results_path}")
     config.training_device = training_device
+    config.num_dataloader_workers = num_dataloader_workers
     config.max_num_atoms = None
     config.disallow_oxygen_bonding = False
     config.disallow_nitrogen_nitrogen_single_bond = False

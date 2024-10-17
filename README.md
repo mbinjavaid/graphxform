@@ -1,6 +1,6 @@
-# Graph transformer for computer-aided design of biphasic reaction solvents
+# GraphXForm: Graph transformer for computer-aided molecular design with application to extraction
 
-This is the repository for the paper **[Graph transformer for computer-aided design of biphasic reaction solvents](arxiv.org)**.
+This is the repository for the paper **[GraphXForm: Graph transformer for computer-aided molecular design with application to extraction](arxiv.org)**.
 
 ## Preliminary note on structure
 

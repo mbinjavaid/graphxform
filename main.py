@@ -13,6 +13,7 @@ from logger import Logger
 from molecule_dataset import RandomMoleculeDataset
 
 os.environ["RAY_DEDUP_LOGS"] = "0"
+os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
 import ray
 import torch
 import numpy as np

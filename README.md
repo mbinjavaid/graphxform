@@ -1,6 +1,6 @@
 # GraphXForm: Graph transformer for computer-aided molecular design with application to extraction
 
-This is the repository for the paper **[GraphXForm: Graph transformer for computer-aided molecular design with application to extraction](arxiv.org)**.
+This is the repository for the paper **[GraphXForm: Graph transformer for computer-aided molecular design with application to extraction](https://arxiv.org/abs/2411.01667v1)**.
 
 ## Preliminary note on structure
 

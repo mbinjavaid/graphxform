@@ -2,7 +2,6 @@ import math
 from typing import List, Union
 import os
 import ray
-import rdkit.Chem
 import torch
 import numpy as np
 import pandas as pd
@@ -13,6 +12,8 @@ from rdkit.Contrib.SA_Score import sascorer
 from molecule_design import MoleculeDesign
 from objective_predictor.GH_GNN_IDAC.src.models.utilities.mol2graph import get_dataloader_pairs_T, sys2graph, atom_features, n_atom_features, n_bond_features
 from objective_predictor.GH_GNN_IDAC.src.models.GHGNN_architecture import GHGNN
+
+from guacamol.benchmark_suites import goal_directed_suite_v2
 
 
 @ray.remote
@@ -167,6 +168,30 @@ class MoleculeObjectiveEvaluator:
         self.config = config
         self.device = torch.device("cpu") if device is None else device
         self.predictor_workers = [PredictorWorker.remote(self.config, self.device) for _ in range(self.config.num_predictor_workers)]
+        # initialize GuacaMol benchmarks
+        guacamol_goal_directed_suite = goal_directed_suite_v2()
+        self.guacamol_benchmarks = dict(
+            celecoxib_rediscovery=guacamol_goal_directed_suite[0],
+            troglitazone_rediscovery=guacamol_goal_directed_suite[1],
+            thiothixene_rediscovery=guacamol_goal_directed_suite[2],
+            aripiprazole_similarity=guacamol_goal_directed_suite[3],
+            albuterol_similarity=guacamol_goal_directed_suite[4],
+            mestranol_similarity=guacamol_goal_directed_suite[5],
+            isomers_c11h24=guacamol_goal_directed_suite[6],
+            isomers_c9h10n2o2pf2cl=guacamol_goal_directed_suite[7],
+            median_camphor_menthol=guacamol_goal_directed_suite[8],
+            median_tadalafil_sildenafil=guacamol_goal_directed_suite[9],
+            osimertinib_mpo=guacamol_goal_directed_suite[10],
+            fexofenadine_mpo=guacamol_goal_directed_suite[11],
+            ranolazine_mpo=guacamol_goal_directed_suite[12],
+            perindopril_rings=guacamol_goal_directed_suite[13],
+            amlodipine_rings=guacamol_goal_directed_suite[14],
+            sitagliptin_replacement=guacamol_goal_directed_suite[15],
+            zaleplon_mpo=guacamol_goal_directed_suite[16],
+            valsartan_smarts=guacamol_goal_directed_suite[17],
+            deco_hop=guacamol_goal_directed_suite[18],
+            scaffold_hop=guacamol_goal_directed_suite[19]
+        )
 
     def predict_objective(self, molecule_designs: List[Union[MoleculeDesign, str]]) -> np.array:
         """
@@ -195,14 +220,23 @@ class MoleculeObjectiveEvaluator:
                 except:
                     continue
 
-        # Distribute the list of feasible molecules to the predictor workers.
-        num_per_worker = math.ceil(len(feasible_molecules) / len(self.predictor_workers))
-        future_objs = [
-            worker.predict_objectives_from_rdkit_mols.remote(feasible_molecules[i * num_per_worker: (i+1) * num_per_worker])
-            for i, worker in enumerate(self.predictor_workers)
-        ]
-        future_objs = ray.get(future_objs)
-        objs = np.concatenate(future_objs)
+        if self.config.objective_type in self.guacamol_benchmarks:
+            # Drug design tasks
+            objs = np.array([
+                self.guacamol_benchmarks[self.config.objective_type].objective.score(
+                    Chem.MolToSmiles(rdkit_mol)
+                )
+                for rdkit_mol in feasible_molecules
+            ])
+        else:
+            # Distribute the list of feasible molecules to the predictor workers.
+            num_per_worker = math.ceil(len(feasible_molecules) / len(self.predictor_workers))
+            future_objs = [
+                worker.predict_objectives_from_rdkit_mols.remote(feasible_molecules[i * num_per_worker: (i+1) * num_per_worker])
+                for i, worker in enumerate(self.predictor_workers)
+            ]
+            future_objs = ray.get(future_objs)
+            objs = np.concatenate(future_objs)
         all_objs = np.array([np.NINF] * len(molecule_designs))
         all_objs[feasible_idcs] = objs
 
@@ -222,33 +256,63 @@ class MoleculeObjectiveEvaluator:
         except:
             return True
 
-        if self.config.disallow_nitrogen_nitrogen_single_bond:
-            # Do not allow nitrogen to nitrogen bonds of single order (only double or triple)
-            for i, atom in enumerate(mol.atoms):
-                if atom == 2 or atom == 4:  # N
-                    for j in range(i+1, len(mol.atoms)):
-                        if (mol.atoms[j] == 2 or mol.atoms[j] == 4) and mol.bonds[i, j] == 1:
-                            return True
-
-        if not self.config.disallow_rings and self.config.disallow_rings_larger_than > 3:
-            rd_mol = mol.rdkit_mol
-            ring_info = rd_mol.GetRingInfo()
-            rings = ring_info.AtomRings()
-            for ring in rings:
-                if len(ring) > self.config.disallow_rings_larger_than:
+        if self.config.objective_type in ["IBA", "DMBA_TMB"] and self.config.include_structural_constraints:
+            """
+            Check for a ring with more than 6 atoms or less than 5
+            """
+            for ring in mol.rdkit_mol.GetRingInfo().AtomRings():
+                if len(ring) < 5 or len(ring) > 6: # adjust according to max/min ring size
                     return True
+            """
+            Check for a O-O single bond in the molecule
+            """
+            for bond in mol.rdkit_mol.GetBonds():
+                if (bond.GetBondType() == Chem.BondType.SINGLE and
+                    mol.rdkit_mol.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomicNum() == 8 and
+                        mol.rdkit_mol.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomicNum() == 8):
+                    return True
+            """
+            Check for an N-N single bond
+            """
+            for bond in mol.rdkit_mol.GetBonds():
+                if (bond.GetBondType() == Chem.BondType.SINGLE and
+                    mol.rdkit_mol.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomicNum() == 7 and
+                        mol.rdkit_mol.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomicNum() == 7):
+                    return True
+            """
+            Check for an N-C-N bond (with exception for C=0)
+            """
+            for atom in mol.rdkit_mol.GetAtoms():
+                if atom.GetAtomicNum() == 6:
+                    neighbors = atom.GetNeighbors()
+                    nitrogen_count = sum(1 for nbr in neighbors if
+                                         nbr.GetAtomicNum() == 7 and
+                                         mol.rdkit_mol.GetBondBetweenAtoms(atom.GetIdx(),
+                                                                 nbr.GetIdx()).GetBondType() == Chem.BondType.SINGLE)
 
-        min_required_atoms = []
-        for i, atom_name in enumerate(self.config.atom_vocabulary.keys()):
-            if self.config.atom_vocabulary[atom_name]["allowed"] and "min_atoms" in self.config.atom_vocabulary[atom_name] and self.config.atom_vocabulary[atom_name]["min_atoms"] > 0:
-                min_required_atoms.append((i + 1, self.config.atom_vocabulary[atom_name]["min_atoms"]))  # (tuple of atom index, min num atoms required)
-        if len(min_required_atoms):
-            for atom in mol.atoms:
-                for j, (req_atom, req_num) in enumerate(min_required_atoms):
-                    if req_atom == atom:
-                        min_required_atoms[j] = (req_atom, req_num - 1)
-        for _, req_num in min_required_atoms:
-            if req_num > 0:
-                return True
+                    # Check if carbon is also double-bonded to oxygen (C=O)
+                    has_carbonyl = any(
+                        nbr.GetAtomicNum() == 8 and  # Oxygen
+                        mol.rdkit_mol.GetBondBetweenAtoms(atom.GetIdx(), nbr.GetIdx()).GetBondType() == Chem.BondType.DOUBLE
+                        for nbr in neighbors
+                    )
+
+                    if nitrogen_count >= 2 and not has_carbonyl:
+                        return True
+            """
+            Don't allow O-C(X)-N
+            """
+            for atom in mol.rdkit_mol.GetAtoms():
+                if atom.GetAtomicNum() == 6:  # Carbon atom
+                    neighbors = atom.GetNeighbors()
+
+                    # Count the types of bonded atoms
+                    n_count = sum(1 for nbr in neighbors if nbr.GetAtomicNum() == 7)  # Nitrogen
+                    o_count = sum(1 for nbr in neighbors if nbr.GetAtomicNum() == 8)  # Oxygen
+                    h_count = atom.GetTotalNumHs()  # Hydrogen
+
+                    # Condition: Carbon is bonded to both N and O and has exactly 1 H
+                    if n_count >= 1 and o_count >= 1 and h_count == 1:
+                        return True  # Restriction is violated
 
         return False

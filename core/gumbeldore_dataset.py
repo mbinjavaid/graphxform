@@ -179,6 +179,7 @@ class GumbeldoreDataset:
 
         # Get overall best metrics and molecules
         metrics_return["mean_top_20_obj"] = np.array([x["obj"] for x in merged_mols[:20]]).mean()
+        metrics_return["mean_kept_obj"] = np.array([x["obj"] for x in merged_mols]).mean()
         metrics_return["mean_top_20_sa_score"] = np.array([x["sa_score"] for x in merged_mols[:20]]).mean()
         metrics_return["top_20_molecules"] = [{x["smiles"]: x["obj"] for x in merged_mols[:20]}]
 
@@ -254,8 +255,8 @@ def async_sbs_worker(config: Config, job_pool: JobPool, network_weights: dict,
                                          batch_leaf_evaluation_fn=batch_leaf_evaluation_fn,
                                          memory_aggressive=False)
 
-                if config.gumbeldore_config["search_type"] == "gd_extreme":
-                    beam_leaves_batch: List[List[sbs.BeamLeaf]] = inc_sbs.perform_gd_extreme(
+                if config.gumbeldore_config["search_type"] == "tasar":
+                    beam_leaves_batch: List[List[sbs.BeamLeaf]] = inc_sbs.perform_tasar(
                         beam_width=config.gumbeldore_config["beam_width"],
                         deterministic=config.gumbeldore_config["deterministic"],
                         nucleus_top_p=config.gumbeldore_config["nucleus_top_p"],

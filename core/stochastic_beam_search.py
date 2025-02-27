@@ -7,7 +7,7 @@ The implementation is slightly generalized from the description in the paper,
 handling the case where not all leaves are at the same level of the tree.
 """
 import typing
-from typing import Any, Callable, List, Tuple
+from typing import Any, Callable, List, Tuple, Union
 
 import numpy as np
 
@@ -72,7 +72,7 @@ def stochastic_beam_search(
         root_states: List[State],
         beam_width: int,
         deterministic: bool = False,
-        top_p: float = 0.0,
+        top_p: Union[float, Tuple[float, int, float]] = 0.0,
         keep_intermediate: bool = False
 ) -> List[List[BeamLeaf]]:
     """Stochastic Beam Search, applied to a batch of states (for higher network throughput).
@@ -123,8 +123,10 @@ def stochastic_beam_search(
     batch_collected_leaf_gumbels = [[] for _ in range(batch_len)]
     batch_collected_leaf_states = [[] for _ in range(batch_len)]
 
+    step_counter = 0
     # Expand internal nodes until there are none left to expand
     while any([len(internal_states) for internal_states in batch_internal_states]):
+        step_counter += 1
 
         # Batch the internal states and compute the child probabilities in one go for all of them. Note that we obtain
         # them flattened as a list of np.arrays and need to reassign them back to their batches
@@ -160,11 +162,16 @@ def stochastic_beam_search(
                 batch_internal_states[batch_idx], batch_internal_log_probs[batch_idx], batch_internal_gumbels[batch_idx],
                 batch_child_log_probs_list[batch_idx]
             ):
-                if 1 > top_p > 0:
+                top_p_to_use = top_p if not isinstance(top_p, tuple) else top_p[0]
+                if isinstance(top_p, tuple) and step_counter > top_p[1]:
+                    top_p_to_use = top_p[2]
+
+                if 1 > top_p_to_use > 0:
                     # Top-p nucleus sampling and renormalize
-                    child_log_probs = top_p_filtering(child_log_probs.copy(), top_p)
+                    child_log_probs = top_p_filtering(child_log_probs.copy(), top_p_to_use)
                     with np.errstate(divide='ignore'):
                         child_log_probs = np.log(softmax(child_log_probs))
+
                 log_probabilities = child_log_probs + node_log_prob
                 # Get only feasible actions
                 good_indices = np.where(log_probabilities != np.NINF)[0]
@@ -218,13 +225,6 @@ def stochastic_beam_search(
                         to_expand_states.append((all_states[i], all_child_indices[i]))
                         to_expand_log_probs.append(all_log_probs[i])
                         to_expand_gumbels.append(all_gumbels[i])
-                        # MOLECULE EDIT:
-                        if keep_intermediate and all_states[i] in terminable_states and all_child_indices[i] == 0:
-                            # Remove from terminable states as it will be terminated in all cases
-                            _idx = terminable_states.index(all_states[i])
-                            del terminable_states[_idx]
-                            del terminable_gumbels[_idx]
-                            del terminable_log_probs[_idx]
 
                 # Existing leaves in the top k persist
                 leaf_log_probs = [leaf_log_probs[i] for i in leaf_indices]
@@ -237,6 +237,7 @@ def stochastic_beam_search(
             internal_states = []
             if len(to_expand_states):
                 child_states = child_transition_fn(to_expand_states)
+
                 for log_prob, gumbel, (child_state, is_leaf) in zip(
                     to_expand_log_probs, to_expand_gumbels, child_states
                 ):
@@ -244,10 +245,11 @@ def stochastic_beam_search(
                         leaf_log_probs.append(log_prob)
                         leaf_gumbels.append(gumbel)
                         leaf_states.append(child_state)
-                        #if keep_intermediate:
-                        collected_leaf_log_probs.append(log_prob)
-                        collected_leaf_gumbels.append(gumbel)
-                        collected_leaf_states.append(child_state)
+                        # check for duplicate leaf nodes by their gumbel score
+                        if not (keep_intermediate and gumbel in terminable_gumbels):
+                            collected_leaf_log_probs.append(log_prob)
+                            collected_leaf_gumbels.append(gumbel)
+                            collected_leaf_states.append(child_state)
                     else:
                         internal_log_probs.append(log_prob)
                         internal_gumbels.append(gumbel)

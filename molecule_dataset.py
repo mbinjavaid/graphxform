@@ -1,8 +1,10 @@
+import math
 from typing import Optional, Tuple, List
 
 import torch
 import pickle
 import random
+import numpy as np
 from torch.utils.data import Dataset
 
 from config import MoleculeConfig
@@ -24,7 +26,8 @@ class RandomMoleculeDataset(Dataset):
     As the number of atoms will be different for molecules in a batch, we pad the atoms, and set all labels corresponding
     to the padded atoms to -1 (in the CE-loss, this will be specified as `ignore_index=-1`.
     """
-    def __init__(self, config: MoleculeConfig, path_to_pickle: str, batch_size: int, custom_num_batches: Optional[int]):
+    def __init__(self, config: MoleculeConfig, path_to_pickle: str, batch_size: int, custom_num_batches: Optional[int],
+                 no_random: bool = False):
         self.config = config
         self.batch_size = batch_size
         self.custom_num_batches = custom_num_batches
@@ -48,6 +51,8 @@ class RandomMoleculeDataset(Dataset):
         else:
             self.length = custom_num_batches
 
+        self.no_random = no_random
+
     def __len__(self):
         return self.length
 
@@ -61,15 +66,17 @@ class RandomMoleculeDataset(Dataset):
         partial_molecules: List[MoleculeDesign] = []   # partial molecules which will become the batch
         instance_targets: List[List[int]] = []  # corresponding targets taken from the instances
 
-        batch_to_pick = random.choices(self.targets_to_sample, k=self.batch_size)  # with replacement
+        if self.no_random:
+            batch_to_pick = self.targets_to_sample[idx * self.batch_size: (idx+1) * self.batch_size]
+        else:
+            batch_to_pick = random.choices(self.targets_to_sample, k=self.batch_size)  # with replacement
         for instance_idx, target_idx in batch_to_pick:
             instance = self.instances[instance_idx]
             # Build up the molecule
             molecule = MoleculeDesign(self.config, initial_atom=instance["start_atom"])
             # create molecule up to (excluding) target actions
-            for actions in instance["action_seq"][:target_idx]:
-                for action in actions:
-                    molecule.take_action(action)
+            for action in instance["action_seq"][:target_idx]:
+                molecule.take_action(action)
             partial_molecules.append(molecule)
             instance_targets.append(instance["action_seq"][target_idx])
 
@@ -79,18 +86,17 @@ class RandomMoleculeDataset(Dataset):
                                                    include_feasibility_masks=True)
 
         # We now create the targets. We separate it into targets for level 0, 1 and 2.
-        # Action level 0 target: Shape: (B,), indicating index to choose. If the target
-        # is at level 2 (i.e., only one item in the target), then we set it to -1 (ignore).
-        batch_target_zero = torch.LongTensor([target[0] if len(target) == 2 else -1 for target in instance_targets])  # (B,)
-        # Action level 1 target: If we are at level 2, ignore. Also if the action chosen at level 0 was 0 (terminate), then
-        # ignore.
-        batch_target_one = torch.LongTensor([target[1] if len(target) == 2 and target[0] != 0 else -1 for target in instance_targets])  # (B,)
-        # Action level 2 target: Ignore if we are not at level 2 (i.e., length of target only 1).
-        batch_target_two = torch.LongTensor([target[0] if len(target) == 1 else -1 for target in instance_targets])  # (B,)
+        # We only set the target action as target for the current level the molecule is in.
+        # For all other levels, we set it to -1 for a molecule. (ignore)
+        batch_targets = [
+            torch.LongTensor([target if partial_molecules[i].current_action_level == level else -1 for i, target in
+                              enumerate(instance_targets)])  # (B,)
+            for level in [0,1,2]
+        ]
 
         return dict(
             input=batch_input,
-            target_zero=batch_target_zero,
-            target_one=batch_target_one,
-            target_two=batch_target_two
+            target_zero=batch_targets[0],
+            target_one=batch_targets[1],
+            target_two=batch_targets[2]
         )

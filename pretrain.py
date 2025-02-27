@@ -2,8 +2,6 @@ import argparse
 import copy
 import importlib
 import os
-import time
-import gc
 
 from torch.nn import CrossEntropyLoss
 from torch.optim.lr_scheduler import LambdaLR
@@ -26,16 +24,13 @@ def save_checkpoint(checkpoint: dict, filename: str, config: MoleculeConfig):
 
 
 def train_for_one_epoch(epoch: int, config: MoleculeConfig, network: MoleculeTransformer,
-                        optimizer: torch.optim.Optimizer, dataset: RandomMoleculeDataset):
+                        optimizer: torch.optim.Optimizer, dataset: RandomMoleculeDataset, is_validation=False):
 
-
-    print("---- Loading dataset")
-
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=config.num_dataloader_workers,
-                            pin_memory=False, persistent_workers=True)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=not is_validation, num_workers=config.num_dataloader_workers,
+                            pin_memory=True, persistent_workers=True)
     metrics = dict()
     # Train for one epoch
-    network.train()
+    network.train() if not is_validation else network.eval()
     accumulated_loss = 0
     accumulated_loss_lvl_zero = 0
     accumulated_loss_lvl_one = 0
@@ -67,14 +62,15 @@ def train_for_one_epoch(epoch: int, config: MoleculeConfig, network: MoleculeTra
         loss_two = torch.tensor(0.) if torch.isnan(loss_two) else loss_two
         loss = loss_zero + config.scale_factor_level_one * loss_one + config.scale_factor_level_two * loss_two
 
-        # Optimization step
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        if not is_validation:
+            # Optimization step
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
 
-        if config.optimizer["gradient_clipping"] > 0:
-            torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=config.optimizer["gradient_clipping"])
+            if config.optimizer["gradient_clipping"] > 0:
+                torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=config.optimizer["gradient_clipping"])
 
-        optimizer.step()
+            optimizer.step()
 
         batch_loss = loss.item()
         accumulated_loss += loss.item()
@@ -86,29 +82,32 @@ def train_for_one_epoch(epoch: int, config: MoleculeConfig, network: MoleculeTra
 
         del data
 
-    metrics["full_loss"] = accumulated_loss / num_batches
-    metrics["loss_level_zero"] = accumulated_loss_lvl_zero / num_batches
-    metrics["loss_level_one"] = accumulated_loss_lvl_one / num_batches
-    metrics["loss_level_two"] = accumulated_loss_lvl_two / num_batches
-
-    torch.cuda.empty_cache()
-    gc.collect()
+    metric_prefix = "" if not is_validation else "val_"
+    metrics[f"{metric_prefix}full_loss"] = accumulated_loss / num_batches
+    metrics[f"{metric_prefix}loss_level_zero"] = accumulated_loss_lvl_zero / num_batches
+    metrics[f"{metric_prefix}loss_level_one"] = accumulated_loss_lvl_one / num_batches
+    metrics[f"{metric_prefix}loss_level_two"] = accumulated_loss_lvl_two / num_batches
 
     return metrics
 
 
 if __name__ == '__main__':
-    pretrain_train_dataset = "./data/pretrain_data.pickle"  # Path to the pretraining dataset
-    pretrain_num_epochs = 1000  # For how many epochs to train
-    batch_size = 128  # Minibatch size. Adjust to your resources. (~32 for 24GB VRAM)
-    num_batches_per_epoch = 2500  # Number of minibatches per epoch.
-    training_device = "cuda:0"  # Device on which to train. Set to "cpu" if no CUDA available.
-    num_dataloader_workers = 30  # Number of dataloader workers for creating batches for training
+    pretrain_train_dataset = "./data/chembl/pretrain_sequences/chembl_train.pickle"
+    pretrain_val_dataset = "./data/chembl/pretrain_sequences/chembl_valid.pickle"
+    pretrain_num_epochs = 1000
+    batch_size = 512
+    num_batches_per_epoch = 3000
+    batch_size_validation = 512
     load_checkpoint_from_path = None
 
     print(">> Pretraining Molecule Design")
 
     parser = argparse.ArgumentParser(description='Experiment')
+    parser.add_argument('--debug', help="debug flag to turn off server logging", action="store_true")
+    parser.add_argument('--run-name', type=str, help="give a descriptive run name so we can keep track of results",
+                        default="Default run")
+    parser.add_argument('--exp-name', type=str, help="MLflow Experiment name to group run into",
+                        default="Default experiment")
     parser.add_argument('--config', help="Path to optional config relative to main.py")
     args = parser.parse_args()
 
@@ -118,15 +117,18 @@ if __name__ == '__main__':
 
     config = MoleculeConfig()
     print(f"Results path: {config.results_path}")
-    config.training_device = training_device
-    config.num_dataloader_workers = num_dataloader_workers
     config.max_num_atoms = None
+    config.allow_nitrogen = True
+    config.allow_positive_charged_nitrogen = False  # Set this to True, if the dataset contains [NHx+]
+    config.max_allowed_oxygen = None
+    config.max_allowed_nitrogen = None
+    config.min_ratio_c = None  # minimum ratio of C atoms to all atoms
     config.disallow_oxygen_bonding = False
     config.disallow_nitrogen_nitrogen_single_bond = False
     config.disallow_rings = False
     config.disallow_rings_larger_than = -1
 
-    logger = Logger(args, config.results_path, config.log_to_file)
+    logger = Logger(args, config.results_path, config.log_to_file, config.log_to_mlflow, config.mlflow_server_uri)
     logger.log_hyperparams(config)
     # Fix random number generator seed for better reproducibility
     np.random.seed(config.seed)
@@ -180,14 +182,18 @@ if __name__ == '__main__':
                     checkpoint["pretrain_epochs_trained"] // config.optimizer["schedule"]["decay_lr_every_epochs"])
         scheduler = LambdaLR(optimizer, lr_lambda=_lambda)
 
-        dataset = RandomMoleculeDataset(config, pretrain_train_dataset,
-                                        batch_size=batch_size,
-                                        custom_num_batches=num_batches_per_epoch)
+        train_dataset = RandomMoleculeDataset(config, pretrain_train_dataset,
+                                              batch_size=batch_size,
+                                              custom_num_batches=num_batches_per_epoch)
+        val_dataset = RandomMoleculeDataset(config, pretrain_val_dataset,
+                                            batch_size=batch_size_validation,
+                                            custom_num_batches=None,
+                                            no_random=True)
 
         for epoch in range(pretrain_num_epochs):
-
+            print("Training.")
             generated_loggable_dict = train_for_one_epoch(
-                epoch, config, network, optimizer, dataset
+                epoch, config, network, optimizer, train_dataset
             )
             checkpoint["pretrain_epochs_trained"] += 1
             scheduler.step()
@@ -196,18 +202,26 @@ if __name__ == '__main__':
                   f" Avg loss level 2: {generated_loggable_dict['loss_level_two']}")
             logger.log_metrics(generated_loggable_dict, step=epoch)
 
+            print("Validating...")
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                validation_metrics = train_for_one_epoch(
+                    None, config, network, None, val_dataset, is_validation=True
+                )
+            logger.log_metrics(validation_metrics, step=epoch)
+            print(f">> Validation. Avg loss level 0: {validation_metrics['val_loss_level_zero']},"
+                  f" Avg loss level 1: {validation_metrics['val_loss_level_one']},"
+                  f" Avg loss level 2: {validation_metrics['val_loss_level_two']}")
+
             # Save model
             checkpoint["model_weights"] = copy.deepcopy(network.get_weights())
             checkpoint["optimizer_state"] = copy.deepcopy(
                 dict_to_cpu(optimizer.state_dict())
             )
 
-            #val_metric = generated_loggable_dict["best_gen_obj"]   # measure by best objective found during sampling
-            #checkpoint["validation_metric"] = val_metric
             save_checkpoint(checkpoint, "last_model.pt", config)
 
-            # @TODO true validation set
-            if generated_loggable_dict["full_loss"] < checkpoint["pretrain_best_validation_loss"]:
+            if validation_metrics["val_full_loss"] < checkpoint["pretrain_best_validation_loss"]:
                 print(">> Got new best model.")
                 checkpoint["pretrain_best_validation_loss"] = generated_loggable_dict["full_loss"]
                 save_checkpoint(checkpoint, "best_model.pt", config)

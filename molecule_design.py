@@ -1,14 +1,13 @@
 import copy
-
+import random
 import numpy as np
-import rdkit.Chem
 import torch
+from torch import nn
 from rdkit import Chem
 
 from config import MoleculeConfig
 from core.abstracts import BaseTrajectory
 from core.utils import softmax
-from model.molecule_transformer import MoleculeTransformer
 
 from typing import Optional, List, Tuple
 
@@ -16,84 +15,89 @@ from typing import Optional, List, Tuple
 class MoleculeDesign(BaseTrajectory):
     """
     Environment for the molecular design.
-    Actions are chosen hierarchically in three levels:
-        - Level 0: Choose to terminate (0), add C atom (1), add N atom (2), add O atom (3), add positively charged nitrogen (4), or increase existing bond (5)
-        - Level 1: If not terminating, pick an atom A on which the action should be performed. If at level 0s it was
-            decided to add an atom, we are done. Else (increase bond), transition to level 2:
-        - Level 2: Pick another atom B to increase the bond by 1 between A and B.
+    Actions are chosen hierarchically in three levels.
+        - Level 0: Terminate or pick a first atom.
+            - Choose to terminate (index 0)
+            - Create a new atom and pick that (index 1 up to (length of vocabulary))
+            - Pick an existing atom (index (length of vocabulary + 1) up to (length of vocabulary + 1 + number of atoms)
+        - Level 1: If not terminating, pick a second atom on which a bind decision must be made. (index 0 up to number of atoms)
+        - Level 2: Pick the type of bond (index 0 up to order 6)
 
     Level 0 and 1 are predicted simultaneously by the network, while for level 2 we mark the chosen atom for the network.
 
-    Atom types are specified in the config under `atom_vocabulary`. Indexing starts at 1. Index 0 is for virtual atom.
+    Atom types are specified in the config under `atom_vocabulary`. Indexing starts at 1. Index 0 is for a virtual atom.
     - Index 0: Virtual Atom, which is connected (with special bond order) to every other atom (and vice versa).
 
-    We store all actions in a history, which is a list of lists. Each list has either 2 elements and corresponds to
-    the actions taken at level 0 and 1, or only one element corresponding to level 2. For example, a history
-    (with vocabulary C,N,O, so "increase bond" is at index 4 for action level 0)
-    [[1, 1], [4, 2], [1], [0, -1]] means that first a C atom is added to the atom at index 1, then the atom at
-    index 2 increases its bond with the atom at index 1, and then we terminate.
+    We store all actions in a history, which is a list of indices indicating the action that was taken on a certain level.
+    For example, with a vocabulary of [C, N, O], and starting from the atom C, the action history
+    [1, 4, 1, 0] means that we add a C atom (1), connect it to the existing C atom (4), with a bond order of 2 (1) and
+    then terminate (0), resulting in C=C.
     """
+    maximum_bond_order = 6
+    virtual_bond_idx = 7  # index for the virtual bond between virtual atom and other atoms. Is one more than the maximum bond order possible.
+    maximum_num_atoms_overall = 100
+    bond_types = {
+        1: Chem.rdchem.BondType.SINGLE,
+        2: Chem.rdchem.BondType.DOUBLE,
+        3: Chem.rdchem.BondType.TRIPLE,
+        4: Chem.rdchem.BondType.QUADRUPLE,
+        5: Chem.rdchem.BondType.QUINTUPLE,
+        6: Chem.rdchem.BondType.HEXTUPLE
+    }
 
     def __init__(self, config: MoleculeConfig, initial_atom: int):
         """
         Parameters:
             config [MoleculeConfig]: Config
             initial_atom [int]: We always start with already one atom in the molecule to be able to diversify
-                the starting point for the network. Must be 1,2,3, 4.
-            minimal_init [bool]: If True, we return directly after setting the initial atom
+                the starting point for the network.
         """
         self.config = config
         self.atom_vocabulary = self.config.atom_vocabulary
         self.vocabulary_atom_idcs = list(range(1, len(self.atom_vocabulary) + 1))  # [1, ..., num of atoms in vocab]
         self.vocabulary_atom_names = list(self.atom_vocabulary.keys())
         self.vocabulary_valence = [-1] + [self.atom_vocabulary[x]["valence"] for x in self.vocabulary_atom_names]  # have an entry "-1" for the first virtual atom
-        self.atom_feasibility = [not self.atom_vocabulary[x]["allowed"] for x in self.vocabulary_atom_names]  # if not allowed, then feasbility mask must be set to True
+        self.atom_feasibility_mask = [not self.atom_vocabulary[x]["allowed"] for x in self.vocabulary_atom_names]  # if not allowed, then feasbility mask must be set to True
 
         # Extract relevant indexing information that depends on the size of the vocabulary.
-        self.increase_bond_action_idx = len(self.vocabulary_atom_idcs) + 1
-        self.virtual_bond_idx = max(self.vocabulary_valence) + 1  # index for the virtual bond between virtual atom and other atoms. Is one more than the maximum valence.
-        self.oxygen_atom_idx = self.vocabulary_atom_names.index("O") + 1
-
-        # Extract information about minimum number of atoms
-        self.min_required_atoms = []
-        for i, atom_name in enumerate(self.vocabulary_atom_names):
-            if "min_atoms" in self.atom_vocabulary[atom_name] and self.atom_vocabulary[atom_name]["min_atoms"] > 0:
-                self.min_required_atoms.append((i + 1, self.atom_vocabulary[atom_name]["min_atoms"]))  # (tuple of atom index, min num atoms required)
+        self.pick_existing_atoms_start_action_idx_lvl_0 = len(self.vocabulary_atom_idcs) + 1  # Level 0, where does (after terminate and create new atom) the indexing of the existing atoms start?
 
         self.upper_limit_atoms = self.config.max_num_atoms
-        assert not self.atom_feasibility[initial_atom - 1] and initial_atom in self.vocabulary_atom_idcs, f"Initial atom must be in {self.vocabulary_atom_idcs} and set to allowed in config."
+        assert not self.atom_feasibility_mask[initial_atom - 1] and initial_atom in self.vocabulary_atom_idcs, f"Initial atom must be in {self.vocabulary_atom_idcs} and set to allowed in config."
         self.initial_atom = initial_atom
 
         # Keeps track of all atoms present (including virtual atom)
         self.atoms = np.array([0, initial_atom], dtype=np.uint8)
 
+        # Keeps track of the design as an RDKit molecule
+        self.rdkit_mol = Chem.RWMol()
+
         # Keeps track of all bonds with order. Is a matrix of shape (len(atoms), len(atoms)), where the (i,j)-th entry
-        # indicates connection of i-th atom with j-th atom. Note that the virtual atom has a bond of order 7 with
+        # indicates connection of i-th atom with j-th atom. Note that the virtual atom has a bond of special order with
         # all other atoms.
         self.bonds = np.zeros((2, 2), dtype=np.uint8)
         self.bonds[0, 1] = self.bonds[1, 0] = self.virtual_bond_idx  # connect with virtual atom
+        # The topological distance matrix keeps the shortest path between any two atoms. We set a special distance
+        # for the distance between virtual atom and any other atom, and also for an atom that is not yet connected
+        self.virtual_distance = self.maximum_num_atoms_overall + 1  # for distance between virtual to any atom
+        self.infinity_distance = self.maximum_num_atoms_overall + 2 # for distance between new atom (not bonded yet) to any atom
+        self.topological_distance_matrix = np.array([[0, self.virtual_distance], [self.virtual_distance, 0]], dtype=np.uint8)
 
         self.synthesis_done = False
         self.smiles_string: Optional[str] = None  # Is set after synthesis is done
         self.current_objective = float("-inf")
 
-        # Current action level.
-        self.current_action_level = 0  # start by choosing <terminate>/<add atom>/<bond increase>
+        # Current action level. Can be 0, 1, 2
+        self.current_action_level = 0  # start by choosing <terminate>/<create new atom and pick>/<pick existing atom>
+
         # The action mask indicates before each action what is feasible at the current level.
-        # It is set for level 0 and level 1 when the current action level is reset to 0.
-        # When choosing to increase the bond order, it is also set for level 2.
-        # It's a list of length 3, while the mask for level 2 can be None.
+        # It is set for each level when transitioning to that level
         # A `1` indicates that the action should be masked, i.e., cannot be taken.
-        self.current_action_mask: Optional[List[Optional[np.array]]] = None
-        # Keeps track of the actions for each level, before saving it to the history (i.e., returning to action index 0)
-        self.actions_taken: List[int] = []
-        # At action level 0, the network can predict logits for level 0 and 1. These need to be registered here.
-        # For consistency, we also register actions at level 2.
-        # They will be reset to `None` once action level 1 or 2 have been passed.
-        self.registered_logits: Optional[List[np.array]] = None
+        self.current_action_mask: Optional[np.array] = None
+
         # History is a list of `actions_taken` above, indicating how you get from the initial atom to the current
         # molecule. See class docstring for an example.
-        self.history: List[List[int]] = []
+        self.history: List[int] = []
 
         self.objective: Optional[float] = None
         # Synthetic accessibility score, obtained from RDKit, ranging from 1 [easiest] to 10 [hardest]
@@ -101,37 +105,13 @@ class MoleculeDesign(BaseTrajectory):
 
         # Set this to True if anything goes wrong and the molecule will always evaluate to objective -inf
         self.infeasibility_flag: bool = False
-        self.rdkit_mol: Optional[rdkit.Chem.RWMol] = None
 
-        self.reset_actions_to_level_0()
-
-    def reset_actions_to_level_0(self):
-        """
-        Called after passing through the full hierarchy. Resets the action level to 0 and re-computes the action mask.
-        Also adds the actions_taken (if any) to the history.
-        """
-        self.current_action_level = 0
-        self.registered_logits = None
-        if len(self.actions_taken):
-            self.history.append(self.actions_taken)
-            self.actions_taken = []
-        self.current_action_mask = [np.zeros(len(self.vocabulary_atom_idcs) + 2, dtype=bool)]  # <terminate>/<add atom>/<increase bond>
-        self.current_action_mask.append(None)  # <pick atom> (exclude virtual atom)
-        self.current_action_mask.append(None)   # for level 2
         self.update_action_mask()
-
-    def reset_actions_to_level_2(self):
-        self.current_action_level = 2
-        self.registered_logits = None
-        self.history.append(self.actions_taken)
-        self.actions_taken = []
-        self.current_action_mask[0] = None
-        self.current_action_mask[1] = None
-        self.update_action_mask()
+        self.update_rdkit_mol(new_atom=initial_atom)
 
     def update_action_mask(self):
         """
-        Depending on the current action level, updates the mask for each action level >= the current. Here, we take
+        Creates the action mask for the current action level. Here, we take
         into account the valence of the present atoms.
         """
         if self.synthesis_done:
@@ -139,89 +119,97 @@ class MoleculeDesign(BaseTrajectory):
             return
         atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms])
         atom_valence_remaining = atom_valence - self.bonds[:, 1:].sum(axis=1)
+        ex_action_idx = self.pick_existing_atoms_start_action_idx_lvl_0  # alias
 
-        if self.current_action_level == 0:  # Directly set what to allow. Termination is always allowed.
-            # Set all atoms to infeasible which cannot be chosen.
-            self.current_action_mask[0][self.vocabulary_atom_idcs] = self.atom_feasibility
+        if self.current_action_level == 0:
+            self.current_action_mask = np.zeros(len(self.vocabulary_atom_idcs) + len(self.atoms), dtype=bool)  # <terminate><create new and pick><pick existing>
+            # Termination is always allowed. So we won't change that.
 
-            # Check if we have reached the max number of atoms or if there is any valence remaining (skip virtual atom).
-            # If not, only the terminate-action is possible.
-            # If we are at the maximum number of atoms, we can only terminate or increase the bond
-            if self.upper_limit_atoms is not None and len(self.atoms) - 1 == self.upper_limit_atoms:
-                self.current_action_mask[0][1:-1] = 1
-            # If there is no valence remaining, we can only terminate
-            if not np.any(atom_valence_remaining[1:]):
-                self.current_action_mask[0][1:] = 1
-            # Else if there is only one atom left with valence, we cannot increase the bonds
-            elif np.sum(atom_valence_remaining[1:] > 0) < 2:
-                self.current_action_mask[0][-1] = 1
+            # --> First of all, check if we can create a new atom.
+            # In principle only allow creating new atoms of types which can be chosen by the config
+            # (where `allowed` is set to True)
+            self.current_action_mask[1:ex_action_idx] = self.atom_feasibility_mask
+            # Apart from this, creating a new atom is only possible if we haven't reached the max
+            # number of atoms yet, and if there is still one free valence for an existing atom.
+            if (self.upper_limit_atoms is not None and len(self.atoms) - 1 == self.upper_limit_atoms) or \
+                    (not np.any(atom_valence_remaining[1:])):
+                self.current_action_mask[1:ex_action_idx] = 1
 
-            # Special settings
-            # Case 1: Do not allow oxygen to bond with another oxygen
-            if self.config.disallow_oxygen_bonding and np.any(atom_valence_remaining[1:]):
-                # If we are not allowed to bond oxygens with each other, we need to check if the only valence
-                # remaining are oxygen atoms. If so, we are not allowed to add oxygen or increase the bonds.
-                atom_idcs = np.where(atom_valence_remaining[1:] > 0)[0]  # account for virtual atom
-                if len(atom_idcs) > 0:
-                    if np.all(self.atoms[atom_idcs + 1] == self.oxygen_atom_idx):
-                        self.current_action_mask[0][self.oxygen_atom_idx] = 1
-                        self.current_action_mask[0][-1] = 1
-            # Case 2: Do not allow rings.
-            if self.config.disallow_rings and self.current_action_mask[0][-1] == 0:
-                # We check if there are at least two atoms that have nonzero valence and are already bonded.
-                # Otherwise we do not allow increasing bonds bonding.
-                self.current_action_mask[0][-1] = 1
-                for i in range(1, len(self.atoms)):
-                    if atom_valence_remaining[i] > 0:
-                        for j in range(i+1, len(self.atoms)):
-                            if atom_valence_remaining[j] > 0 and self.bonds[i, j] > 0:
-                                self.current_action_mask[0][-1] = 0  # allow increasing bonds
-                                break
-                    if self.current_action_mask[0][-1] == 0:
-                        break
+            # --> Now see which of the existing atoms can be picked at level 0. Picking an existing atom
+            # at level 0 always means that we will add a bond between two existing atoms.
 
-            # Decide for each atom if it can be picked at level 1. This is possible if it has free valence
-            self.current_action_mask[1] = atom_valence_remaining[1:] < 1
+            # For each atom, it cannot be picked, if it doesn't have free valence or there is no other atom with free
+            # valence that is not yet bonded with it.
+            self.current_action_mask[ex_action_idx:][np.where(atom_valence_remaining[1:] <= 0)] = 1  # no free valence
+            # Now the case where we check for each atom if there is another one with free valence that it is not bonded to yet
+            # - Get the bond matrix where in each row we set 1 to atoms that the current row is not bonded with
+            bond_indicator = np.zeros_like(self.bonds[1:, 1:])
+            bond_indicator[np.where(self.bonds[1:, 1:] == 0)] = 1
+            np.fill_diagonal(bond_indicator, 0)  # don't count the atom itself
+            has_free_nonneighbor = np.matmul(bond_indicator, (atom_valence_remaining[1:] > 0)[:, None]).squeeze()
+            self.current_action_mask[ex_action_idx:][np.where(has_free_nonneighbor == 0)] = 1
 
         elif self.current_action_level == 1:
-            if self.config.disallow_oxygen_bonding and self.actions_taken[0] == self.oxygen_atom_idx:
-                # If the atom placed at level 0 is oxygen and we do not want bonds between oxygen atoms,
-                # disallow choosing any other oxygen atom at level 1. Account for the virtual atom and the atom that
-                # has just been added.
-                self.current_action_mask[1][np.where(self.atoms[1:-1] == self.oxygen_atom_idx)] = 1
-
-            if self.config.disallow_rings and self.actions_taken[0] == self.increase_bond_action_idx:
-                # If we do not allow rings and have chosen to increase bond order,
-                # then we also want to disallow picking atoms that do not share free valence
-                # with another already bonded atom.
-                has_free_valence_idcs = np.where(atom_valence_remaining[1:] > 0)[0]
-                for atom_i in has_free_valence_idcs:
-                    self.current_action_mask[1][atom_i] = 1  # at first, disallow
-                    for atom_j in has_free_valence_idcs:
-                        if atom_i != atom_j and self.bonds[atom_i + 1, atom_j + 1] > 0:
-                            self.current_action_mask[1][atom_i] = 0  # allow
-                            break
+            self.current_action_mask = np.zeros(len(self.atoms) - 1, dtype=bool)
+            # Pick the second atom, which cannot be the same as the one picked on level 0.
+            # If we created a new atom in level 0, it is already present in `atoms`. So we need to account for that.
+            atom_picked_on_lvl_0 = len(self.atoms) - 2 if self.history[-1] < ex_action_idx else self.history[-1] - ex_action_idx
+            self.current_action_mask[atom_picked_on_lvl_0] = 1
+            # Also mask all atoms that don't have free valence
+            self.current_action_mask[np.where(atom_valence_remaining[1:] < 1)] = 1
+            # And mask all atoms that the atom picked on lvl 0 is already bonded with
+            self.current_action_mask[np.where(self.bonds[atom_picked_on_lvl_0 + 1, 1:] > 0)] = 1
 
         elif self.current_action_level == 2:
-            # At level 2, an atom can be picked if it has free valence and was not picked at level 1
-            self.current_action_mask[2] = atom_valence_remaining[1:] < 1
-            self.current_action_mask[2][self.history[-1][1]] = 1  # atom picked at level 1
+            self.current_action_mask = np.zeros(self.maximum_bond_order, dtype=bool)
+            # At level 2, we choose the bond type. This can be any order up to the
+            # minimum of the free valence of the atoms picked at level 0 and 1
+            atom_picked_on_lvl_0 = len(self.atoms) - 2 if self.history[-2] < ex_action_idx else self.history[-2] - ex_action_idx
+            atom_picked_on_lvl_1 = self.history[-1]
+            max_bond_order = min(atom_valence_remaining[atom_picked_on_lvl_0 + 1], atom_valence_remaining[atom_picked_on_lvl_1 + 1])
+            self.current_action_mask[int(max_bond_order):] = 1
 
-            if self.config.disallow_oxygen_bonding and self.atoms[self.history[-1][1] + 1] == self.oxygen_atom_idx:
-                # If we have chosen an O atom at level 1 to bond, then at level 2 disallow choosing another O
-                self.current_action_mask[2][np.where(self.atoms[1:] == self.oxygen_atom_idx)] = 1
+    def update_topological_distance_matrix(self, new_atom_created: bool = False):
+        if new_atom_created:
+            new_atom_idx = len(self.atoms) - 1
+            self.topological_distance_matrix = np.pad(self.topological_distance_matrix, [(0, 1), (0, 1)], mode='constant',
+                                                      constant_values=self.infinity_distance)
+            self.topological_distance_matrix[0, new_atom_idx] = self.topological_distance_matrix[new_atom_idx, 0] = self.virtual_distance
+            self.topological_distance_matrix[new_atom_idx, new_atom_idx] = 0
+        else:
+            # re-compute the topological distance matrix from the current molecule and set it
+            self.topological_distance_matrix[1:, 1:] = Chem.GetDistanceMatrix(self.rdkit_mol, force=True).astype(np.uint8)
 
-            if self.config.disallow_rings:
-                # Prohibit choosing an atom that is not already bonded to the one chosen at level 1
-                self.current_action_mask[2][np.where(self.bonds[self.history[-1][1] + 1, 1:] == 0)] = 1
-
-    def masked_log_probs_for_current_action_level(self) -> np.array:
+    def update_rdkit_mol(self, new_atom: Optional[int] = None, set_bond: Optional[Tuple[int, int, int]] = None):
         """
-        Assuming logits are registered, gets them for the current action index and masks infeasible actions, determined
-        by `current_action_mask`.
+        Updates the RDKit mol by either adding a new atom or setting the bond order between two atoms.
+        Parameters:
+            new_atom: Atom to add as index in vocabulary
+            set_bond: Tuple of ints (i, j, bond order), where i,j start from 0 (so we do not count virtual atom)
         """
-        logits = self.registered_logits[self.current_action_level]
-        mask = self.current_action_mask[self.current_action_level]
+        if new_atom is not None:
+            atom_idx = new_atom
+            atom_config = self.atom_vocabulary[self.vocabulary_atom_names[atom_idx - 1]]
+            a = Chem.Atom(atom_config["atomic_number"])
+            if "formal_charge" in atom_config:
+                a.SetFormalCharge(atom_config["formal_charge"])
+            if "chiral_tag" in atom_config:
+                if atom_config["chiral_tag"] == 1:
+                    a.SetChiralTag(Chem.CHI_TETRAHEDRAL_CW)
+                elif atom_config["chiral_tag"] == 2:
+                    a.SetChiralTag(Chem.CHI_TETRAHEDRAL_CCW)
+            self.rdkit_mol.AddAtom(a)
+
+        elif set_bond is not None:
+            i, j, bond_order = set_bond
+            self.rdkit_mol.AddBond(i, j, self.bond_types[bond_order])
+
+    def masked_log_probs_for_current_action_level(self, logits: np.array) -> np.array:
+        """
+        Given an np.array of `logits` masks infeasible actions, determined
+        by `current_action_mask`, and returns normalized log probabilities.
+        """
+        mask = self.current_action_mask
         logits[mask] = np.NINF
         with np.errstate(divide='ignore'):
             log_probs = np.log(softmax(logits))
@@ -234,45 +222,47 @@ class MoleculeDesign(BaseTrajectory):
         """
         assert not self.synthesis_done, "Taking action on already terminated design. No no!"
 
+        assert self.current_action_mask[action] == 0, \
+            f"Trying to take action {action} on level {self.current_action_level}, but it is set to infeasible"
+
+        next_level = 0
         if self.current_action_level == 0:
             if action == 0:  # terminate
                 self.synthesis_done = True
                 self.finalize()
-                self.actions_taken = [0, -1]
-                self.reset_actions_to_level_0()
-            elif 1 <= action <= len(self.vocabulary_atom_idcs):  # add atom
+            elif 1 <= action < self.pick_existing_atoms_start_action_idx_lvl_0:  # create a new atom
                 self.atoms = np.append(self.atoms, action)
                 # add a row and column for the new atom
                 self.bonds = np.pad(self.bonds, [(0, 1), (0, 1)], mode='constant', constant_values=0)
                 new_atom_idx = len(self.atoms) - 1
                 self.bonds[0, new_atom_idx] = self.bonds[new_atom_idx, 0] = self.virtual_bond_idx  # Connect with virtual atom
-                self.actions_taken = [action]
-                self.current_action_level += 1
-                self.update_action_mask()
-            elif action == self.increase_bond_action_idx:  # increase bond
-                self.actions_taken = [self.increase_bond_action_idx]
-                self.current_action_level += 1
-                self.update_action_mask()
+                self.update_rdkit_mol(new_atom=action)
+                self.update_topological_distance_matrix(new_atom_created=True)
+
+                next_level = 1
+            else:  # already existing atom was picked as first atom
+                next_level = 1
         elif self.current_action_level == 1:
-            self.actions_taken.append(action)
-            if self.actions_taken[0] < self.increase_bond_action_idx:
-                # action defines to which atom to bond the freshly added atom (we do not count virtual atom)
-                new_atom_idx = len(self.atoms) - 1
-                self.bonds[new_atom_idx, action + 1] = self.bonds[action + 1, new_atom_idx] = 1
-                self.reset_actions_to_level_0()
-            elif self.actions_taken[0] == self.increase_bond_action_idx:
-                self.reset_actions_to_level_2()
-            else:
-                raise ValueError(f"Action at level 0 must be 1,2,3,4 when choosing atom at level 1. Is: {self.actions_taken[0]}")
+            # pick the second atom. only need to increase level
+            next_level = 2
         elif self.current_action_level == 2:
-            # Increase the bond between the chosen atom and the atom picked at level 1.
-            self.actions_taken = [action]
-            atom_a = action
-            atom_b = self.history[-1][1]
+            # Set the bond between the atom picked at level 0 and the one picked at level 1
+            atom_a = self.history[-1]
+            atom_b = self.history[-2]
+
+            if atom_b < self.pick_existing_atoms_start_action_idx_lvl_0:  # we created a new atom
+                atom_b = len(self.atoms) - 2
+            else:
+                atom_b = atom_b - self.pick_existing_atoms_start_action_idx_lvl_0
             assert atom_a != atom_b, f"Cannot bond atom {atom_a} with itself {atom_b}. {np.array([self.vocabulary_valence[x] for x in self.atoms]) - self.bonds[:, 1:].sum(axis=1)}"
-            self.bonds[atom_a + 1, atom_b + 1] += 1
-            self.bonds[atom_b + 1, atom_a + 1] += 1
-            self.reset_actions_to_level_0()
+            bond_order = action + 1
+            self.bonds[atom_a + 1, atom_b + 1] = self.bonds[atom_b + 1, atom_a + 1] = bond_order
+            self.update_rdkit_mol(set_bond=(atom_a, atom_b, bond_order))
+            self.update_topological_distance_matrix(new_atom_created=False)
+
+        self.history.append(int(action))
+        self.current_action_level = next_level
+        self.update_action_mask()
 
     def finalize(self, assert_feasible: bool = False):
         """
@@ -281,27 +271,17 @@ class MoleculeDesign(BaseTrajectory):
         """
         if assert_feasible:
             self.assert_feasible()
-        mol = self.to_rdkit_mol()
+
+        try:
+            Chem.SanitizeMol(self.rdkit_mol)
+        except:
+            self.infeasibility_flag = True
+
         if not self.infeasibility_flag:
-            self.rdkit_mol = mol
             self.smiles_string = Chem.MolToSmiles(self.rdkit_mol)
 
             if self.smiles_string == "C":
                 self.infeasibility_flag = True
-
-    def register_logits(self, logits_level_0: np.array, logits_level_1: np.array, logits_level_2: np.array):
-        """
-        The network predicts logits for level 0 and level 1 together, while for meaningful level 2 logits we first
-        need to have a decision on level 1.
-        """
-        if self.registered_logits is not None:
-            print("Warning: Registering logits before actions have been reset.")
-        if self.current_action_level == 0:
-            self.registered_logits = [logits_level_0, logits_level_1, None]
-        elif self.current_action_level == 2:
-            self.registered_logits = [None, None, logits_level_2]
-        else:
-            print("Warning: Registering logits is supposed to happen only at action level 0 or 2")
 
     def assert_feasible(self):
         """
@@ -309,7 +289,7 @@ class MoleculeDesign(BaseTrajectory):
         and whether all bonds are consistent
         """
         assert self.atoms[0] == 0, "First atom should be virtual (0)"
-        assert np.all([not self.atom_feasibility[x - 1] for x in self.atoms[1:]]) and np.all(self.atoms[1:] > 0), "Only atoms allowed that are also allowd in config vocabulary"
+        assert np.all([not self.atom_feasibility_mask[x - 1] for x in self.atoms[1:]]) and np.all(self.atoms[1:] > 0), "Only atoms allowed that are also allowd in config vocabulary"
         assert self.upper_limit_atoms is None or len(self.atoms) - 1 <= self.upper_limit_atoms, "Exceeded maximum number of atoms"
         assert np.all(self.bonds[0, 1:] == self.virtual_bond_idx) and np.all(self.bonds[1:, 0] == self.virtual_bond_idx), "Virtual atom must be connected to all other atoms."
         assert not np.any(self.bonds.diagonal()), "An atom (even virtual) may not be connected to itself"
@@ -318,8 +298,9 @@ class MoleculeDesign(BaseTrajectory):
         if self.current_action_level == 0 and len(self.atoms) > 2:
             assert np.all(self.bonds[1:, 1:].sum(axis=1) > 0), "An atom must be connected to at least another atom"
 
-    def to_rdkit_mol(self) -> Chem.RWMol:
+    def to_rdkit_mol(self, sanitize=True) -> Chem.RWMol:
         """
+        @Deprecated
         Returns the representation of the current molecule as
         rdkit's RWMol
         """
@@ -330,6 +311,11 @@ class MoleculeDesign(BaseTrajectory):
             a = Chem.Atom(atom_config["atomic_number"])
             if "formal_charge" in atom_config:
                 a.SetFormalCharge(atom_config["formal_charge"])
+            if "chiral_tag" in atom_config:
+                if atom_config["chiral_tag"] == 1:
+                    a.SetChiralTag(Chem.CHI_TETRAHEDRAL_CW)
+                elif atom_config["chiral_tag"] == 2:
+                    a.SetChiralTag(Chem.CHI_TETRAHEDRAL_CCW)
             mol.AddAtom(a)
 
         bond_type = {
@@ -346,10 +332,11 @@ class MoleculeDesign(BaseTrajectory):
                 if bonds[i, j] > 0:
                     mol.AddBond(i, j, bond_type[bonds[i, j]])
 
-        try:
-            Chem.SanitizeMol(mol)
-        except:
-            self.infeasibility_flag = True
+        if sanitize:
+            try:
+                Chem.SanitizeMol(mol)
+            except:
+                self.infeasibility_flag = True
         return mol
 
     def is_terminable(self):
@@ -359,26 +346,22 @@ class MoleculeDesign(BaseTrajectory):
         """
         Returns the current molecule as a SMILES string.
         """
-        return Chem.MolToSmiles(self.to_rdkit_mol())
+        return Chem.MolToSmiles(self.rdkit_mol)
 
     # ---- Implementation of abstract methods from `BaseTrajectory`
     @staticmethod
-    def init_batch_from_instance_list(config: MoleculeConfig, instances: List[int], network: MoleculeTransformer, device: torch.device):
+    def init_batch_from_instance_list(config: MoleculeConfig, instances: List[int], network: nn.Module, device: torch.device):
         """
         An instance is given by the first atom placed on the molecule, so 1 (C), 2 (N) or 3 (O)
         """
         return [MoleculeDesign(config=config, initial_atom=atom) for atom in instances]
 
     @staticmethod
-    def log_probability_fn(trajectories: List['MoleculeDesign'], network: MoleculeTransformer) -> List[np.array]:
+    def log_probability_fn(trajectories: List['MoleculeDesign'], network: nn.Module) -> List[np.array]:
         """
         Given a list of trajectories and a policy network,
         returns a list of numpy arrays, each having length num_actions, where each numpy array is a log-probability
         distribution over the next action level.
-
-        In our molecular case, we need to distinguish between trajectories which have registered logits and those who
-        don't. If they don't, we need to pass them through the network. Otherwise, we can just collect the logits for
-        the corresponding action level.
 
         Parameters:
             trajectories [List[BaseTrajectory]]
@@ -387,36 +370,20 @@ class MoleculeDesign(BaseTrajectory):
             List of numpy arrays, where i-th entry corresponds to the log-probabilities for i-th trajectory.
         """
         log_probs_to_return: List[np.array] = []
+        network.eval()
+        with torch.no_grad():
+            batch = MoleculeDesign.list_to_batch(molecules=trajectories, device=network.device)
+            batch_logits_per_level = list(network(batch))
+            for lvl in range(3):
+                batch_logits_per_level[lvl] = batch_logits_per_level[lvl].cpu().numpy()
 
-        batch_idx_to_list_idx = []
-        to_eval_with_network = []
-        for i, molecule_design in enumerate(trajectories):
-            if molecule_design.registered_logits is None:
-                to_eval_with_network.append(molecule_design)
-                batch_idx_to_list_idx.append(i)
-
-        if len(to_eval_with_network):
-            network.eval()
-            with torch.no_grad():
-                batch = MoleculeDesign.list_to_batch(molecules=to_eval_with_network, device=network.device)
-                batch_level_zero_logits, batch_level_one_logits, batch_level_two_logits = network(batch)
-                batch_level_zero_logits = batch_level_zero_logits.cpu().numpy()
-                batch_level_one_logits = batch_level_one_logits.cpu().numpy()
-                batch_level_two_logits = batch_level_two_logits.cpu().numpy()
-
-                # `level_zero_logits` is of shape (batch, atom vocabulary length + 2). There is no padding, so we don't need to remove anything
-                # `level_one_logits` and `level_two_logits` are of shape (batch, max num_atoms - 1), so we need to remove any padded atoms from them.
-                for i in range(len(to_eval_with_network)):
-                    molecule_design = trajectories[batch_idx_to_list_idx[i]]
-                    level_zero_logits = batch_level_zero_logits[i]
-                    level_one_logits = batch_level_one_logits[i, :batch["num_atoms"][i].item() - 1]
-                    level_two_logits = batch_level_two_logits[i, :batch["num_atoms"][i].item() - 1]
-                    molecule_design.register_logits(
-                        level_zero_logits, level_one_logits, level_two_logits
-                    )
-
-        for molecule_design in trajectories:
-            log_probs_to_return.append(molecule_design.masked_log_probs_for_current_action_level())
+            for i, mol in enumerate(trajectories):
+                # get logits for this molecule and corresponding level
+                logits = batch_logits_per_level[mol.current_action_level][i]
+                # Now we need to trim the padding corresponding to current action level
+                if mol.current_action_level != 2:
+                    logits = logits[:len(mol.current_action_mask)]
+                log_probs_to_return.append(mol.masked_log_probs_for_current_action_level(logits))
 
         return log_probs_to_return
 
@@ -435,7 +402,7 @@ class MoleculeDesign(BaseTrajectory):
         """
         Returns number of current _feasible_ actions.
         """
-        return int((1 - self.current_action_mask[self.current_action_level]).sum())
+        return int((1 - self.current_action_mask).sum())
 
     @staticmethod
     def list_to_batch(molecules: List['MoleculeDesign'], device: torch.device = None,
@@ -444,41 +411,60 @@ class MoleculeDesign(BaseTrajectory):
         Given a list of molecule designs, prepares a batch that can be passed through the network.
         In the following, when referring to `number of atoms`, we _include_ the virtual atom.
         The batch is given as a dictionary with the following keys and values:
-        - "level_idx": This is "0" for level 0 or "1" for level 2 [sic!]. It is used to mark the virtual atom to inform
+        * "level_idx": This is "0" for level 0, "1" for level 1 or "2" for level 2. It is used to mark the virtual atom to inform
             the network what decision to make.
-        - "picked_atom_ohe": A zero vector of length <max num atoms> with a 1 with the index of the
-            picked atom at level 1. This is only relevant for level 2.
-        - "num_atoms": torch.LongTensor of shape (batch_size,), which holds the number of atoms for each molecule
+        * "picked_atom_mhe": A zero vector of length <max num atoms> with a 1 for the index of the
+            atom that was picked/created at level 0, and a 2 for the index of the atom that was picked at level 1.
+        * "num_atoms": torch.LongTensor of shape (batch_size,), which holds the number of atoms for each molecule
             (including virtual)
-        - "atoms": torch.LongTensor of shape (batch_size, <max num atoms>) containing the
+        * "atoms": torch.LongTensor of shape (batch_size, <max num atoms>) containing the
             indices (including virtual=0) of the atoms present in a molecule.
             We pad with 'num atoms in vocab + 1' to the maximum number of atoms in the batch.
-        - "atoms_degree": torch.LongTensor of shape (batch_size, <max num atoms>), where an entry corresponds to the
+        * "atoms_degree": torch.LongTensor of shape (batch_size, <max num atoms>), where an entry corresponds to the
             degree of the atom, i.e., to how many other atoms it is connected (excluding virtual).
              Hence, we pad with 'max possible valence + 1' to the maximum number of atoms in the batch (an atom can be connected to at most 6
              other atoms).
              Note that the virtual atom is also included here, but it is later not used in the network.
-        - "bonds": torch.LongTensor of shape (batch_size, <max num atoms>, <max num atoms>), indicating the connection
+        * "bonds": torch.LongTensor of shape (batch_size, <max num atoms>, <max num atoms>), indicating the connection
             between atoms. We pad both columns and rows with 'virtual bond idx + 1' to the maximum number of atoms in the batch.
-        - "additive_padding_attn_mask": torch.FloatTensor of shape (batch_size, <max num atoms>, <max num atoms>), which
+        * "topological_distance": torch.LongTensor of shape (batch_size, <max num atoms>, <max num atoms>), indicating the topological
+            distance (i.e., smallest number of bonds) between atoms.
+            We pad both columns and rows with 103 (100 max atoms overall + 1 for distance to virtual + 1 for infinity
+             distance + 1 for padding) to the maximum number of atoms in the batch.
+        * "additive_padding_attn_mask": torch.FloatTensor of shape (batch_size, <max num atoms>, <max num atoms>), which
             is zero everywhere except at the padding positions, where it's -inf. For numerical reasons, the diagonal is 0,
             so that still every padding token can attend to itself. This padding mask will later be added to the learned
             attention mask.
+
+        if `include_feasibility_masks` is set to True, we also return
         """
         atoms_padding_idx = len(molecules[0].vocabulary_atom_idcs) + 1
         degree_padding_idx = max(molecules[0].vocabulary_valence) + 1
-        bond_padding_idx = molecules[0].virtual_bond_idx + 1
+        bond_padding_idx = MoleculeDesign.virtual_bond_idx + 1
+        distance_padding_idx = MoleculeDesign.maximum_num_atoms_overall + 3
 
         device = torch.device("cpu") if device is None else device
         num_atoms = [len(mol.atoms) for mol in molecules]
         max_num_atoms = max(num_atoms)
 
-        batch_level_idx = [0 if mol.current_action_level == 0 else 1 for mol in molecules]
+        batch_level_idx = [mol.current_action_level == 0 for mol in molecules]
 
-        batch_picked_atom_ohe = np.zeros(((len(molecules), max_num_atoms)), dtype=int)
+        batch_picked_atom_mhe = np.zeros(((len(molecules), max_num_atoms)), dtype=int)
+        ex_pick_idx_start = molecules[0].pick_existing_atoms_start_action_idx_lvl_0  # alias
         for i, mol in enumerate(molecules):
-            if mol.current_action_level == 2:
-                batch_picked_atom_ohe[i, mol.history[-1][1] + 1] = 1
+            if mol.current_action_level == 0:
+                pass  # nothing has been chosen yet
+            elif mol.current_action_level == 1:
+                # an atom has been picked/created at level 0
+                atom_picked_on_lvl_0 = len(mol.atoms) - 1 if mol.history[-1] < ex_pick_idx_start else mol.history[-1] - ex_pick_idx_start + 1
+                batch_picked_atom_mhe[i, atom_picked_on_lvl_0] = 1
+            elif mol.current_action_level == 2:
+                # an atom has been picked/created at level 0
+                atom_picked_on_lvl_0 = len(mol.atoms) - 1 if mol.history[-2] < ex_pick_idx_start else mol.history[-2] - ex_pick_idx_start + 1
+                batch_picked_atom_mhe[i, atom_picked_on_lvl_0] = 1
+                # an atom has been picked at level 1
+                atom_picked_on_lvl_1 = mol.history[-1] + 1
+                batch_picked_atom_mhe[i, atom_picked_on_lvl_1] = 2
 
         batch_atoms = np.stack([
                 np.concatenate((mol.atoms, np.full(max_num_atoms - num_atoms[i], fill_value=atoms_padding_idx, dtype=int)))
@@ -505,6 +491,15 @@ class MoleculeDesign(BaseTrajectory):
             bonds_list.append(padded_bonds)
         batch_bonds = np.stack(bonds_list)
 
+        distance_matrices_list = [
+            np.pad(
+                mol.topological_distance_matrix, [(0, max_num_atoms - num_atoms[i]), (0, max_num_atoms - num_atoms[i])],
+                mode="constant", constant_values=distance_padding_idx
+            )
+            for i, mol in enumerate(molecules)
+        ]
+        batch_topological_distance = np.stack(distance_matrices_list)
+
         additive_padding_masks = []
         for i, mol in enumerate(molecules):
             mask = np.zeros_like(mol.bonds).astype(float)
@@ -518,49 +513,43 @@ class MoleculeDesign(BaseTrajectory):
 
         return_dict = dict(
             level_idx=torch.tensor(batch_level_idx, dtype=torch.long, device=device),  # (B,)
-            picked_atom_ohe=torch.from_numpy(batch_picked_atom_ohe).long().to(device),  # (B, <max num atoms>)
+            picked_atom_mhe=torch.from_numpy(batch_picked_atom_mhe).long().to(device),  # (B, <max num atoms>)
             num_atoms=torch.tensor(num_atoms, dtype=torch.long, device=device),  # (B,)
             atoms=torch.from_numpy(batch_atoms).long().to(device),  # (B, <max num atoms>)
             atoms_degree=torch.from_numpy(batch_atoms_degree).long().to(device),  # (B, <max num atoms>)
             bonds=torch.from_numpy(batch_bonds).long().to(device),  # (B, <max num atoms>, <max num atoms>)
+            topological_distance=torch.from_numpy(batch_topological_distance).long().to(device),  # (B, <max num atoms>, <max num atoms>)
             additive_padding_attn_mask=torch.from_numpy(batch_additive_padding_attn_mask).float().to(device),  # (B, <max num atoms>, <max num atoms>)
         )
 
         if include_feasibility_masks:
-            num_actions_level_0 = len(molecules[0].vocabulary_atom_idcs) + 2
             # This is only relevant for training. We prepare the masks with respect to action feasibility for all
-            # action levels. Note that we do (!) return masks
-            # also for padded atoms, but these are 0 everywhere (so all feasible). Account for this during training.
-            feasibility_mask_level_zero = torch.from_numpy(
-                np.stack([
-                    mol.current_action_mask[0] if mol.current_action_level == 0 else np.zeros(num_actions_level_0)
-                    for mol in molecules
-                ])
-            ).bool().to(device)
-
-            feasibility_mask_level_one = torch.from_numpy(
-                np.stack(
-                    [np.pad(
-                        mol.current_action_mask[1],
-                        [(0, max_num_atoms - num_atoms[i])]
-                    ) if mol.current_action_level == 0 else np.zeros(max_num_atoms - 1)
-                    for i, mol in enumerate(molecules)]
+            # action levels, also masking padded atoms. For molecules which are at a different action level, we also
+            # return masks, but these are 0 everywhere (so all feasible). Account for this during training in
+            # cross-entropy loss with `ignore_index`.
+            feasibility_masks_per_level = []
+            num_actions_per_level_and_mol = [
+                [mol.pick_existing_atoms_start_action_idx_lvl_0 + len(mol.atoms) - 1 for mol in molecules],  # lvl 0
+                [len(mol.atoms) - 1 for mol in molecules],  # lvl 1
+                [molecules[0].maximum_bond_order] * len(molecules)  # lvl 2
+            ]
+            for lvl, num_actions_per_mol in enumerate(num_actions_per_level_and_mol):
+                max_num_actions = max(num_actions_per_mol)
+                feasibility_masks_per_level.append(
+                    torch.from_numpy(
+                        np.stack([
+                            np.pad(
+                                mol.current_action_mask,
+                                [(0, max_num_actions - num_actions_per_mol[i])],
+                                mode='constant', constant_values=1
+                            ) if mol.current_action_level == lvl else np.zeros(max_num_actions, dtype=bool)
+                        for i, mol in enumerate(molecules)])
+                    ).bool().to(device)
                 )
-            ).bool().to(device)
 
-            feasibility_mask_level_two = torch.from_numpy(
-                np.stack(
-                    [np.pad(
-                        mol.current_action_mask[2],
-                        [(0, max_num_atoms - num_atoms[i])]
-                    ) if mol.current_action_level == 2 else np.zeros(max_num_atoms - 1)
-                     for i, mol in enumerate(molecules)]
-                )
-            ).bool().to(device)
-
-            return_dict["feasibility_mask_level_zero"] = feasibility_mask_level_zero  # (B, num atoms in vocab + 2)
-            return_dict["feasibility_mask_level_one"] = feasibility_mask_level_one  # (B, <max_num_atoms - 1>)
-            return_dict["feasibility_mask_level_two"] = feasibility_mask_level_two  # (B, <max_num_atoms - 1>)
+            return_dict["feasibility_mask_level_zero"] = feasibility_masks_per_level[0]  # (B, <num atoms in vocab + max_num_atoms>)
+            return_dict["feasibility_mask_level_one"] = feasibility_masks_per_level[1]  # (B, <max_num_atoms - 1>)
+            return_dict["feasibility_mask_level_two"] = feasibility_masks_per_level[2]  # (B, <max_num_atoms - 1>)
 
         return return_dict
 
@@ -577,7 +566,7 @@ class MoleculeDesign(BaseTrajectory):
         Returns list of designs which to use as a starting point.
         These are chains of C-atoms of length 1 to max number of atoms - 1.
         """
-        carbon_atom_idx = list(config.atom_vocabulary.keys()).index("O") + 1
+        carbon_atom_idx = list(config.atom_vocabulary.keys()).index("C") + 1
         instance_list = []
         for num_c_to_add in range(min(config.max_num_atoms - 1, config.start_c_chain_max_len)):
             mol = MoleculeDesign(config, initial_atom=1)
@@ -601,13 +590,37 @@ class MoleculeDesign(BaseTrajectory):
         return MoleculeDesign.init_batch_from_instance_list(config, atoms * repeat, None, None)
 
     @staticmethod
-    def from_smiles(config: MoleculeConfig, smiles:str) -> 'MoleculeDesign':
+    def random_atom_order_in_smiles(smiles:str) -> str:
+        """
+        Given a SMILES string, returns an equivalent SMILES string with random atom order. Helpful for
+        data augmentation.
+        """
         mol = Chem.MolFromSmiles(smiles)
-        Chem.SanitizeMol(mol)
-        return MoleculeDesign.from_rdkit_mol(config, mol, smiles, False)
+        if mol is None:
+            raise ValueError("Invalid SMILES input.")
+
+        # Number of atoms
+        num_atoms = mol.GetNumAtoms()
+
+        # Create a random permutation of atom indices
+        atom_indices = list(range(num_atoms))
+        random.shuffle(atom_indices)
+
+        # Renumber the atoms according to the shuffled indices
+        reordered_mol = Chem.RenumberAtoms(mol, atom_indices)
+
+        # Convert the reordered molecule back to SMILES.
+        # Use canonical=False to preserve non-canonical (i.e., randomized) ordering.
+        return Chem.MolToSmiles(reordered_mol, isomericSmiles=True, canonical=False)
 
     @staticmethod
-    def from_rdkit_mol(config: MoleculeConfig, rdkit_mol: Chem.RWMol, smiles: str, do_finish=True) -> 'MoleculeDesign':
+    def from_smiles(config: MoleculeConfig, smiles: str, do_finish=False, compare_smiles=False) -> 'MoleculeDesign':
+        mol = Chem.MolFromSmiles(smiles)
+        Chem.SanitizeMol(mol)
+        return MoleculeDesign.from_rdkit_mol(config, mol, smiles, do_finish, compare_smiles)
+
+    @staticmethod
+    def from_rdkit_mol(config: MoleculeConfig, rdkit_mol: Chem.RWMol, smiles: str, do_finish=True, compare_smiles=True) -> 'MoleculeDesign':
         """
         Creates an instance of `MoleculeDesign` from an RDKit molecule.
         """
@@ -621,12 +634,18 @@ class MoleculeDesign(BaseTrajectory):
             k = config.atom_vocabulary[atom_name]["atomic_number"]
             if "formal_charge" in config.atom_vocabulary[atom_name]:
                 k = f"{k}_{config.atom_vocabulary[atom_name]['formal_charge']}"
-            atomic_num_to_atom_idx[k] = i + 1
+            if "chiral_tag" in config.atom_vocabulary[atom_name]:
+                k = f"{k}@{config.atom_vocabulary[atom_name]['chiral_tag']}"
+            atomic_num_to_atom_idx[k] = i + 1  # account for 0 = Terminate action
 
         for atom in atoms:
             k = atom.GetAtomicNum()
-            if atom.GetFormalCharge() > 0:
-                k = f"{k}_1"
+            formal_charge = int(atom.GetFormalCharge())
+            if formal_charge != 0:
+                k = f"{k}_{formal_charge}"
+            chiral_tag = int(atom.GetChiralTag())
+            if chiral_tag != 0:
+                k = f"{k}@{chiral_tag}"
             atom_idx = atomic_num_to_atom_idx[k]
             atom_idcs_for_design.append(atom_idx)
 
@@ -638,27 +657,27 @@ class MoleculeDesign(BaseTrajectory):
         # We now iterate over each atom.
         for i in range(1, len(atom_idcs_for_design)):
             atom_to_add = atom_idcs_for_design[i]
+
             # We now want to get the most recent index to which the new atom is bonded. This is used as the initial
             # bond of the new atom.
             atom_is_placed = False
-            for j in range(i-1, -1, -1):  # Loop backwards
+            #for j in range(i-1, -1, -1):  # Loop backwards
+            for j in range(0, i):
                 desired_bond_order = adjacency_matrix[i, j]
-                current_bond_order = 0
                 if desired_bond_order > 0:
                     if not atom_is_placed:
                         design.take_action(atom_to_add)
-                        design.take_action(j)
-                        current_bond_order += 1
                         atom_is_placed = True
-                    # Increase bond if needed
-                    while current_bond_order < desired_bond_order:
-                        design.take_action(len(config.atom_vocabulary) + 1)  # increase existing bond
-                        design.take_action(i)  # freshly added atom
-                        design.take_action(j)  # to bond with
-                        current_bond_order += 1
+                    else:
+                        design.take_action(1 + len(config.atom_vocabulary.keys()) + len(design.atoms) - 2)
+
+                    design.take_action(j)
+                    design.take_action(int(desired_bond_order - 1))
+
         if do_finish:
             design.take_action(0)
-            assert design.smiles_string == smiles, f"Converted: {design.smiles_string}, RDKit: {smiles}"
+            if compare_smiles:
+                assert Chem.CanonSmiles(design.smiles_string) == Chem.CanonSmiles(smiles), f"Converted: {Chem.CanonSmiles(design.smiles_string)}, RDKit: {Chem.CanonSmiles(smiles)}"
             design.assert_feasible()
 
         return design

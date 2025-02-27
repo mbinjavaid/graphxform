@@ -21,6 +21,8 @@ class Logger:
 
         def add_to_attribute_dict(a):
             for key, value in a:
+                key = key.replace("+", "_plus")
+                key = key.replace("@", "_at")
                 if isinstance(value, dict):
                     add_to_attribute_dict([(f"{key}.{k}", v) for k, v in value.items()])
                 else:

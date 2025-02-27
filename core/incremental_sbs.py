@@ -216,7 +216,7 @@ class IncrementalSBS:
         self.child_transition_fn = child_transition_fn
         self.memory_aggressive = memory_aggressive
 
-    def perform_gd_extreme(self, beam_width: int,
+    def perform_tasar(self, beam_width: int,
                                 deterministic: bool = False,
                                 nucleus_top_p: float = 1.,
                                 replan_steps: int = 10,
@@ -279,7 +279,6 @@ class IncrementalSBS:
                         best_leaf_batch[_idx] = best_leaf._replace(state=best_leaf_client_state)
                         best_leaf_action_seqs_batch[_idx] = best_leaf_node.get_action_sequence()
 
-                # print(best_leaf_action_seqs_batch[_idx])
                 # Now as we have the best leaf (which can be unaltered), we get the root action of it and remove it
                 # from the action sequence
                 root_action = best_leaf_action_seqs_batch[_idx].pop(0)
@@ -308,7 +307,12 @@ class IncrementalSBS:
                 else:
                     root_nodes[_idx] = (root_node, root_state)
 
-        return all_leaves
+        all_leaves_sorted = [
+            sorted(x, key=lambda y: self.leaf_evaluation_fn(y.state), reverse=True)
+            for x in all_leaves
+        ]
+
+        return all_leaves_sorted
 
     def perform_incremental_sbs(self, beam_width: int, num_rounds: int, nucleus_top_p: float = 1.,
                                 sbs_keep_intermediate: bool = False,

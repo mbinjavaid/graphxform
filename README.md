@@ -17,25 +17,33 @@ sampled without replacement for multiple rounds, the setting `gumbeldore_config.
 Install all requirements from `requirements.txt`. Additionally, you must install **[torch_scatter](https://github.com/rusty1s/pytorch_scatter)** with the options 
 corresponding to your hardware.
 
-Create subdirectories `results` (where model weights and experimental results will be saved) and `data`. 
+Create subdirectories `results` (where model weights and experimental results will be saved), `data`, `data/chembl` and 
+`data/chembl/pretrain_sequences`. 
+
+### GuacaMol
+
+For the drug design tasks, [guacamol](https://github.com/BenevolentAI/guacamol/tree/master) is required. A run will fail, since in guacamol's `utils.chemistry`, it needs `histogram` from scipy, which is no longer supported. You can exchange it with `from numpy import histogram`, see this [issue](https://github.com/BenevolentAI/guacamol/issues/33). 
 
 ## Pretraining
 
 To pretrain with the settings in the paper, do the following: 
 
-1. Please download the file `chembl.tab` from this link: [Download File](https://drive.google.com/file/d/1UKNivLk5tgXzUwuKH2ZxYCCczcM-M7jl/view?usp=sharing)
-and put it under the `./data` directory.
-2. Run `$ python create_pretrain_dataset.py`. This will filter the SMILES in `chembl.tab` for all strings containing the C,N,O-alphabet and
-converts them to instances of `MoleculeDesign` (the class in `molecule_design.py`, which takes the role of the molecular graph environment).
-The pickled molecules are saved in `./data/pretrain_data.pickle`.
-3. Run `$ python pretrain.py` to perform pretraining of the model. The general config to use (e.g., architecture) is under `config.py`.
+1. Download the file `chembl_35_chemreps.txt.gz` from this this link: [Download File](https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_35/chembl_35_chemreps.txt.gz)
+and put the extracted `chembl_35_chemreps.txt` under the `./data/chembl` directory.
+2. Run `$ python filter_molecules.py`. This will perform a train/val split with 100k validation molecules, which will be
+put under `data/chembl/chembl_{train/valid}.smiles`. Then, depending on the allowed vocabulary (see `filter_molecules.py`),
+it filters the smiles for all strings containing the allowed sets of characters and save them under `data/chembl/chembl_{train/valid}_filtered.smiles`.
+3. Run `$ python create_pretrain_dataset.py`. This will convert the filtered SMILES to instances of `MoleculeDesign` (the class in `molecule_design.py`, which takes the role of the molecular graph environment).
+The pickled molecules are saved in `./data/chembl/pretrain_sequences/chembl_{train/valid}.pickle`.
+4. Run `$ python pretrain.py` to perform pretraining of the model. The general config to use (e.g., architecture) is under `config.py`.
 In `pretrain.py`, you can specify pretrain-specific options directly at the entrypoint to adjust to your hardware, i.e.:
 ```python
 if __name__ == '__main__':
     pretrain_train_dataset = "./data/pretrain_data.pickle"  # Path to the pretraining dataset
     pretrain_num_epochs = 1000   # For how many epochs to train
-    batch_size = 128  # Minibatch size
-    num_batches_per_epoch = 2500   # Number of minibatches per epoch.
+    batch_size = 512  # Minibatch size
+    num_batches_per_epoch = 3000   # Number of minibatches per epoch.
+    batch_size_validation = 512  # Batch size during validation
     training_device = "cuda:0"  # Device on which to train. Set to "cpu" if no CUDA available.
     num_dataloader_workers = 30  # Number of dataloader workers for creating batches for training
     load_checkpoint_from_path = None   # Path to checkpoint if training should be continued from existing weights.
@@ -44,9 +52,10 @@ if __name__ == '__main__':
 
 ## Finetuning
 
-Finetuning the model is performed by running `$ python main.py`. The first thing that should be done is modify `config.py`
+Finetuning the model is performed by running `$ python main.py`. We note that during finetuning, all layers excpet the last
+are frozen. The first thing that should be done is modify `config.py`
 to configure everything to your needs. The default `config.py` here in the repo reflects in general the setup in the paper, 
-and we list all options and their meaning below in detail.
+and we list all options and their meaning below in detail. The config as it is, is defined to perform `celecoxib_rediscovery` of the GuacaMol benchmark.
 
 In each epoch during finetuning, the agent generates a high number of potential molecules, and stores the best ones 
 under `./data/generated_molecules.pickle` (can be changed via `gumbeldore_config.destination_path` in the config, see below).
@@ -85,15 +94,36 @@ for more detailed info on the parallelization (which is not really used here).
    because the indexing is derived from it. To explain how it works, it's best to look at the default:
    ```python
    self.atom_vocabulary = {  # Attention! Order matters!
-      "C":    {"allowed": True, "atomic_number": 6, "valence": 4, "min_atoms": 0},
-      "N":    {"allowed": True, "atomic_number": 7, "valence": 3, "min_atoms": 0},
-      "O":    {"allowed": True, "atomic_number": 8, "valence": 2, "min_atoms": 0}
-   }
-   ```
-   Each key is an atom name (e.g., a single letter, but naming is arbitrary) corresponding to a node type that can be placed
-   on the graph. The value is again a dictionary, with `allowed` indicating if the atom may be placed (otherwise, it will be masked,
-   useful for seeing how turning atom types on and off affect the performance). `atomic_number` is used to identify the atom type
-   in `rdkit`. `min_atoms` is an optional int to force the agent to use a minimum number of atoms of that type in each design.
+    "C":    {"allowed": True, "atomic_number": 6, "valence": 4},
+    "C-":   {"allowed": True, "atomic_number": 6, "valence": 3, "formal_charge": -1},
+    "C+":   {"allowed": True, "atomic_number": 6, "valence": 5, "formal_charge": 1},
+    "C@":   {"allowed": True, "atomic_number": 6, "valence": 4, "chiral_tag": 1},
+    "C@@":  {"allowed": True, "atomic_number": 6, "valence": 4, "chiral_tag": 2},
+    "N":    {"allowed": True, "atomic_number": 7, "valence": 3},
+    "N-":   {"allowed": True, "atomic_number": 7, "valence": 2, "formal_charge": -1},
+    "N+":   {"allowed": True, "atomic_number": 7, "valence": 4, "formal_charge": 1},
+    "O":    {"allowed": True, "atomic_number": 8, "valence": 2},
+    "O-":   {"allowed": True, "atomic_number": 8, "valence": 1, "formal_charge": -1},
+    "O+":   {"allowed": True, "atomic_number": 8, "valence": 3, "formal_charge": 1},
+    "F":    {"allowed": True, "atomic_number": 9, "valence": 1},
+    "P":    {"allowed": True, "atomic_number": 15, "valence": 7},
+    "P-":   {"allowed": True, "atomic_number": 15, "valence": 6, "formal_charge": -1},
+    "P+":   {"allowed": True, "atomic_number": 15, "valence": 8, "formal_charge": 1},
+    "S":    {"allowed": True, "atomic_number": 16, "valence": 6},
+    "S-":   {"allowed": True, "atomic_number": 16, "valence": 5, "formal_charge": -1},
+    "S+":   {"allowed": True, "atomic_number": 16, "valence": 7, "formal_charge": 1},
+    "S@":   {"allowed": True, "atomic_number": 16, "valence": 6, "chiral_tag": 1},
+    "S@@":  {"allowed": True, "atomic_number": 16, "valence": 6, "chiral_tag": 2},
+    "Cl": {"allowed": True, "atomic_number": 17, "valence": 1},
+    "Br": {"allowed": True, "atomic_number": 35, "valence": 1},
+    "I": {"allowed": True, "atomic_number": 53, "valence": 1}
+    }
+    ```
+    Each key is an atom name (e.g., a single letter, but naming is arbitrary) corresponding to a node type that can be placed
+    on the graph. The value is again a dictionary, with `allowed` indicating if the atom may be placed (otherwise, it will be masked,
+    useful for seeing how turning atom types on and off affect the performance). `atomic_number` is used to identify the atom type
+    in `rdkit`. `valence` specifies to how many other non-hydrogen atoms we can bond it with. For ionization, we also set `formal_charge`, and for chirality, set `chiral_tag` (1 for rdkit's `Chem.CHI_TETRAHEDRAL_CW` and 2 for `Chem.CHI_TETRAHEDRAL_CCW`.
+    **Note that for the solvent design tasks, we set `allowed` to `False` for all atoms except C, N, O.** 
 
 - `start_from_c_chains`: [bool] If `True` (Default), the agent starts each design from a carbon chain. See `start_c_chain_max_len` below in that case.
 - `start_c_chain_max_len`: [int] Defaults to 1. Only relevant if `start_from_c_chains` is `True`. Then, if integer `n` is given here, 
@@ -107,17 +137,13 @@ for more detailed info on the parallelization (which is not really used here).
 - `synthetic_accessibility_in_objective_scale`: [float] Defaults to 0. This is actually not used in the paper. If a positive
     value `x` is given, the objective value will be augmented with synthetic accessibility score. I.e., let `score` be the original
     objective value, then the updated one is set to `score - x * SA_score`.
-- `disallow_oxygen_bonding`: [bool] If `True`, oxygen may not bond with other oxygen atoms.
-- `disallow_nitrogen_nitrogen_single_bond`: [bool] If `True`, nitrogen may not bond with nitrogen with single bonds (only double or triple).
-- `disallow_rings`: [bool] If `True`, no rings are allowed, i.e., do not allow to increase the bond order between atoms that aren't bonded yet.
-- `disallow_rings_larger_than`: [int] Defaults to 0. If this is greater than 3, all rings larger than the given value are not allowed.
+- `include_structural_constraints`: [bool] If `True`, design is performed under the constraints mentioned in the paper. Used for the constrained results of the solvent design tasks. 
 
 #### Objective function options
 
 - `GHGNN_model_path`: [str] Path to activity coefficient prediction model. Defaults to `objective_predictor/GH_GNN_IDAC/models/GHGNN.pth`.
 - `GHGNN_hidden_dim`: [int] Latent dim of activity coefficient prediction model. Defaults to 113 and should not be altered.
-- `objective_type`: [str] Objective function to use for finetuning as described in paper. 
-Must be either **"IBA"** or **"DMBA"** (for TMB/DMBA).
+- `objective_type`: [str] Objective function to use for finetuning as described in paper. For **solvent design**, this is either **"IBA"** or **"DMBA_TMB"** (for TMB/DMBA). For the GuacaMol goal-directed tasks, this is one of the following: `celecoxib_rediscovery`,`troglitazone_rediscovery`,`thiothixene_rediscovery`,`aripiprazole_similarity`,`albuterol_similarity`,`mestranol_similarity`,`isomers_c11h24`,`isomers_c9h10n2o2pf2cl`,`median_camphor_menthol`,`median_tadalafil_sildenafil`,`osimertinib_mpo`,`fexofenadine_mpo`,`ranolazine_mpo`,`perindopril_rings`,`amlodipine_rings`,`sitagliptin_replacement`,`zaleplon_mpo`,`valsartan_smarts`,`deco_hop`,`scaffold_hop`.
 - `num_predictor_workers`: [int] Number of parallel workers that distribute objective function evaluations between each other. Defaults to 10.
 - `objective_predictor_batch_size`: [int] Batch size for inference of the activity coefficient model.
 - `objective_gnn_device`: [str] Device on which the activity model lives. Defaults to "cpu".
@@ -142,19 +168,20 @@ This variable will be set as the env var of the same name in each worker. Defaul
 #### Learning algorithm for finetuning options
 
 - `gumbeldore_config`: [dict] This is the config for the self-improvement part. We go through the options below but only explain how they are used
-    in our setup. For a more general discussion, please see the SIL repository [https://github.com/grimmlab/gumbeldore](https://github.com/grimmlab/gumbeldore).
-    - `num_trajectories_to_keep:` [int] Number of best designed molecules to keep, which are used for supervised training during finetuning.
+    in our setup. For a more general discussion, please see the TASAR repository [https://github.com/grimmlab/step-and-reconsider/](https://github.com/grimmlab/step-and-reconsider/).
+    - `num_trajectories_to_keep:` [int] Number of best designed molecules to keep, which are used for supervised training during finetuning. Default is 100.
     - `keep_intermediate_trajectories`: [bool] If this is `True`, all designed molecules encountered in the trie are considered,
-        not only the leaves. This is not used in the paper and defaults to `False`.
+        not only the leaves.
     - `devices_for_workers`: List[str] Number of parallel workers and on which devices their models live. Defaults to `["cuda:0"] * 1`.
     - `destination_path`: [str] Path where the generated molecules after each epoch are stored (and then loaded from to use as training dataset).
         Defaults to `"./data/generated_molecules.pickle"`. **Note**: You need to manually delete this file if you want to start fresh in a new run.
     Otherwise, it will always only be updated.
     - `batch_size_per_worker`: [int] If you start from a single atom, keep at 1.
     - `batch_size_per_cpu_worker`: [int] Same as above. This value is used for workers whose models live on the CPU.
-    - `search_type`: [str] Keep at `'wor'` (sampling without replacement using stochastic beam search in multiple rounds).
-    - `beam_width`: [int] Beam width for stochastic beam search. Defaults to 1024. Adjust to you hardware.
-    - `num_rounds`: Union[int, Tuple[int, int]]. If it's a single integer, we sample for this many rounds exactly. If it's an (int, int)-tuple
+    - `search_type`: [str] Keep at `'tasar'` ("Take a step and reconsider": sampling without replacement using stochastic beam search, following the best solution for a number of steps, before considering alternatives).
+    - `beam_width`: [int] Beam width for stochastic beam search. Defaults to 16 for demonstration purposes. Value in paper is 512.
+    - `replan_steps`: [int] Needed for TASAR. Defines the 'step size', i.e. for how many actions the best solution should be followed before sampling unseen alternatives. Defaults to 12 (value used in paper), indicating that we resample solutions after every 3 atoms placed.
+    - `num_rounds`: Union[int, Tuple[int, int]]. (No longer used in the paper, only relevant for `search_type='wor'`). If it's a single integer, we sample for this many rounds exactly. If it's an (int, int)-tuple
       (as used in the paper), then we sample as long as it takes to obtain a new best molecule, but for a minimum of first entry rounds and a maximum of second entry rounds.
     - `deterministic`: [bool] Set to `True` to switch to deterministic beam seach. Not relevant for paper.
     - `nucleus_top_p`: [float] Top-p sampling nucleus size. Defaults to 1.0 (no nucleus sampling)
@@ -162,7 +189,7 @@ This variable will be set as the env var of the same name in each worker. Defaul
 
 #### Results and logging options
 
-- `results_path`: [str] Path where to save results (checkpoint and top 20 molecules) to. Defaults to 
+- `results_path`: [str] Path where to save results (checkpoint and top 20 molecules with objective values and SMILES). Defaults to 
     ```python
     os.path.join("./results", datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S"))
     ```
@@ -173,6 +200,7 @@ This variable will be set as the env var of the same name in each worker. Defaul
 Thanks to the following repositories:
 
 - [rezero](https://github.com/majumderb/rezero)
-- [gumbeldore](https://github.com/grimmlab/gumbeldore), using
-	- [unique-randomizer](https://github.com/google-research/unique-randomizer)
-	- [stochastic-beam-search](https://github.com/wouterkool/stochastic-beam-search/tree/stochastic-beam-search)
+- [step-and-reconsider](https://github.com/grimmlab/step-and-reconsider), using
+    - [gumbeldore](https://github.com/grimmlab/gumbeldore)
+    - [unique-randomizer](https://github.com/google-research/unique-randomizer)
+    - [stochastic-beam-search](https://github.com/wouterkool/stochastic-beam-search/tree/stochastic-beam-search)

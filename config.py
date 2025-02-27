@@ -7,41 +7,62 @@ class MoleculeConfig:
         self.seed = 42
 
         # Network and environment
-        self.latent_dimension = 128
-        self.num_transformer_blocks = 8
-        self.num_heads = 8
+        self.latent_dimension = 512
+        self.num_transformer_blocks = 10
+        self.num_heads = 16
         self.dropout = 0.
         self.use_rezero_transformer = True
 
         # Environment options
         self.wall_clock_limit = None  # in seconds. If no limit, set to None
-        self.max_num_atoms = 25
+        self.max_num_atoms = 50
 
         self.atom_vocabulary = {  # Attention! Order matters!
-            "C":    {"allowed": True, "atomic_number": 6, "valence": 4, "min_atoms": 0},
-            "N":    {"allowed": True, "atomic_number": 7, "valence": 3, "min_atoms": 0},
-            "O":    {"allowed": True, "atomic_number": 8, "valence": 2, "min_atoms": 0}
+            "C":    {"allowed": True, "atomic_number": 6, "valence": 4},
+            "C-":   {"allowed": True, "atomic_number": 6, "valence": 3, "formal_charge": -1},
+            "C+":   {"allowed": True, "atomic_number": 6, "valence": 5, "formal_charge": 1},
+            "C@":   {"allowed": True, "atomic_number": 6, "valence": 4, "chiral_tag": 1},
+            "C@@":  {"allowed": True, "atomic_number": 6, "valence": 4, "chiral_tag": 2},
+
+            "N":    {"allowed": True, "atomic_number": 7, "valence": 3},
+            "N-":   {"allowed": True, "atomic_number": 7, "valence": 2, "formal_charge": -1},
+            "N+":   {"allowed": True, "atomic_number": 7, "valence": 4, "formal_charge": 1},
+
+            "O":    {"allowed": True, "atomic_number": 8, "valence": 2},
+            "O-":   {"allowed": True, "atomic_number": 8, "valence": 1, "formal_charge": -1},
+            "O+":   {"allowed": True, "atomic_number": 8, "valence": 3, "formal_charge": 1},
+
+            "F":    {"allowed": True, "atomic_number": 9, "valence": 1},
+
+            "P":    {"allowed": True, "atomic_number": 15, "valence": 7},
+            "P-":   {"allowed": True, "atomic_number": 15, "valence": 6, "formal_charge": -1},
+            "P+":   {"allowed": True, "atomic_number": 15, "valence": 8, "formal_charge": 1},
+
+            "S":    {"allowed": True, "atomic_number": 16, "valence": 6},
+            "S-":   {"allowed": True, "atomic_number": 16, "valence": 5, "formal_charge": -1},
+            "S+":   {"allowed": True, "atomic_number": 16, "valence": 7, "formal_charge": 1},
+            "S@":   {"allowed": True, "atomic_number": 16, "valence": 6, "chiral_tag": 1},
+            "S@@":  {"allowed": True, "atomic_number": 16, "valence": 6, "chiral_tag": 2},
+
+            "Cl": {"allowed": True, "atomic_number": 17, "valence": 1},
+            "Br": {"allowed": True, "atomic_number": 35, "valence": 1},
+            "I": {"allowed": True, "atomic_number": 53, "valence": 1}
         }
 
         self.start_from_c_chains = True
         self.start_c_chain_max_len = 1
-        self.start_from_smiles = None
+        self.start_from_smiles = None  # Give SMILES and set `start_from_c_chains=False`.
         self.repeat_start_instances = 1
         # Positive value x, where the actual objective with our molecule score will be set to obj = score - x * SA_score
         self.synthetic_accessibility_in_objective_scale = 0
-        # Don't allow oxygen to bond with other oxygen
-        self.disallow_oxygen_bonding = True
-        # Don't allow nitrogen to bond with nitrogen with single bond (only double or triple)
-        self.disallow_nitrogen_nitrogen_single_bond = True
-        # Don't allow rings, i.e., do not allow to increase the bond between atoms that aren't bonded yet at level 2.
-        self.disallow_rings = False
-        self.disallow_rings_larger_than = 0  # if this is greater than 3, we disallow all rings that are larger than the given value.
+        # Enforce structural constraints (see molecule evaluator)
+        self.include_structural_constraints = False
 
         # Objective molecule predictor
         self.GHGNN_model_path = os.path.join("objective_predictor/GH_GNN_IDAC/models/GHGNN.pth")
         self.GHGNN_hidden_dim = 113
-        self.objective_type = "IBA"  # either "IBA" or "DMBA_TMB"
-        self.num_predictor_workers = 10  # num of parallel workers that operate on a given list of molecules
+        self.objective_type = "celecoxib_rediscovery"  # either "IBA" or "DMBA_TMB" for solvent design, or goal-directed task from GuacaMol (see README)
+        self.num_predictor_workers = 1  # num of parallel workers that operate on a given list of molecules
         self.objective_predictor_batch_size = 64
         self.objective_gnn_device = "cpu"  # device on which the GNN should live
 
@@ -50,9 +71,9 @@ class MoleculeConfig:
         self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
 
         # Training
-        self.num_dataloader_workers = 30  # Number of workers for creating batches for training
+        self.num_dataloader_workers = 3  # Number of workers for creating batches for training
         self.CUDA_VISIBLE_DEVICES = "0,1"  # Must be set, as ray can have problems detecting multiple GPUs
-        self.training_device = "cuda:0"  # Device on which to perform the supervised training
+        self.training_device = "cpu"  # Device on which to perform the supervised training
         self.num_epochs = 1000  # Number of epochs (i.e., passes through training set) to train
         self.scale_factor_level_one = 1.
         self.scale_factor_level_two = 1.
@@ -73,15 +94,16 @@ class MoleculeConfig:
         # Self-improvement sequence decoding
         self.gumbeldore_config = {
             # Number of trajectories with the the highest objective function evaluation to keep for training
-            "num_trajectories_to_keep": 500,
-            "keep_intermediate_trajectories": False,  # if True, we consider all intermediate, terminable trajectories
-            "devices_for_workers": ["cuda:0"] * 1,
+            "num_trajectories_to_keep": 100,
+            "keep_intermediate_trajectories": True,  # if True, we consider all intermediate, terminable trajectories
+            "devices_for_workers": ["cpu"] * 1,
             "destination_path": "./data/generated_molecules.pickle",
             "batch_size_per_worker": 1,  # Keep at one, as we only have three atoms from which we can start
             "batch_size_per_cpu_worker": 1,
-            "search_type": "wor",
-            "beam_width": 1024,
-            "num_rounds": (10, 50),  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
+            "search_type": "tasar",
+            "beam_width": 32,
+            "replan_steps": 12,
+            "num_rounds": 1,  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
             "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.
             "nucleus_top_p": 1.,
             "pin_workers_to_core": False

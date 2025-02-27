@@ -56,6 +56,15 @@ def train_for_one_epoch(epoch: int, config: MoleculeConfig, network: MoleculeTra
 
     # Train for one epoch
     network.train()
+
+    # freeze layers except the last
+    for parameter in network.parameters():
+        parameter.requires_grad = False
+    network.virtual_atom_linear.weight.requires_grad = True
+    network.virtual_atom_linear.bias.requires_grad = True
+    network.bond_atom_linear.weight.requires_grad = True
+    network.bond_atom_linear.bias.requires_grad = True
+
     accumulated_loss_lvl_zero = 0
     accumulated_loss_lvl_one = 0
     accumulated_loss_lvl_two = 0

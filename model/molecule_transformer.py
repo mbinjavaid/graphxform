@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn.modules import TransformerEncoderLayer
 from model.rztx import RZTXEncoderLayer
 from config import MoleculeConfig
+from molecule_design import MoleculeDesign
 
 
 class MoleculeTransformer(nn.Module):
@@ -17,27 +18,29 @@ class MoleculeTransformer(nn.Module):
         self.num_heads = self.config.num_heads
         self.num_blocks = self.config.num_transformer_blocks
 
-        self.num_possible_atoms = len(self.config.atom_vocabulary) + 1  # all atoms in vocab plus one virtual atom
         max_possible_valence = max([self.config.atom_vocabulary[x]["valence"] for x in self.config.atom_vocabulary])
+        self.num_possible_atom_types = len(self.config.atom_vocabulary) + 1  # all atoms in vocab plus one virtual atom
+        self.num_possible_bonds = MoleculeDesign.maximum_bond_order
 
-        self.virtual_atom_level_embedding = nn.Embedding(num_embeddings=2, embedding_dim=self.latent_dim)
-        self.atom_learnable_embedding = nn.Embedding(num_embeddings=self.num_possible_atoms + 1, embedding_dim=self.latent_dim,
-                                                     padding_idx=self.num_possible_atoms)
-        self.degree_learnable_embedding = nn.Embedding(num_embeddings=max_possible_valence + 2, embedding_dim=self.latent_dim,
+        self.virtual_atom_level_embedding = nn.Embedding(num_embeddings=3, embedding_dim=self.latent_dim)
+        self.atom_learnable_embedding = nn.Embedding(num_embeddings=self.num_possible_atom_types + 1, embedding_dim=self.latent_dim,
+                                                     padding_idx=self.num_possible_atom_types)
+        self.degree_learnable_embedding = nn.Embedding(num_embeddings=max_possible_valence + 2, embedding_dim=self.latent_dim,  # always count also 0 degree
                                                        padding_idx=max_possible_valence + 1)  # an atom can be connected to at most 4 other atoms
         # We map each bond to a scalar, additive attention bias for each transformer block and head. We perform the
         # embedding for all layers in one go.
-        self.bond_learnable_embedding = nn.Embedding(num_embeddings=max_possible_valence + 3,
+        self.bond_learnable_embedding = nn.Embedding(num_embeddings=MoleculeDesign.virtual_bond_idx + 2,
                                                      embedding_dim=self.num_blocks * self.num_heads,
-                                                     padding_idx=max_possible_valence + 2)
+                                                     padding_idx=MoleculeDesign.virtual_bond_idx + 1)
 
-        # Maps the One-(or zero)-hot encoded vector to an indicator for each atom if it was picked at level 1 (only
-        # relevant for level 2). In particular, an index of 0 maps to all 0s.
-        self.picked_atom_embedding = nn.Embedding(num_embeddings=2, embedding_dim=self.latent_dim, padding_idx=0)
+        # Maps the One-(or zero)-hot encoded vector to an indicator for each atom if it was picked at level 0 (indicator 1) or
+        # level 1 (indicator 2).
+        self.picked_atom_embedding = nn.Embedding(num_embeddings=3, embedding_dim=self.latent_dim, padding_idx=0)
 
-        # Mapping the transformed virtual atom to the "pick atom or terminate" logits
-        self.virtual_atom_linear = nn.Linear(self.latent_dim, self.num_possible_atoms + 1)
-        # Mapping latent atoms to two logits: One for level 1, and one for level 2
+        # Mapping the transformed virtual atom to the "terminate or create atom of type" logits, as well as the logits
+        # for level 2
+        self.virtual_atom_linear = nn.Linear(self.latent_dim, self.num_possible_atom_types + self.num_possible_bonds)
+        # Mapping latent atoms to two logits: One for level 0, and one for level 1
         self.bond_atom_linear = nn.Linear(self.latent_dim, 2)
 
         # Transformer itself
@@ -62,14 +65,11 @@ class MoleculeTransformer(nn.Module):
 
         atom_sequence = self.atom_learnable_embedding(x["atoms"])  # (B, num_atoms, latent_dim)
         # add the embedded degree to all but the virtual atom. Shape stays (B, num_atoms, latent_dim)
-        #print(x["atoms_degree"].shape)
-        #print(x["atoms_degree"][:, 1:])
         atom_sequence[:, 1:] = atom_sequence[:, 1:] + self.degree_learnable_embedding(x["atoms_degree"][:, 1:])
         # add the embedded level index to the virtual atom.
         atom_sequence[:, 0] = atom_sequence[:, 0] + self.virtual_atom_level_embedding(x["level_idx"])
         # add the embedding indicating whether an atom was picked to the sequence
-        atom_sequence = atom_sequence + self.picked_atom_embedding(x["picked_atom_ohe"])
-
+        atom_sequence = atom_sequence + self.picked_atom_embedding(x["picked_atom_mhe"])
 
         # Prepare the additive attention masks
         attn_mask = self.bond_learnable_embedding(x["bonds"])  # (B, num_atoms, num_atoms, num_trf_blocks*num_heads)
@@ -84,12 +84,13 @@ class MoleculeTransformer(nn.Module):
             atom_sequence = trf_block(atom_sequence, src_mask=mask_block_folded)
 
         virtual_atom = atom_sequence[:, 0, :]  # (B, latent_dim)
-        level_zero_logits = self.virtual_atom_linear(virtual_atom)  # (B, num possible atoms + 2)
+        virtual_level_zero_and_two_logits = self.virtual_atom_linear(virtual_atom)  # (B, 1 + num possible atoms + number of possible bonds)
+        virtual_level_zero_logits = virtual_level_zero_and_two_logits[:, :-self.num_possible_bonds]
+        level_two_logits = virtual_level_zero_and_two_logits[:, -self.num_possible_bonds:]
 
-        level_one_and_two_logits = self.bond_atom_linear(atom_sequence[:, 1:, :])  # (B, num_atoms - 1, 2)
-        level_one_logits = level_one_and_two_logits[:, :, 0]
-        level_two_logits = level_one_and_two_logits[:, :, 1]
-
+        atom_level_zero_and_one_logits = self.bond_atom_linear(atom_sequence[:, 1:, :])  # (B, num_atoms - 1, 2)
+        level_zero_logits = torch.concatenate((virtual_level_zero_logits, atom_level_zero_and_one_logits[:, :, 0]), dim=1)
+        level_one_logits = atom_level_zero_and_one_logits[:, :, 1]
         return level_zero_logits, level_one_logits, level_two_logits
 
     def get_weights(self):

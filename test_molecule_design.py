@@ -66,7 +66,9 @@ class TestMoleculeDesign(unittest.TestCase):
 
         # Check remaining valence
         atom_valence = np.array([mol.vocabulary_valence[x] for x in mol.atoms])
-        atom_valence_used = mol.bonds.sum(axis=1)
+        # atom_valence_used = mol.bonds.sum(axis=1)
+        # Don't consider virtual bonds in valence calculation:
+        atom_valence_used = np.sum(np.where(mol.bonds != mol.virtual_bond_idx, mol.bonds, 0), axis=1)
         self.assertEqual(atom_valence[1] - atom_valence_used[1], 3)  # C has 3 valence left (4-1)
         self.assertEqual(atom_valence[2] - atom_valence_used[2], 0)  # N has 0 valence left (3-1-2)
         self.assertEqual(atom_valence[3] - atom_valence_used[3], 0)  # O has 0 valence left (2-2)

@@ -99,6 +99,13 @@ class MoleculeDesign(BaseTrajectory):
         # molecule. See class docstring for an example.
         self.history: List[int] = []
 
+        self.first_bond_atom: Optional[int] = None  # 1-indexed atom added or selected at level 0 for bond formation.
+        self.second_bond_atom: Optional[int] = None  # 1-indexed atom selected at level 1.
+
+        self._reconstruction = False  # flag to indicate we are reconstructing from SMILES/rdkit mol.
+
+
+
         self.objective: Optional[float] = None
         # Synthetic accessibility score, obtained from RDKit, ranging from 1 [easiest] to 10 [hardest]
         self.sa_score: float = 0.
@@ -111,50 +118,68 @@ class MoleculeDesign(BaseTrajectory):
 
     # Fix the update_action_mask method
     def update_action_mask(self):
-        """
-        Creates the action mask for the current action level. Here, we take
-        into account the valence of the present atoms.
-        """
         if self.synthesis_done:
             self.current_action_mask = None
             return
+
         atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms])
-        atom_valence_remaining = atom_valence - self.bonds[:, 1:].sum(axis=1)
-        ex_action_idx = self.pick_existing_atoms_start_action_idx_lvl_0  # alias
+        atom_valence_used = np.sum(np.where(self.bonds != self.virtual_bond_idx, self.bonds, 0), axis=1)
+        atom_valence_remaining = atom_valence - atom_valence_used
+        ex_action_idx = self.pick_existing_atoms_start_action_idx_lvl_0
 
         if self.current_action_level == 0:
-            # Same as before
             self.current_action_mask = np.zeros(len(self.vocabulary_atom_idcs) + len(self.atoms), dtype=bool)
             self.current_action_mask[1:ex_action_idx] = self.atom_feasibility_mask
             if (self.upper_limit_atoms is not None and len(self.atoms) - 1 == self.upper_limit_atoms) or \
-                    (not np.any(atom_valence_remaining[1:])):
-                self.current_action_mask[1:ex_action_idx] = 1
-            self.current_action_mask[ex_action_idx:][np.where(atom_valence_remaining[1:] <= 0)] = 1
+               (not np.any(atom_valence_remaining[1:])):
+                self.current_action_mask[1:ex_action_idx] = True
+            self.current_action_mask[ex_action_idx:][np.where(atom_valence_remaining[1:] <= 0)] = True
             bond_indicator = np.zeros_like(self.bonds[1:, 1:])
             bond_indicator[np.where(self.bonds[1:, 1:] == 0)] = 1
             np.fill_diagonal(bond_indicator, 0)
             has_free_nonneighbor = np.matmul(bond_indicator, (atom_valence_remaining[1:] > 0)[:, None]).squeeze()
-            self.current_action_mask[ex_action_idx:][np.where(has_free_nonneighbor == 0)] = 1
+            self.current_action_mask[ex_action_idx:][np.where(has_free_nonneighbor == 0)] = True
 
         elif self.current_action_level == 1:
-            self.current_action_mask = np.zeros(len(self.atoms) - 1, dtype=bool)
-            atom_picked_on_lvl_0 = len(self.atoms) - 2 if self.history[-1] < ex_action_idx else self.history[
-                                                                                                    -1] - ex_action_idx
-            self.current_action_mask[atom_picked_on_lvl_0] = 1  # Can't bond to itself
-            self.current_action_mask[np.where(atom_valence_remaining[1:] < 1)] = 1  # Atoms with no free valence
-
-            # REMOVE THIS LINE to allow cycle formation:
-            # self.current_action_mask[np.where(self.bonds[atom_picked_on_lvl_0 + 1, 1:] > 0)] = 1
+            # For level 1, if in reconstruction mode use a mask length equal to len(atoms)-1 (direct mapping)
+            if self._reconstruction:
+                mask = np.zeros(len(self.atoms) - 1, dtype=bool)
+                for i in range(len(mask)):
+                    if atom_valence_remaining[i + 1] < 1:
+                        mask[i] = True
+                self.current_action_mask = mask
+            else:
+                # Use available_atoms list excluding first_bond_atom.
+                available_atoms = [i for i in range(1, len(self.atoms)) if i != self.first_bond_atom]
+                mask = np.zeros(len(available_atoms), dtype=bool)
+                for j, atom_idx in enumerate(available_atoms):
+                    if atom_valence_remaining[atom_idx] < 1:
+                        mask[j] = True
+                self.current_action_mask = mask
 
         elif self.current_action_level == 2:
-            # Same as before
-            self.current_action_mask = np.zeros(self.maximum_bond_order, dtype=bool)
-            atom_picked_on_lvl_0 = len(self.atoms) - 2 if self.history[-2] < ex_action_idx else self.history[
-                                                                                                    -2] - ex_action_idx
-            atom_picked_on_lvl_1 = self.history[-1]
-            max_bond_order = min(atom_valence_remaining[atom_picked_on_lvl_0 + 1],
-                                 atom_valence_remaining[atom_picked_on_lvl_1 + 1])
-            self.current_action_mask[int(max_bond_order):] = 1
+            mask_length = 2 * self.maximum_bond_order
+            mask = np.zeros(mask_length, dtype=bool)
+            if self.first_bond_atom is None or self.second_bond_atom is None:
+                atom1 = 1
+                atom2 = 1
+            else:
+                atom1 = self.first_bond_atom
+                atom2 = self.second_bond_atom
+            max_allowed_order = min(atom_valence_remaining[atom1], atom_valence_remaining[atom2])
+            mask[int(max_allowed_order):self.maximum_bond_order] = True
+
+            current_order = self.bonds[atom1, atom2]
+            for r in range(1, self.maximum_bond_order + 1):
+                action_idx = self.maximum_bond_order + r - 1
+                proposed_order = current_order - r
+                if proposed_order < 1:
+                    if not self.is_connected_without_bond(atom1, atom2):
+                        mask[action_idx] = True
+                else:
+                    if proposed_order > max_allowed_order:
+                        mask[action_idx] = True
+            self.current_action_mask = mask
 
     def update_topological_distance_matrix(self, new_atom_created: bool = False):
         if new_atom_created:
@@ -203,62 +228,83 @@ class MoleculeDesign(BaseTrajectory):
         return log_probs
 
     def take_action(self, action: int):
-        """
-        Takes an action on the current action level and updates everything accordingly.
-        """
         assert not self.synthesis_done, "Taking action on already terminated design. No no!"
-        assert self.current_action_mask[action] == 0, \
-            f"Trying to take action {action} on level {self.current_action_level}, but it is set to infeasible"
-        ex_action_idx = self.pick_existing_atoms_start_action_idx_lvl_0  # alias
+        assert self.current_action_mask[action] == 0, (
+            f"Action {action} on level {self.current_action_level} is masked (infeasible)."
+        )
+        ex_action_idx = self.pick_existing_atoms_start_action_idx_lvl_0
 
         if self.current_action_level == 0:
             self.history.append(action)
             if action == 0:
                 self.synthesis_done = True
             elif action < ex_action_idx:
-                # Add a new atom
+                # Add a new atom.
                 self.atoms = np.append(self.atoms, action)
-                # Add a new row and column to bonds matrix
                 self.bonds = np.pad(self.bonds, ((0, 1), (0, 1)), 'constant', constant_values=0)
-                # Set connections to virtual atom
-                self.bonds[0, -1] = 7
-                self.bonds[-1, 0] = 7
+                self.bonds[0, -1] = self.virtual_bond_idx
+                self.bonds[-1, 0] = self.virtual_bond_idx
+                self.update_rdkit_mol(new_atom=action)
+                self.update_topological_distance_matrix(new_atom_created=True)
+                self.first_bond_atom = len(self.atoms) - 1
                 self.current_action_level = 1
             else:
-                # Pick an existing atom
+                self.first_bond_atom = action - ex_action_idx + 1
                 self.current_action_level = 1
             self.update_action_mask()
 
         elif self.current_action_level == 1:
             self.history.append(action)
-            self.second_atom = action + 1  # The second atom is 1-indexed in atoms array
+            # Use a different mapping if we are in reconstruction mode.
+            if self._reconstruction:
+                # In reconstruction, use the simple direct mapping.
+                self.second_bond_atom = action + 1
+            else:
+                # In regular mode, use the mapping that skips first_bond_atom.
+                if self.first_bond_atom is None:
+                    raise ValueError("first_bond_atom is not set for level 1 action.")
+                if (action + 1) < self.first_bond_atom:
+                    self.second_bond_atom = action + 1
+                else:
+                    self.second_bond_atom = action + 2
             self.current_action_level = 2
             self.update_action_mask()
 
         elif self.current_action_level == 2:
-            # Create a bond with the specified order between the atom selected on level 0 and the atom selected on level 1.
             self.history.append(action)
+            if self.first_bond_atom is None or self.second_bond_atom is None:
+                raise ValueError("Bond atoms not selected before level 2 action.")
+            atom1 = self.first_bond_atom
+            atom2 = self.second_bond_atom
 
-            # Determine which atoms to bond
-            if self.history[-3] < ex_action_idx:
-                # If we added a new atom on level 0
-                atom_picked_on_lvl_0 = len(self.atoms) - 1  # Last atom (1-indexed)
+            if action < self.maximum_bond_order:
+                new_bond_order = action + 1
             else:
-                # If we selected an existing atom on level 0
-                atom_picked_on_lvl_0 = self.history[-3] - ex_action_idx + 1  # Convert action to atom index (1-indexed)
+                reduction = action - self.maximum_bond_order + 1
+                current_bond_order = self.bonds[atom1, atom2]
+                new_bond_order = current_bond_order - reduction
+                if new_bond_order < 1:
+                    new_bond_order = 0
+                if new_bond_order == 0:
+                    if not self.is_connected_without_bond(atom1, atom2):
+                        raise ValueError("Reduction action would disconnect the molecule; action should be masked.")
 
-            atom_picked_on_lvl_1 = self.history[-2] + 1  # Convert from 0-indexed to 1-indexed
-            bond_order = action + 1  # Bond order is 1-indexed
+            print(f"DEBUG: Bonding atoms at indices {atom1} and {atom2} with new order {new_bond_order}")
+            self.bonds[atom1, atom2] = new_bond_order
+            self.bonds[atom2, atom1] = new_bond_order
 
-            print(
-                f"DEBUG: Bonding atoms at indices {atom_picked_on_lvl_0} and {atom_picked_on_lvl_1} with order {bond_order}")
+            rdkit_idx1 = atom1 - 1
+            rdkit_idx2 = atom2 - 1
+            bond = self.rdkit_mol.GetBondBetweenAtoms(rdkit_idx1, rdkit_idx2)
+            if bond is not None:
+                self.rdkit_mol.RemoveBond(rdkit_idx1, rdkit_idx2)
+            if new_bond_order >= 1:
+                self.rdkit_mol.AddBond(rdkit_idx1, rdkit_idx2, self.bond_types[new_bond_order])
+            self.update_topological_distance_matrix(new_atom_created=False)
 
-            # Update bonds matrix
-            self.bonds[atom_picked_on_lvl_0, atom_picked_on_lvl_1] = bond_order
-            self.bonds[atom_picked_on_lvl_1, atom_picked_on_lvl_0] = bond_order
-
-            # Reset to level 0
             self.current_action_level = 0
+            self.first_bond_atom = None
+            self.second_bond_atom = None
             self.update_action_mask()
 
     def finalize(self, assert_feasible: bool = False):
@@ -721,6 +767,8 @@ class MoleculeDesign(BaseTrajectory):
         # Start by creating the design with the first atom
         design = MoleculeDesign(config, atom_idcs_for_design[0])
 
+        design._reconstruction = True
+
         # Track which bonds have been added
         bonds_added = set()
 
@@ -781,4 +829,5 @@ class MoleculeDesign(BaseTrajectory):
                 except:
                     print("ERROR: Failed to compare SMILES strings")
 
+        design._reconstruction = False
         return design

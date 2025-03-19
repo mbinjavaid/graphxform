@@ -163,12 +163,12 @@ class MoleculeDesign(BaseTrajectory):
         atom_valence_remaining = atom_valence - self.bonds[1:, 1:].sum(axis=1)
         ex_action_idx = self.pick_existing_atoms_start_action_idx_lvl_0  # alias
 
-        print("----- update_action_mask: START -----")
-        print("Current bonds matrix:")
-        print(self.bonds)
-
-        print("Pre-update action mask:")
-        print(self.current_action_mask)  # Example: print current state before updating the mask
+        # print("----- update_action_mask: START -----")
+        # print("Current bonds matrix:")
+        # print(self.bonds)
+        #
+        # print("Pre-update action mask:")
+        # print(self.current_action_mask)  # Example: print current state before updating the mask
 
 
         if self.current_action_level == 0:
@@ -228,13 +228,13 @@ class MoleculeDesign(BaseTrajectory):
 
             # Debug print: Show history and selected_bond if it exists.
 
-            print("DEBUG: In level 2 update_action_mask")
-
-            print("DEBUG: self.history =", self.history)
+            # print("DEBUG: In level 2 update_action_mask")
+            #
+            # print("DEBUG: self.history =", self.history)
 
             if hasattr(self, 'selected_bond'):
 
-                print("DEBUG: self.selected_bond =", self.selected_bond)
+                # print("DEBUG: self.selected_bond =", self.selected_bond)
 
                 atom_a_idx, atom_b_idx = self.selected_bond
 
@@ -258,7 +258,7 @@ class MoleculeDesign(BaseTrajectory):
 
             # Debug prints for the bond selection.
 
-            print("Atom indices for bond update: atom_a_idx =", atom_a_idx, ", atom_b_idx =", atom_b_idx)
+            # print("Atom indices for bond update: atom_a_idx =", atom_a_idx, ", atom_b_idx =", atom_b_idx)
 
             # Fetch remaining valence info.
 
@@ -266,13 +266,13 @@ class MoleculeDesign(BaseTrajectory):
 
             atom_valence_remaining = atom_valence - self.bonds[1:, 1:].sum(axis=1)
 
-            print("Atom valences:", atom_valence)
+            # print("Atom valences:", atom_valence)
 
-            print("Atom valence remaining:", atom_valence_remaining)
+            # print("Atom valence remaining:", atom_valence_remaining)
 
             current_bond_order = self.bonds[atom_a_idx, atom_b_idx]
 
-            print("Current bond order:", current_bond_order)
+            # print("Current bond order:", current_bond_order)
 
             # Compute available extra increase based solely on remaining valence.
 
@@ -280,15 +280,15 @@ class MoleculeDesign(BaseTrajectory):
 
             allowed_final_order = current_bond_order + extra_increase
 
-            print("Extra available increase:", extra_increase)
+            # print("Extra available increase:", extra_increase)
 
-            print("Allowed final order for increase actions:", allowed_final_order)
+            # print("Allowed final order for increase actions:", allowed_final_order)
 
             # Unmask available increasing actions.
 
             self.current_action_mask[:int(allowed_final_order)] = False
 
-            print("Action mask after unmasking increase actions:", self.current_action_mask)
+            # print("Action mask after unmasking increase actions:", self.current_action_mask)
 
             # Unmask reduction candidates:
 
@@ -300,14 +300,14 @@ class MoleculeDesign(BaseTrajectory):
 
                     new_order = current_bond_order - reduction
 
-                    print("Reduction move:", reduction, "would result in order:", new_order, "at reduction_idx:",
-                          reduction_idx)
+                    # print("Reduction move:", reduction, "would result in order:", new_order, "at reduction_idx:",
+                    #       reduction_idx)
 
                     if new_order > 0:
 
                         self.current_action_mask[reduction_idx] = False
 
-                        print("Partial reduction unmasked at index", reduction_idx)
+                        # print("Partial reduction unmasked at index", reduction_idx)
 
                     else:
 
@@ -315,35 +315,35 @@ class MoleculeDesign(BaseTrajectory):
 
                             self.current_action_mask[reduction_idx] = False
 
-                            print("Full removal allowed (connectivity holds) unmasked at index", reduction_idx)
+                            # print("Full removal allowed (connectivity holds) unmasked at index", reduction_idx)
 
                         else:
 
                             self.current_action_mask[reduction_idx] = True
 
-                            print("Full removal disallowed (connectivity fails) at index", reduction_idx)
+                            # print("Full removal disallowed (connectivity fails) at index", reduction_idx)
 
             reduction_indices = list(range(self.maximum_bond_order, len(self.current_action_mask)))
 
-            print("Reduction indices computed: ", reduction_indices)
+            # print("Reduction indices computed: ", reduction_indices)
 
             feasible_reduction = [i for i in reduction_indices if not self.current_action_mask[i]]
 
-            print("Feasible reduction candidates (should be non-empty if a bond is reducible):", feasible_reduction)
+            # print("Feasible reduction candidates (should be non-empty if a bond is reducible):", feasible_reduction)
 
-            print("Final updated action mask:", self.current_action_mask)
+            # print("Final updated action mask:", self.current_action_mask)
 
         # Log the computed reduction indices
         reduction_indices = list(range(self.maximum_bond_order, len(self.current_action_mask)))
-        print("Reduction indices computed: ", reduction_indices)
+        # print("Reduction indices computed: ", reduction_indices)
         feasible_reduction = [i for i in reduction_indices if
                               self.current_action_mask[i] == 0 or self.current_action_mask[i] == False]
-        print("Feasible reduction candidates (should be non-empty if a bond is reducible):", feasible_reduction)
+        # print("Feasible reduction candidates (should be non-empty if a bond is reducible):", feasible_reduction)
 
         # Final mask log
-        print("Updated action mask:")
-        print(self.current_action_mask)
-        print("----- update_action_mask: END -----")
+        # print("Updated action mask:")
+        # print(self.current_action_mask)
+        # print("----- update_action_mask: END -----")
 
     def update_topological_distance_matrix(self, new_atom_created: bool = False):
         if new_atom_created:
@@ -552,10 +552,12 @@ class MoleculeDesign(BaseTrajectory):
                     candidate_atom_idx = self.last_created_atom_idx
 
                 else:
-
                     existing_bond_action_index = action - new_atom_action_count
-
-                    candidate_atom_idx = existing_bond_action_index + 1  # offset to match self.atoms indexing
+                    candidate_atom_idx = existing_bond_action_index + 1  # initial candidate for real atoms (indices starting at 1)
+                    if candidate_atom_idx == self.base_atom_idx:
+                        candidate_atom_idx += 1
+                        if candidate_atom_idx >= len(self.atoms):
+                            raise IndexError("No valid candidate atom for bond modification.")
 
                 # Set the selected bond using the base atom and the candidate atom.
 
@@ -578,7 +580,7 @@ class MoleculeDesign(BaseTrajectory):
             if action < self.maximum_bond_order:
                 # Increase or set bond order: action index 0 means order 1, index 1 means order 2, etc.
                 new_order = action + 1
-                print(f"DEBUG: Bonding atoms at indices {atom_a_idx} and {atom_b_idx} with new order {new_order}")
+                # print(f"DEBUG: Bonding atoms at indices {atom_a_idx} and {atom_b_idx} with new order {new_order}")
                 self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = new_order
                 # RDKit atoms exclude the virtual atom, so subtract 1 from indices.
                 self.update_rdkit_mol(set_bond=(atom_a_idx - 1, atom_b_idx - 1, new_order))
@@ -587,8 +589,8 @@ class MoleculeDesign(BaseTrajectory):
                 reduction = action - self.maximum_bond_order + 1
                 current_order = self.bonds[atom_a_idx, atom_b_idx]
                 new_order = max(0, current_order - reduction)
-                print(
-                    f"DEBUG: Reducing bond between atoms at indices {atom_a_idx} and {atom_b_idx} from order {current_order} to {new_order}")
+                # print(
+                #     f"DEBUG: Reducing bond between atoms at indices {atom_a_idx} and {atom_b_idx} from order {current_order} to {new_order}")
                 if new_order > 0:
                     self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = new_order
                     self.rdkit_mol.RemoveBond(atom_a_idx - 1, atom_b_idx - 1)

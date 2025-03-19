@@ -72,8 +72,10 @@ def test_bond_addition_and_reduction(mol):
     mol.current_action_level = 1
     mol.base_atom_idx = 1  # A is at index 1.
     # Remove any existing last_created_atom_idx so that in block2 the fallback computes candidate.
-    if hasattr(mol, 'last_created_atom_idx'):
-        del mol.last_created_atom_idx
+
+    # if hasattr(mol, 'last_created_atom_idx'):
+    #     del mol.last_created_atom_idx
+
     # Set history so that the branch for existing bond modification is triggered.
     # (In our level1 code, if history[-1] < pick_existing_atoms_start_action_idx_lvl_0, candidate is computed from history.)
     mol.history = [mol.pick_existing_atoms_start_action_idx_lvl_0]

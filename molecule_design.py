@@ -159,8 +159,8 @@ class MoleculeDesign(BaseTrajectory):
         if self.synthesis_done:
             self.current_action_mask = None
             return
-        atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms])
-        atom_valence_remaining = atom_valence - self.bonds[:, 1:].sum(axis=1)
+        atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms[1:]])
+        atom_valence_remaining = atom_valence - self.bonds[1:, 1:].sum(axis=1)
         ex_action_idx = self.pick_existing_atoms_start_action_idx_lvl_0  # alias
 
         print("----- update_action_mask: START -----")
@@ -175,19 +175,20 @@ class MoleculeDesign(BaseTrajectory):
             self.current_action_mask = np.zeros(len(self.vocabulary_atom_idcs) + len(self.atoms), dtype=bool)
             self.current_action_mask[1:ex_action_idx] = self.atom_feasibility_mask
             if (self.upper_limit_atoms is not None and len(self.atoms) - 1 == self.upper_limit_atoms) or \
-                    (not np.any(atom_valence_remaining[1:])):
+                    (not np.any(atom_valence_remaining)):
                 self.current_action_mask[1:ex_action_idx] = 1
             existing_bond = (self.bonds[1:, 1:] > 0).any(axis=1)
-            mask_valence = (atom_valence_remaining[1:] <= 0)
+            mask_valence = (atom_valence_remaining <= 0)
             final_mask = np.logical_and(mask_valence, np.logical_not(existing_bond))
             masked = np.zeros(len(self.atoms) - 1, dtype=bool)
-            masked[np.where(atom_valence_remaining[1:] <= 0)] = True
+            masked[np.where(atom_valence_remaining <= 0)] = True
             masked[np.where(existing_bond)] = False
             self.current_action_mask[ex_action_idx:] = masked
             bond_indicator = np.zeros_like(self.bonds[1:, 1:])
             bond_indicator[np.where(self.bonds[1:, 1:] == 0)] = 1
             np.fill_diagonal(bond_indicator, 0)
-            has_free_nonneighbor = np.matmul(bond_indicator, (atom_valence_remaining[1:] > 0)[:, None]).squeeze()
+            # has_free_nonneighbor = np.matmul(bond_indicator, (atom_valence_remaining[1:] > 0)[:, None]).squeeze()
+            has_free_nonneighbor = np.matmul(bond_indicator, (atom_valence_remaining > 0)[:, None]).squeeze()
             self.current_action_mask[ex_action_idx:][np.where(has_free_nonneighbor == 0)] = 1
 
         elif self.current_action_level == 1:
@@ -204,7 +205,8 @@ class MoleculeDesign(BaseTrajectory):
             self.current_action_mask[:new_atom_action_count] = np.array(self.atom_feasibility_mask)
             for idx in range(new_atom_action_count):
                 if idx < len(self.atoms) - 1:
-                    if atom_valence_remaining[idx + 1] < 1:
+                    # if atom_valence_remaining[idx + 1] < 1:
+                    if atom_valence_remaining[idx] < 1:
                         self.current_action_mask[idx] = 1
             for idx in range(existing_bond_action_count):
                 if idx == atom_picked_on_lvl_0:
@@ -260,9 +262,9 @@ class MoleculeDesign(BaseTrajectory):
 
             # Fetch remaining valence info.
 
-            atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms])
+            atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms[1:]])
 
-            atom_valence_remaining = atom_valence - self.bonds[:, 1:].sum(axis=1)
+            atom_valence_remaining = atom_valence - self.bonds[1:, 1:].sum(axis=1)
 
             print("Atom valences:", atom_valence)
 
@@ -274,7 +276,7 @@ class MoleculeDesign(BaseTrajectory):
 
             # Compute available extra increase based solely on remaining valence.
 
-            extra_increase = min(atom_valence_remaining[atom_a_idx], atom_valence_remaining[atom_b_idx])
+            extra_increase = min(atom_valence_remaining[atom_a_idx-1], atom_valence_remaining[atom_b_idx-1])
 
             allowed_final_order = current_bond_order + extra_increase
 

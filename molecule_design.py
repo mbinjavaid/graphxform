@@ -327,17 +327,17 @@ class MoleculeDesign(BaseTrajectory):
 
             # print("Reduction indices computed: ", reduction_indices)
 
-            feasible_reduction = [i for i in reduction_indices if not self.current_action_mask[i]]
+            # feasible_reduction = [i for i in reduction_indices if not self.current_action_mask[i]]
 
             # print("Feasible reduction candidates (should be non-empty if a bond is reducible):", feasible_reduction)
 
             # print("Final updated action mask:", self.current_action_mask)
 
         # Log the computed reduction indices
-        reduction_indices = list(range(self.maximum_bond_order, len(self.current_action_mask)))
+        # reduction_indices = list(range(self.maximum_bond_order, len(self.current_action_mask)))
         # print("Reduction indices computed: ", reduction_indices)
-        feasible_reduction = [i for i in reduction_indices if
-                              self.current_action_mask[i] == 0 or self.current_action_mask[i] == False]
+        # feasible_reduction = [i for i in reduction_indices if
+        #                       self.current_action_mask[i] == 0 or self.current_action_mask[i] == False]
         # print("Feasible reduction candidates (should be non-empty if a bond is reducible):", feasible_reduction)
 
         # Final mask log

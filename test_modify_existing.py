@@ -22,12 +22,11 @@ class TestModifyExistingBonds(unittest.TestCase):
         atom_a = carbon_indices[0]
         atom_b = carbon_indices[1]
 
-        print(atom_a)
-
         # Verify the original bond order between the two carbons.
         original_bond = rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
         # print("original bond: ", original_bond)
         original_order = original_bond.GetBondTypeAsDouble() if original_bond else 0
+        print("original order: ", original_order)
         self.assertEqual(original_order, 1, "Expected initial carbon-carbon bond to be a single bond (order 1).")
 
         # Now, simulate a modification of the bond order.

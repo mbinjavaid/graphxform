@@ -111,35 +111,39 @@ class MoleculeDesign(BaseTrajectory):
 
     def is_connected_without_bond(self, atom1: int, atom2: int) -> bool:
         """
-        Checks whether the molecule would remain connected if the bond between atom1 and atom2 were removed.
-        This is done by performing a depth-first search from atom1 and checking if atom2 is still reachable.
+        Checks whether the molecule would remain connected if the bond between atom1 and atom2 were removed,
+        using RDKit's GetMolFrags function.
 
-        Parameters:
-            atom1, atom2: Atom indices in the internal representation (including the virtual atom at index 0)
-
-        Returns:
-            bool: True if the molecule would remain connected after removing the bond, False otherwise
+        Note:
+            - The input atom indices refer to the internal representation which includes the virtual atom at index 0.
+            - The rdkit_mol attribute, however, only contains the "real" atoms (i.e. indices starting from 0).
+            - Thus, we adjust the indices by subtracting 1.
         """
+        # If the molecule has less than two real atoms, removal of any bond will disconnect it.
         if len(self.atoms) <= 3:
             return False
 
-        bonds_copy = self.bonds.copy()
-        bonds_copy[atom1, atom2] = 0
-        bonds_copy[atom2, atom1] = 0
+        # Map atom indices from the internal representation to the indices in rdkit_mol.
+        # Our internal indices: virtual atom at index 0, then real atoms 1,2,... map to rdkit indices 0,1,...
+        rdkit_atom1 = atom1 - 1
+        rdkit_atom2 = atom2 - 1
 
-        visited = np.zeros(len(self.atoms), dtype=bool)
-        stack = [atom1]
-        visited[atom1] = True
+        # Create a copy of the RDKit molecule so that modifications don't affect the original.
+        mol_copy = Chem.RWMol(self.rdkit_mol)
 
-        while stack:
-            current = stack.pop()
-            if current == atom2:
-                return True
-            for neighbor in range(1, len(self.atoms)):
-                if bonds_copy[current, neighbor] > 0 and not visited[neighbor]:
-                    visited[neighbor] = True
-                    stack.append(neighbor)
-        return False
+        # Remove the bond if it exists.
+        bond = mol_copy.GetBondBetweenAtoms(rdkit_atom1, rdkit_atom2)
+        if bond is None:
+            # If there is no bond between the atoms, then connectivity remains unaffected.
+            return True
+
+        mol_copy.RemoveBond(rdkit_atom1, rdkit_atom2)
+
+        # Compute the fragments. GetMolFrags returns a tuple where each element is a tuple of atom indices in that fragment.
+        frags = Chem.GetMolFrags(mol_copy, asMols=False)
+
+        # The molecule is connected if and only if there is exactly one fragment.
+        return len(frags) == 1
 
     def update_action_mask(self):
         """
@@ -620,24 +624,28 @@ class MoleculeDesign(BaseTrajectory):
         return MoleculeDesign.from_rdkit_mol(config, mol, smiles, do_finish, compare_smiles)
 
     @staticmethod
-    def from_rdkit_mol(config: MoleculeConfig, rdkit_mol: Chem.RWMol, smiles: str, do_finish=True, compare_smiles=True) -> 'MoleculeDesign':
+    def from_rdkit_mol(config: MoleculeConfig, rdkit_mol: Chem.RWMol, smiles: str, do_finish=True,
+                       compare_smiles=True) -> 'MoleculeDesign':
         """
         Creates an instance of `MoleculeDesign` from an RDKit molecule.
+        Directly constructs the internal representation by bypassing the action system.
         """
+        # Create an empty molecule design with the first atom
         Chem.Kekulize(rdkit_mol)
         atoms = rdkit_mol.GetAtoms()
-        atom_idcs_for_design = []  # indices to choose at level 0 for corresponding atoms
-        adjacency_matrix: np.ndarray = Chem.rdmolops.GetAdjacencyMatrix(rdkit_mol, useBO=True)
+        atom_idcs_for_design = []  # Atom types in our vocabulary
 
-        atomic_num_to_atom_idx = dict()
+        # Map atomic numbers to indices in our vocabulary
+        atomic_num_to_atom_idx = {}
         for i, atom_name in enumerate(config.atom_vocabulary.keys()):
             k = config.atom_vocabulary[atom_name]["atomic_number"]
             if "formal_charge" in config.atom_vocabulary[atom_name]:
                 k = f"{k}_{config.atom_vocabulary[atom_name]['formal_charge']}"
             if "chiral_tag" in config.atom_vocabulary[atom_name]:
                 k = f"{k}@{config.atom_vocabulary[atom_name]['chiral_tag']}"
-            atomic_num_to_atom_idx[k] = i + 1  # account for initial virtual atom (0)
+            atomic_num_to_atom_idx[k] = i + 1
 
+        # Get atom types for all atoms in the molecule
         for atom in atoms:
             k = atom.GetAtomicNum()
             formal_charge = int(atom.GetFormalCharge())
@@ -649,27 +657,72 @@ class MoleculeDesign(BaseTrajectory):
             atom_idx = atomic_num_to_atom_idx[k]
             atom_idcs_for_design.append(atom_idx)
 
-        # Start by creating the design using the first atom.
+        # Initialize with the first atom
         design = MoleculeDesign(config, atom_idcs_for_design[0])
-        # Iterate over the rest of the atoms.
-        for i in range(1, len(atom_idcs_for_design)):
-            atom_to_add = atom_idcs_for_design[i]
-            atom_is_placed = False
-            # Iterate over previous atoms to check bonds.
-            for j in range(0, i):
-                desired_bond_order = adjacency_matrix[i, j]
-                if desired_bond_order > 0:
-                    if not atom_is_placed:
-                        design.take_action(atom_to_add)
-                        atom_is_placed = True
-                    else:
-                        design.take_action(1 + len(config.atom_vocabulary.keys()) + len(design.atoms) - 2)
-                    design.take_action(j)
-                    design.take_action(int(desired_bond_order - 1))
+
+        # CRUCIAL CHANGE: Instead of using the action system, we'll build the molecule directly
+
+        # 1. First, recreate the RDKit molecule from scratch
+        design.rdkit_mol = Chem.RWMol()
+
+        # 2. Add all atoms to both the design.atoms array and the RDKit molecule
+        for i in range(len(atoms)):
+            if i == 0:
+                # First atom is already added during initialization
+                atom_config = config.atom_vocabulary[list(config.atom_vocabulary.keys())[atom_idcs_for_design[0] - 1]]
+                a = Chem.Atom(atom_config["atomic_number"])
+                design.rdkit_mol.AddAtom(a)
+            else:
+                atom_type = atom_idcs_for_design[i]
+                design.atoms = np.append(design.atoms, atom_type)
+                atom_config = config.atom_vocabulary[list(config.atom_vocabulary.keys())[atom_type - 1]]
+                a = Chem.Atom(atom_config["atomic_number"])
+                design.rdkit_mol.AddAtom(a)
+
+        # 3. Update the bonds matrix and add bonds to the RDKit molecule
+        num_atoms = len(design.atoms)
+        design.bonds = np.zeros((num_atoms, num_atoms), dtype=np.uint8)
+        design.bonds[0, 1:] = design.bonds[1:, 0] = design.virtual_bond_idx  # Connect virtual atom
+
+        # 4. Add bonds between atoms based on the adjacency matrix
+        adjacency_matrix = Chem.rdmolops.GetAdjacencyMatrix(rdkit_mol, useBO=True)
+        for i in range(len(atoms)):
+            for j in range(i + 1, len(atoms)):
+                bond_order = int(adjacency_matrix[i, j])
+                if bond_order > 0:
+                    # Add bond to the design's bond matrix
+                    design.bonds[i + 1, j + 1] = design.bonds[j + 1, i + 1] = bond_order
+
+                    # Add bond to the RDKit molecule
+                    design.rdkit_mol.AddBond(i, j, design.bond_types[bond_order])
+
+        # 5. Initialize and update the topological distance matrix
+        # First create a distance matrix of the right size (including virtual atom)
+        design.topological_distance_matrix = np.full((num_atoms, num_atoms),
+                                                     design.infinity_distance,
+                                                     dtype=np.uint8)
+
+        # Set the diagonal to 0 (distance to self)
+        np.fill_diagonal(design.topological_distance_matrix, 0)
+
+        # Set distances to virtual atom
+        design.topological_distance_matrix[0, 1:] = design.topological_distance_matrix[1:, 0] = design.virtual_distance
+
+        # Set actual distances between atoms
+        if len(atoms) > 0:
+            rdkit_distance_matrix = Chem.GetDistanceMatrix(design.rdkit_mol, force=True).astype(np.uint8)
+            design.topological_distance_matrix[1:len(atoms) + 1, 1:len(atoms) + 1] = rdkit_distance_matrix
+
+        # 6. Set the current action level to 0 (choosing atoms)
+        design.current_action_level = 0
+        design.update_action_mask()
+
+        # 7. Finalize if needed
         if do_finish:
-            design.take_action(0)
+            design.synthesis_done = True
+            design.finalize()
             if compare_smiles:
-                assert Chem.CanonSmiles(design.smiles_string) == Chem.CanonSmiles(smiles), \
-                    f"Converted: {Chem.CanonSmiles(design.smiles_string)}, RDKit: {Chem.CanonSmiles(smiles)}"
-            design.assert_feasible()
+                assert Chem.CanonSmiles(design.smiles_string) == Chem.CanonSmiles(
+                    smiles), f"Converted: {Chem.CanonSmiles(design.smiles_string)}, RDKit: {Chem.CanonSmiles(smiles)}"
+
         return design

@@ -161,7 +161,8 @@ class MoleculeDesign(BaseTrajectory):
         if self.current_action_level == 0:
             self.current_action_mask = np.zeros(len(self.vocabulary_atom_idcs) + len(self.atoms), dtype=bool)
             self.current_action_mask[1:ex_action_idx] = self.atom_feasibility_mask
-            if (self.upper_limit_atoms is not None and len(self.atoms) - 1 == self.upper_limit_atoms) or (not np.any(atom_valence_remaining)):
+            if (self.upper_limit_atoms is not None and len(self.atoms) - 1 == self.upper_limit_atoms) or (
+            not np.any(atom_valence_remaining)):
                 self.current_action_mask[1:ex_action_idx] = 1
             existing_bond = (self.bonds[1:, 1:] > 0).any(axis=1)
             masked = np.zeros(len(self.atoms) - 1, dtype=bool)
@@ -179,21 +180,65 @@ class MoleculeDesign(BaseTrajectory):
             existing_bond_action_count = len(self.atoms) - 1
             total_actions = new_atom_action_count + existing_bond_action_count
             self.current_action_mask = np.zeros(total_actions, dtype=bool)
-            atom_picked_on_lvl_0 = (
-                len(self.atoms) - 2 if self.history[-1] < self.pick_existing_atoms_start_action_idx_lvl_0
-                else self.history[-1] - self.pick_existing_atoms_start_action_idx_lvl_0)
-            self.current_action_mask[:new_atom_action_count] = np.array(self.atom_feasibility_mask)
-            for idx in range(new_atom_action_count):
-                if idx < len(self.atoms) - 1:
-                    if atom_valence_remaining[idx] < 1:
-                        self.current_action_mask[idx] = 1
-            for idx in range(existing_bond_action_count):
-                if idx == atom_picked_on_lvl_0:
-                    self.current_action_mask[new_atom_action_count + idx] = 1
-                elif self.bonds[len(self.atoms) - 1, idx + 1] > 0:
-                    self.current_action_mask[new_atom_action_count + idx] = 0
+
+            # Determine which atom was selected at level 0
+            if len(self.history) > 0:
+                latest_action = self.history[-1]
+                if latest_action < self.pick_existing_atoms_start_action_idx_lvl_0:
+                    # We added a new atom
+                    atom_picked_on_lvl_0 = len(self.atoms) - 2
                 else:
-                    self.current_action_mask[new_atom_action_count + idx] = 1
+                    # We selected an existing atom
+                    atom_picked_on_lvl_0 = latest_action - self.pick_existing_atoms_start_action_idx_lvl_0
+            else:
+                atom_picked_on_lvl_0 = len(self.atoms) - 2
+
+            # Find the actual index in the atoms array (adding 1 for virtual atom)
+            atom_idx_in_array = atom_picked_on_lvl_0 + 1
+
+            # Mask action 0 (virtual atom creation)
+            self.current_action_mask[0] = True
+
+            # Apply atom feasibility mask - making sure sizes match
+            if len(self.atom_feasibility_mask) == new_atom_action_count:
+                # This handles the case where we have exactly one mask entry per atom type
+                self.current_action_mask[1:new_atom_action_count + 1] = np.array(self.atom_feasibility_mask)
+            else:
+                # Fallback - copy as many mask entries as possible
+                n = min(len(self.atom_feasibility_mask), new_atom_action_count - 1)
+                self.current_action_mask[1:n + 1] = np.array(self.atom_feasibility_mask[:n])
+
+            # Additional masking for atom creation based on valence
+            for idx in range(1, new_atom_action_count):
+                if idx < len(self.atoms) - 1:
+                    if atom_valence_remaining[idx - 1] < 1:
+                        self.current_action_mask[idx] = True
+
+            # Set mask for existing atom selection
+            for idx in range(existing_bond_action_count):
+                target_atom_idx = idx + 1  # Index in the atoms array (adding 1 for virtual atom)
+
+                # Can't bond an atom with itself
+                if target_atom_idx == atom_idx_in_array:
+                    self.current_action_mask[new_atom_action_count + idx] = True
+                    continue
+
+                # Check if atoms already have a bond
+                current_bond = self.bonds[atom_idx_in_array, target_atom_idx]
+
+                # Check remaining valence for both atoms
+                atom_a_valence = atom_valence_remaining[atom_idx_in_array - 1]  # -1 to adjust for virtual atom
+                atom_b_valence = atom_valence_remaining[target_atom_idx - 1]  # -1 to adjust for virtual atom
+
+                # If already bonded, we can modify the bond
+                if current_bond > 0:
+                    self.current_action_mask[new_atom_action_count + idx] = False
+                # If not bonded, we can create a bond if both atoms have remaining valence
+                elif atom_a_valence > 0 and atom_b_valence > 0:
+                    self.current_action_mask[new_atom_action_count + idx] = False
+                # Otherwise, mask it
+                else:
+                    self.current_action_mask[new_atom_action_count + idx] = True
 
         elif self.current_action_level == 2:
             expected_mask_length = 2 * self.maximum_bond_order
@@ -211,7 +256,7 @@ class MoleculeDesign(BaseTrajectory):
             atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms[1:]])
             atom_valence_remaining = atom_valence - self.bonds[1:, 1:].sum(axis=1)
             current_bond_order = self.bonds[atom_a_idx, atom_b_idx]
-            extra_increase = min(atom_valence_remaining[atom_a_idx-1], atom_valence_remaining[atom_b_idx-1])
+            extra_increase = min(atom_valence_remaining[atom_a_idx - 1], atom_valence_remaining[atom_b_idx - 1])
             allowed_final_order = current_bond_order + extra_increase
             self.current_action_mask[:int(allowed_final_order)] = False
 
@@ -291,6 +336,11 @@ class MoleculeDesign(BaseTrajectory):
                 self.base_atom_idx = new_atom_idx
                 next_level = 1
             else:
+                # CRITICAL FIX: When selecting an existing atom at level 0,
+                # we need to set self.base_atom_idx for level 1 bonding to work
+                selected_atom_idx = action - self.pick_existing_atoms_start_action_idx_lvl_0 + 1
+                self.base_atom_idx = selected_atom_idx
+                self.history.append(int(action))
                 next_level = 1
 
         elif self.current_action_level == 1:
@@ -302,6 +352,7 @@ class MoleculeDesign(BaseTrajectory):
                 atom_picked_on_lvl_0 = (
                     len(self.atoms) - 2 if self.history[-1] < self.pick_existing_atoms_start_action_idx_lvl_0
                     else self.history[-1] - self.pick_existing_atoms_start_action_idx_lvl_0)
+                print(f"Atom picked on level 0: {atom_picked_on_lvl_0}")
             else:
                 atom_picked_on_lvl_0 = len(self.atoms) - 2
 
@@ -323,6 +374,7 @@ class MoleculeDesign(BaseTrajectory):
                     self.current_action_mask[new_atom_action_count + idx] = 1
 
             if action < new_atom_action_count:
+                print("OOGA BOOGA")
                 self.atoms = np.append(self.atoms, action)
                 self.bonds = np.pad(self.bonds, [(0, 1), (0, 1)],
                                     mode='constant', constant_values=0)

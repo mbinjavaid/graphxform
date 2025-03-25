@@ -44,7 +44,7 @@ class TestMoleculeDesign(unittest.TestCase):
         self.mol.take_action(1)
         new_atom_action_count = len(self.mol.vocabulary_atom_idcs)
         existing_bond_action_count = len(self.mol.atoms) - 1  # real atoms only.
-        total_expected_actions = new_atom_action_count + existing_bond_action_count
+        total_expected_actions = new_atom_action_count + existing_bond_action_count + 1  # +1 for replacement action
         mask = self.mol.current_action_mask
         self.assertEqual(len(mask), total_expected_actions)
         self.assertTrue(np.any(mask[:new_atom_action_count] == 0))

@@ -45,6 +45,8 @@ class MoleculeDesign(BaseTrajectory):
         6: Chem.rdchem.BondType.HEXTUPLE
     }
 
+    REPLACE_ACTION = "replace_atom"  # Special action identifier for atom replacement
+
     def __init__(self, config: MoleculeConfig, initial_atom: int):
         """
         Parameters:
@@ -82,6 +84,10 @@ class MoleculeDesign(BaseTrajectory):
         self.virtual_distance = self.maximum_num_atoms_overall + 1  # for distance between virtual to any atom
         self.infinity_distance = self.maximum_num_atoms_overall + 2 # for distance between new atom (not bonded yet) to any atom
         self.topological_distance_matrix = np.array([[0, self.virtual_distance], [self.virtual_distance, 0]], dtype=np.uint8)
+
+        # Additional tracking variables for atom replacement
+        self.is_replacing_atom = False  # Flag to indicate we're in replacement mode
+        self.atom_to_replace = None  # Index of atom being replaced
 
         self.synthesis_done = False
         self.smiles_string: Optional[str] = None  # Is set after synthesis is done
@@ -162,36 +168,50 @@ class MoleculeDesign(BaseTrajectory):
             self.current_action_mask = np.zeros(len(self.vocabulary_atom_idcs) + len(self.atoms), dtype=bool)
             self.current_action_mask[1:ex_action_idx] = self.atom_feasibility_mask
             if (self.upper_limit_atoms is not None and len(self.atoms) - 1 == self.upper_limit_atoms) or (
-            not np.any(atom_valence_remaining)):
+                    not np.any(atom_valence_remaining)):
                 self.current_action_mask[1:ex_action_idx] = 1
             existing_bond = (self.bonds[1:, 1:] > 0).any(axis=1)
             masked = np.zeros(len(self.atoms) - 1, dtype=bool)
             masked[np.where(atom_valence_remaining <= 0)] = True
             masked[np.where(existing_bond)] = False
             self.current_action_mask[ex_action_idx:] = masked
+
+            # Check for atoms with modifiable bonds (bonds that can be decreased)
+            has_modifiable_bond = np.zeros(len(self.atoms) - 1, dtype=bool)
+            for i in range(len(self.atoms) - 1):
+                if np.any(self.bonds[i + 1, 1:] > 1):  # Any bond with order > 1
+                    has_modifiable_bond[i] = True
+
+            # Original free non-neighbor calculation
             bond_indicator = np.zeros_like(self.bonds[1:, 1:])
             bond_indicator[np.where(self.bonds[1:, 1:] == 0)] = 1
             np.fill_diagonal(bond_indicator, 0)
             has_free_nonneighbor = np.matmul(bond_indicator, (atom_valence_remaining > 0)[:, None]).squeeze()
-            self.current_action_mask[ex_action_idx:][np.where(has_free_nonneighbor == 0)] = 1
+
+            # Only mask atoms with no free non-neighbors AND no modifiable bonds
+            no_valid_actions = (has_free_nonneighbor == 0) & ~has_modifiable_bond
+            self.current_action_mask[ex_action_idx:][np.where(no_valid_actions)] = 1
 
         elif self.current_action_level == 1:
             new_atom_action_count = len(self.vocabulary_atom_idcs)
             existing_bond_action_count = len(self.atoms) - 1
-            total_actions = new_atom_action_count + existing_bond_action_count
+            total_actions = new_atom_action_count + existing_bond_action_count + 1
             self.current_action_mask = np.zeros(total_actions, dtype=bool)
 
             # Determine which atom was selected at level 0
             if len(self.history) > 0:
                 latest_action = self.history[-1]
                 if latest_action < self.pick_existing_atoms_start_action_idx_lvl_0:
-                    # We added a new atom
+                    # We added a new atom - can't replace it yet
                     atom_picked_on_lvl_0 = len(self.atoms) - 2
+                    can_replace = False
                 else:
-                    # We selected an existing atom
+                    # We selected an existing atom - can potentially replace it
                     atom_picked_on_lvl_0 = latest_action - self.pick_existing_atoms_start_action_idx_lvl_0
+                    can_replace = True
             else:
                 atom_picked_on_lvl_0 = len(self.atoms) - 2
+                can_replace = False
 
             # Find the actual index in the atoms array (adding 1 for virtual atom)
             atom_idx_in_array = atom_picked_on_lvl_0 + 1
@@ -240,7 +260,18 @@ class MoleculeDesign(BaseTrajectory):
                 else:
                     self.current_action_mask[new_atom_action_count + idx] = True
 
-        elif self.current_action_level == 2:
+            # Add replace action at the end
+            replace_action_idx = new_atom_action_count + existing_bond_action_count
+
+            # Replace is only feasible if:
+            # 1. We selected an existing atom at level 0
+            # 2. The atom is not the only atom in the molecule (can't replace the initial atom)
+            if can_replace and len(self.atoms) > 2:
+                self.current_action_mask[replace_action_idx] = False  # Allow replacement
+            else:
+                self.current_action_mask[replace_action_idx] = True  # Disallow replacement
+
+        elif self.current_action_level == 2 and not self.is_replacing_atom:
             expected_mask_length = 2 * self.maximum_bond_order
             self.current_action_mask = np.ones(expected_mask_length, dtype=bool)
             if hasattr(self, 'selected_bond'):
@@ -271,6 +302,46 @@ class MoleculeDesign(BaseTrajectory):
                             self.current_action_mask[reduction_idx] = False
                         else:
                             self.current_action_mask[reduction_idx] = True
+
+        elif self.current_action_level == 2 and self.is_replacing_atom:
+            # We're replacing an atom - check which atom types are valid replacements
+            self.current_action_mask = np.ones(len(self.vocabulary_atom_idcs), dtype=bool)  # Default: all masked
+
+            # Get information about the atom to be replaced
+            atom_idx = self.atom_to_replace
+            rdkit_atom_idx = atom_idx - 1  # Adjust for RDKit indexing
+            current_atom_type = self.atoms[atom_idx]
+
+            # Get current bond configuration
+            current_bonds = self.bonds[atom_idx, 1:]
+            current_bond_sum = current_bonds.sum()
+
+            # Get specific bond orders to neighboring atoms
+            neighbor_bonds = []
+            for i, bond_order in enumerate(current_bonds):
+                if bond_order > 0 and i > 0:  # Skip virtual atom
+                    neighbor_bonds.append((i, bond_order))
+
+            # Check each possible replacement atom
+            for new_atom_idx, atom_type in enumerate(self.vocabulary_atom_idcs):
+                # Skip if atom type is not allowed in config
+                if self.atom_feasibility_mask[new_atom_idx]:
+                    continue
+
+                # Skip if it's the same as current atom
+                if atom_type == current_atom_type:
+                    continue
+
+                # Check valence constraint
+                new_atom_valence = self.vocabulary_valence[atom_type]
+                if new_atom_valence < current_bond_sum:
+                    continue
+
+                # Perform a deeper chemical validity check
+                is_valid = self.validate_atom_replacement(rdkit_atom_idx, atom_type, neighbor_bonds)
+
+                if is_valid:
+                    self.current_action_mask[new_atom_idx] = False  # Unmask this valid replacement
 
     def update_topological_distance_matrix(self, new_atom_created: bool = False):
         if new_atom_created:
@@ -317,7 +388,8 @@ class MoleculeDesign(BaseTrajectory):
 
     def take_action(self, action: int):
         assert not self.synthesis_done, "Taking action on already terminated design. No no!"
-        assert self.current_action_mask[action] == 0, f"Trying to take action {action} on level {self.current_action_level}, but it is set to infeasible"
+        assert self.current_action_mask[
+                   action] == 0, f"Trying to take action {action} on level {self.current_action_level}, but it is set to infeasible"
         next_level = 0
 
         if self.current_action_level == 0:
@@ -346,35 +418,20 @@ class MoleculeDesign(BaseTrajectory):
         elif self.current_action_level == 1:
             new_atom_action_count = len(self.vocabulary_atom_idcs)
             existing_bond_action_count = len(self.atoms) - 1
-            total_actions = new_atom_action_count + existing_bond_action_count
-            self.current_action_mask = np.zeros(total_actions, dtype=bool)
-            if len(self.history) > 0:
+            replace_action_idx = new_atom_action_count + existing_bond_action_count
+
+            # Check if this is the replace action
+            if action == replace_action_idx:
+                # We're replacing the atom selected at level 0
                 atom_picked_on_lvl_0 = (
-                    len(self.atoms) - 2 if self.history[-1] < self.pick_existing_atoms_start_action_idx_lvl_0
-                    else self.history[-1] - self.pick_existing_atoms_start_action_idx_lvl_0)
-                print(f"Atom picked on level 0: {atom_picked_on_lvl_0}")
-            else:
-                atom_picked_on_lvl_0 = len(self.atoms) - 2
-
-            self.current_action_mask[:new_atom_action_count] = np.array(self.atom_feasibility_mask)
-            for idx in range(new_atom_action_count):
-                if idx < len(self.atoms) - 1:
-                    real_atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms[1:]])
-                    real_atom_bonds_sum = self.bonds[1:, 1:].sum(axis=1)
-                    real_atom_valence_remaining = real_atom_valence - real_atom_bonds_sum
-                    if real_atom_valence_remaining[idx] < 1:
-                        self.current_action_mask[idx] = 1
-
-            for idx in range(existing_bond_action_count):
-                if idx == atom_picked_on_lvl_0:
-                    self.current_action_mask[new_atom_action_count + idx] = 1
-                elif self.bonds[len(self.atoms) - 1, idx + 1] > 0:
-                    self.current_action_mask[new_atom_action_count + idx] = 0
-                else:
-                    self.current_action_mask[new_atom_action_count + idx] = 1
-
-            if action < new_atom_action_count:
-                print("OOGA BOOGA")
+                        self.history[-1] - self.pick_existing_atoms_start_action_idx_lvl_0
+                )
+                self.atom_to_replace = atom_picked_on_lvl_0 + 1  # +1 to account for virtual atom
+                self.is_replacing_atom = True
+                self.history.append(int(action))
+                next_level = 2
+            elif action < new_atom_action_count:
+                # Adding a new atom (existing functionality)
                 self.atoms = np.append(self.atoms, action)
                 self.bonds = np.pad(self.bonds, [(0, 1), (0, 1)],
                                     mode='constant', constant_values=0)
@@ -384,7 +441,9 @@ class MoleculeDesign(BaseTrajectory):
                 self.update_topological_distance_matrix(new_atom_created=True)
                 self.history.append(int(action))
                 self.last_created_atom_idx = new_atom_idx
+                next_level = 2
             else:
+                # Bonding with existing atom (existing functionality)
                 if hasattr(self, 'last_created_atom_idx'):
                     candidate_atom_idx = self.last_created_atom_idx
                 else:
@@ -396,37 +455,141 @@ class MoleculeDesign(BaseTrajectory):
                             raise IndexError("No valid candidate atom for bond modification.")
                 self.selected_bond = (self.base_atom_idx, candidate_atom_idx)
                 self.history.append(int(action))
-            next_level = 2
+                next_level = 2
 
         elif self.current_action_level == 2:
-            if hasattr(self, 'selected_bond'):
+            if self.is_replacing_atom:
+                # Handle atom replacement
+                new_atom_type = action + 1  # Convert from 0-indexed action to 1-indexed atom type
+                self.replace_atom(self.atom_to_replace, new_atom_type)
+                self.history.append(int(action))
+                self.is_replacing_atom = False
+                self.atom_to_replace = None
+                next_level = 0
+            elif hasattr(self, 'selected_bond'):
+                # Handle bond modification (existing functionality)
                 atom_a_idx, atom_b_idx = self.selected_bond
+
+                if action < self.maximum_bond_order:
+                    new_order = action + 1
+                    self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = new_order
+                    self.update_rdkit_mol(set_bond=(atom_a_idx - 1, atom_b_idx - 1, new_order))
+                else:
+                    reduction = action - self.maximum_bond_order + 1
+                    current_order = self.bonds[atom_a_idx, atom_b_idx]
+                    new_order = max(0, current_order - reduction)
+                    if new_order > 0:
+                        self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = new_order
+                        self.rdkit_mol.RemoveBond(atom_a_idx - 1, atom_b_idx - 1)
+                        self.update_rdkit_mol(set_bond=(atom_a_idx - 1, atom_b_idx - 1, new_order))
+                    else:
+                        self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = 0
+                        self.rdkit_mol.RemoveBond(atom_a_idx - 1, atom_b_idx - 1)
+
+                self.history.append(int(action))
+                if hasattr(self, 'selected_bond'):
+                    del self.selected_bond
+                next_level = 0
             else:
+                # Handle bond creation for newly added atom (existing functionality)
                 atom_a_idx = self.base_atom_idx
                 atom_b_idx = self.last_created_atom_idx
 
-            if action < self.maximum_bond_order:
-                new_order = action + 1
-                self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = new_order
-                self.update_rdkit_mol(set_bond=(atom_a_idx - 1, atom_b_idx - 1, new_order))
-            else:
-                reduction = action - self.maximum_bond_order + 1
-                current_order = self.bonds[atom_a_idx, atom_b_idx]
-                new_order = max(0, current_order - reduction)
-                if new_order > 0:
+                if action < self.maximum_bond_order:
+                    new_order = action + 1
                     self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = new_order
-                    self.rdkit_mol.RemoveBond(atom_a_idx - 1, atom_b_idx - 1)
                     self.update_rdkit_mol(set_bond=(atom_a_idx - 1, atom_b_idx - 1, new_order))
-                else:
-                    self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = 0
-                    self.rdkit_mol.RemoveBond(atom_a_idx - 1, atom_b_idx - 1)
-            self.history.append(int(action))
-            self.current_action_level = 0
-            if hasattr(self, 'selected_bond'):
-                del self.selected_bond
+
+                self.history.append(int(action))
+                next_level = 0
 
         self.current_action_level = next_level
         self.update_action_mask()
+
+    def validate_atom_replacement(self, rdkit_atom_idx, new_atom_type, neighbor_bonds):
+        """
+        Performs a detailed check if replacing an atom would create a valid molecule.
+
+        Parameters:
+            rdkit_atom_idx (int): RDKit index of atom to replace
+            new_atom_type (int): New atom type index from vocabulary
+            neighbor_bonds (list): List of (neighbor_idx, bond_order) tuples
+
+        Returns:
+            bool: True if replacement would be valid, False otherwise
+        """
+        # Create a copy of the RDKit molecule to test the replacement
+        test_mol = Chem.RWMol(self.rdkit_mol)
+
+        # Get atom configuration from vocabulary
+        atom_name = self.vocabulary_atom_names[new_atom_type - 1]
+        atom_config = self.atom_vocabulary[atom_name]
+
+        # Create the new atom with proper configuration
+        new_atom = Chem.Atom(atom_config["atomic_number"])
+        if "formal_charge" in atom_config:
+            new_atom.SetFormalCharge(atom_config["formal_charge"])
+        if "chiral_tag" in atom_config:
+            if atom_config["chiral_tag"] == 1:
+                new_atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CW)
+            elif atom_config["chiral_tag"] == 2:
+                new_atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CCW)
+
+        # Replace the atom in the test molecule
+        test_mol.ReplaceAtom(rdkit_atom_idx, new_atom)
+
+        # Try to sanitize the molecule with the new atom
+        try:
+            Chem.SanitizeMol(test_mol)
+            return True
+        except:
+            return False
+
+    def replace_atom(self, atom_idx: int, new_atom_type: int):
+        """
+        Replace an existing atom with a new atom type while preserving bonds.
+
+        Parameters:
+            atom_idx (int): Index of the atom to replace in self.atoms
+            new_atom_type (int): New atom type index from vocabulary
+        """
+        # Update internal representation
+        self.atoms[atom_idx] = new_atom_type
+
+        # Update RDKit representation
+        # We need to adjust the index (-1) since RDKit doesn't have the virtual atom
+        rdkit_atom_idx = atom_idx - 1
+
+        # Get atom configuration from vocabulary
+        atom_name = self.vocabulary_atom_names[new_atom_type - 1]
+        atom_config = self.atom_vocabulary[atom_name]
+
+        # Update the atom in the RDKit molecule
+        atom = self.rdkit_mol.GetAtomWithIdx(rdkit_atom_idx)
+        atom.SetAtomicNum(atom_config["atomic_number"])
+
+        # Update atom properties
+        if "formal_charge" in atom_config:
+            atom.SetFormalCharge(atom_config["formal_charge"])
+        else:
+            atom.SetFormalCharge(0)
+
+        if "chiral_tag" in atom_config:
+            if atom_config["chiral_tag"] == 1:
+                atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CW)
+            elif atom_config["chiral_tag"] == 2:
+                atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CCW)
+        else:
+            atom.SetChiralTag(Chem.CHI_UNSPECIFIED)
+
+        # Update topological distance matrix - no change needed as connectivity is preserved
+
+        # Sanitize the molecule to ensure valence constraints are satisfied
+        try:
+            Chem.SanitizeMol(self.rdkit_mol)
+        except Exception as e:
+            print(f"Error sanitizing molecule after replacement: {e}")
+            self.infeasibility_flag = True
 
     def finalize(self, assert_feasible: bool = False):
         if assert_feasible:

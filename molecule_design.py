@@ -176,11 +176,23 @@ class MoleculeDesign(BaseTrajectory):
             masked[np.where(existing_bond)] = False
             self.current_action_mask[ex_action_idx:] = masked
 
-            # Check for atoms with modifiable bonds (bonds that can be decreased)
+            # Check for atoms with modifiable bonds (bonds that can be changed)
             has_modifiable_bond = np.zeros(len(self.atoms) - 1, dtype=bool)
             for i in range(len(self.atoms) - 1):
-                if np.any(self.bonds[i + 1, 1:] > 1):  # Any bond with order > 1
+                atom_idx = i + 1  # Adjust for virtual atom
+
+                # Check for bonds that can be decreased (order > 1)
+                if np.any(self.bonds[atom_idx, 1:] > 1):
                     has_modifiable_bond[i] = True
+                    continue
+
+                # Check for bonds that can be increased (single bonds with remaining valence)
+                for j in range(1, len(self.atoms)):
+                    if atom_idx != j and self.bonds[atom_idx, j] == 1:  # Single bond exists
+                        # If both atoms have remaining valence, the bond can be increased
+                        if atom_valence_remaining[atom_idx - 1] > 0 and atom_valence_remaining[j - 1] > 0:
+                            has_modifiable_bond[i] = True
+                            break
 
             # Original free non-neighbor calculation
             bond_indicator = np.zeros_like(self.bonds[1:, 1:])
@@ -303,42 +315,70 @@ class MoleculeDesign(BaseTrajectory):
                         else:
                             self.current_action_mask[reduction_idx] = True
 
+
         elif self.current_action_level == 2 and self.is_replacing_atom:
+
             # We're replacing an atom - check which atom types are valid replacements
+
             self.current_action_mask = np.ones(len(self.vocabulary_atom_idcs), dtype=bool)  # Default: all masked
 
             # Get information about the atom to be replaced
+
             atom_idx = self.atom_to_replace
+
             rdkit_atom_idx = atom_idx - 1  # Adjust for RDKit indexing
+
             current_atom_type = self.atoms[atom_idx]
 
             # Get current bond configuration
+
             current_bonds = self.bonds[atom_idx, 1:]
-            current_bond_sum = current_bonds.sum()
+
+            # Calculate real bond sum (exclude virtual bond and count only real bonds)
+
+            real_bond_sum = 0
+
+            for i, bond_order in enumerate(current_bonds):
+
+                if i > 0 and bond_order > 0 and bond_order != self.virtual_bond_idx:
+                    real_bond_sum += bond_order
 
             # Get specific bond orders to neighboring atoms
+
             neighbor_bonds = []
+
             for i, bond_order in enumerate(current_bonds):
-                if bond_order > 0 and i > 0:  # Skip virtual atom
+
+                if bond_order > 0 and i > 0 and bond_order != self.virtual_bond_idx:  # Skip virtual atom & special bonds
+
                     neighbor_bonds.append((i, bond_order))
 
             # Check each possible replacement atom
+
             for new_atom_idx, atom_type in enumerate(self.vocabulary_atom_idcs):
+
                 # Skip if atom type is not allowed in config
+
                 if self.atom_feasibility_mask[new_atom_idx]:
                     continue
 
                 # Skip if it's the same as current atom
+
                 if atom_type == current_atom_type:
                     continue
 
                 # Check valence constraint
+
                 new_atom_valence = self.vocabulary_valence[atom_type]
-                if new_atom_valence < current_bond_sum:
+
+                if new_atom_valence < real_bond_sum:
                     continue
 
                 # Perform a deeper chemical validity check
+
                 is_valid = self.validate_atom_replacement(rdkit_atom_idx, atom_type, neighbor_bonds)
+
+                print(f"DEBUG: Atom {atom_idx} -> {atom_type} is valid: {is_valid}")
 
                 if is_valid:
                     self.current_action_mask[new_atom_idx] = False  # Unmask this valid replacement
@@ -553,43 +593,58 @@ class MoleculeDesign(BaseTrajectory):
             atom_idx (int): Index of the atom to replace in self.atoms
             new_atom_type (int): New atom type index from vocabulary
         """
+        print(f"Replacing atom {atom_idx} with type {new_atom_type}")
+        print(f"Before replacement, atoms are: {self.atoms}")
+
         # Update internal representation
         self.atoms[atom_idx] = new_atom_type
 
         # Update RDKit representation
-        # We need to adjust the index (-1) since RDKit doesn't have the virtual atom
         rdkit_atom_idx = atom_idx - 1
-
-        # Get atom configuration from vocabulary
         atom_name = self.vocabulary_atom_names[new_atom_type - 1]
         atom_config = self.atom_vocabulary[atom_name]
 
-        # Update the atom in the RDKit molecule
-        atom = self.rdkit_mol.GetAtomWithIdx(rdkit_atom_idx)
+        print(f"DEBUG: Replacing with {atom_name}, atomic_number={atom_config['atomic_number']}")
+
+        # Work on a copy of the RDKit molecule
+        updated_mol = Chem.RWMol(self.rdkit_mol)
+        atom = updated_mol.GetAtomWithIdx(rdkit_atom_idx)
+        print(f"DEBUG: RDKit atom before: {atom.GetSymbol()}, atomic num: {atom.GetAtomicNum()}")
+
+        # Update the atom type
         atom.SetAtomicNum(atom_config["atomic_number"])
 
-        # Update atom properties
-        if "formal_charge" in atom_config:
-            atom.SetFormalCharge(atom_config["formal_charge"])
-        else:
-            atom.SetFormalCharge(0)
+        # Update formal charge and chirality if specified
+        atom.SetFormalCharge(atom_config.get("formal_charge", 0))
 
-        if "chiral_tag" in atom_config:
-            if atom_config["chiral_tag"] == 1:
-                atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CW)
-            elif atom_config["chiral_tag"] == 2:
-                atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CCW)
+        if atom_config.get("chiral_tag") == 1:
+            atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CW)
+        elif atom_config.get("chiral_tag") == 2:
+            atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CCW)
         else:
             atom.SetChiralTag(Chem.CHI_UNSPECIFIED)
 
-        # Update topological distance matrix - no change needed as connectivity is preserved
+        # Reset hydrogen counts - let RDKit handle them implicitly
+        atom.SetNoImplicit(False)
+        atom.SetNumExplicitHs(0)
 
-        # Sanitize the molecule to ensure valence constraints are satisfied
+        # Try to sanitize to recalculate implicit hydrogens
         try:
-            Chem.SanitizeMol(self.rdkit_mol)
+            # First reset property cache
+            for a in updated_mol.GetAtoms():
+                a.UpdatePropertyCache(strict=False)
+
+            # Sanitize the molecule
+            Chem.SanitizeMol(updated_mol)
+
+            # If successful, update our rdkit_mol
+            self.rdkit_mol = updated_mol
         except Exception as e:
             print(f"Error sanitizing molecule after replacement: {e}")
+            print("Keeping original molecule")
             self.infeasibility_flag = True
+
+        print(f"After replacement, atoms are: {self.atoms}")
 
     def finalize(self, assert_feasible: bool = False):
         if assert_feasible:

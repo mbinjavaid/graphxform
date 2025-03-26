@@ -366,6 +366,9 @@ class TestAtomReplacement(unittest.TestCase):
 
     def test_middle_atom_replacement(self):
         """Test replacing a middle atom that has multiple bonds to different atoms."""
+
+        # Start fresh
+        self.mol = MoleculeDesign(self.config, self.initial_atom)
         # Create a C-C-C chain
         self.mol.take_action(1)  # Add second carbon
         self.mol.take_action(4)  # Select first carbon
@@ -395,6 +398,162 @@ class TestAtomReplacement(unittest.TestCase):
         self.assertEqual(self.mol.bonds[1, middle_atom_idx], 1)  # Bond to first C preserved
         self.assertEqual(self.mol.bonds[middle_atom_idx, 3], 1)  # Bond to third C preserved
 
+    def test_max_valence_replacement(self):
+        """Test replacing an atom that's using its full valence."""
+        # Create a carbon with 4 bonds (full valence)
+        self.mol.take_action(1)  # Add second carbon with single bond
+        self.mol.take_action(4)  # Select first carbon
+        self.mol.take_action(0)  # Create single bond
+
+        self.mol.take_action(1)  # Add third carbon
+        self.mol.take_action(4)  # Select first carbon again
+        self.mol.take_action(0)  # Create single bond
+
+        self.mol.take_action(1)  # Add fourth carbon
+        self.mol.take_action(4)  # Select first carbon again
+        self.mol.take_action(0)  # Create single bond
+
+        self.mol.take_action(1)  # Add fifth carbon
+        self.mol.take_action(4)  # Select first carbon again
+        self.mol.take_action(0)  # Create single bond
+
+        # Now first carbon has 4 bonds (full valence)
+        # Verify this
+        center_atom_idx = 1
+        bond_sum = self.mol.bonds[center_atom_idx, 1:].sum()
+        real_bond_sum = 0
+        for i, bond in enumerate(self.mol.bonds[center_atom_idx, 1:]):
+            if i > 0 and bond > 0 and bond != self.mol.virtual_bond_idx:
+                real_bond_sum += bond
+        self.assertEqual(real_bond_sum, 4)  # Should have exactly 4 bonds
+
+        # Try to replace - only atoms with valence ≥ 4 should be allowed
+        center_atom_action = self.mol.pick_existing_atoms_start_action_idx_lvl_0 + center_atom_idx - 1
+        if center_atom_action in [i for i, m in enumerate(self.mol.current_action_mask) if not m]:
+            self.mol.take_action(center_atom_action)
+            replace_action = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+            self.mol.take_action(replace_action)
+
+            # Verify only carbon (valence 4) is allowed, others should be masked
+            replacements = [i for i, m in enumerate(self.mol.current_action_mask) if not m]
+            self.assertEqual(len(replacements), 0)  # No replacements allowed (can't replace C with C)
+        else:
+            # If the center atom isn't selectable at all, that's fine too
+            print("Center atom with full valence is correctly not selectable")
+
+    def test_bond_order_preservation(self):
+        """Test that replacing atoms preserves double and triple bonds."""
+        # Create a C=C molecule
+        self.mol.take_action(1)  # Add second carbon
+        self.mol.take_action(4)  # Select first carbon
+        self.mol.take_action(1)  # Create double bond
+
+        # Replace the first carbon with nitrogen
+        self.mol.take_action(5)  # Select first carbon
+        replace_action = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+        self.mol.take_action(replace_action)
+        self.mol.take_action(1)  # Replace with N
+
+        # Verify double bond preserved
+        self.assertEqual(self.mol.bonds[1, 2], 2)
+
+        # Also verify in RDKit representation
+        bond = self.mol.rdkit_mol.GetBondBetweenAtoms(0, 1)
+        self.assertEqual(bond.GetBondType(), Chem.BondType.DOUBLE)
+
+    def test_replace_initial_atom(self):
+        """Test replacing the initial atom when it's part of a multi-atom molecule."""
+        # Add a second atom to allow replacement of the initial atom
+        self.mol.take_action(1)  # Level 0: Create carbon atom
+        self.mol.take_action(4)  # Level 1: Select first carbon
+        self.mol.take_action(0)  # Level 2: Create single bond
+
+        # Now the initial atom should be selectable for replacement
+        initial_atom_action = self.mol.pick_existing_atoms_start_action_idx_lvl_0
+        print(f"Initial atom action: {initial_atom_action}")
+        print(f"Available actions: {[i for i, m in enumerate(self.mol.current_action_mask) if not m]}")
+
+        self.assertIn(initial_atom_action,
+                      [i for i, m in enumerate(self.mol.current_action_mask) if not m],
+                      "Initial atom should be selectable when part of a multi-atom molecule")
+
+        # Replace with nitrogen
+        self.mol.take_action(initial_atom_action)
+        replace_action = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+        self.mol.take_action(replace_action)
+        self.mol.take_action(1)  # Replace with N
+
+        # Verify replacement
+        self.assertEqual(self.mol.atoms[1], 2)  # Should be nitrogen now
+
+        # Verify in RDKit
+        rdkit_atom = self.mol.rdkit_mol.GetAtomWithIdx(0)  # RDKit indices are -1 from our indices
+        self.assertEqual(rdkit_atom.GetAtomicNum(), 7)  # Nitrogen atomic number
+
+    def test_oxygen_carbon_to_nitrogen_replacement(self):
+        """Test replacing a carbon with nitrogen in a molecule starting with oxygen."""
+        # Start with oxygen instead of carbon
+        self.mol = MoleculeDesign(self.config, self.atom_indices["O"])  # Start with O
+
+        print("\n--- Creating O-C molecule ---")
+        print(f"Initial atom state: {self.mol.atoms}")  # Should show [0, 3] (virtual, oxygen)
+
+        # Add carbon with single bond to oxygen
+        self.mol.take_action(1)  # Level 0: Create carbon atom
+        self.mol.take_action(4)  # Level 1: Select oxygen atom
+        self.mol.take_action(0)  # Level 2: Create single bond
+
+        print(f"After adding carbon: {self.mol.atoms}")  # Should show [0, 3, 1]
+        print(f"Bonds:\n{self.mol.bonds}")
+
+        # Verify O-C molecule structure
+        self.assertEqual(self.mol.atoms[1], 3)  # First atom is oxygen
+        self.assertEqual(self.mol.atoms[2], 1)  # Second atom is carbon
+        self.assertEqual(self.mol.bonds[1, 2], 1)  # Single bond between them
+
+        # Now select the carbon atom for replacement
+        carbon_atom_idx = 2
+        carbon_atom_action = self.mol.pick_existing_atoms_start_action_idx_lvl_0 + carbon_atom_idx - 1
+
+        print(f"Available actions at level 0: {[i for i, m in enumerate(self.mol.current_action_mask) if not m]}")
+        self.assertIn(carbon_atom_action,
+                      [i for i, m in enumerate(self.mol.current_action_mask) if not m],
+                      f"Carbon atom should be selectable with action {carbon_atom_action}")
+
+        # Select carbon for replacement
+        self.mol.take_action(carbon_atom_action)
+
+        # Choose replace action
+        replace_action_idx = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+        print(f"Level 1 actions: {[i for i, m in enumerate(self.mol.current_action_mask) if not m]}")
+        self.mol.take_action(replace_action_idx)
+
+        # Get available replacement types
+        level_2_actions = [i for i, m in enumerate(self.mol.current_action_mask) if not m]
+        print(f"Available replacements: {level_2_actions}")
+
+        # Nitrogen should be a valid replacement (index 1)
+        self.assertIn(1, level_2_actions, "Nitrogen should be a valid replacement for carbon")
+
+        # Replace with nitrogen
+        print("\n--- Replacing carbon with nitrogen ---")
+        print(f"Before replacement: {self.mol.atoms}")
+        self.mol.take_action(1)  # Replace with nitrogen (action 1 → atom type 2)
+
+        # Verify replacement
+        print(f"After replacement: {self.mol.atoms}")
+        self.assertEqual(self.mol.atoms[2], 2)  # Carbon (1) should now be nitrogen (2)
+
+        # Verify bond is preserved
+        self.assertEqual(self.mol.bonds[1, 2], 1)  # Single bond should still exist
+
+        # Check RDKit representation
+        rdkit_atom = self.mol.rdkit_mol.GetAtomWithIdx(1)  # Carbon was at index 1 in RDKit (second atom)
+        self.assertEqual(rdkit_atom.GetAtomicNum(), 7)  # Nitrogen atomic number
+
+        # Final molecule should be O-N
+        print(f"Final molecule SMILES: {self.mol.to_smiles()}")
+        print(self.mol.bonds)
 
 
 if __name__ == '__main__':

@@ -558,6 +558,12 @@ class MoleculeDesign(BaseTrajectory):
         Returns:
             bool: True if replacement would be valid, False otherwise
         """
+        # # Skip Fluorine validation to test theory
+        # atom_name = self.vocabulary_atom_names[new_atom_type - 1]
+        # if atom_name == "F":  # Skip Fluorine validation
+        #     print("DEBUG: Skipping Fluorine validation check")
+        #     return False  # Just return false without testing
+
         # Create a copy of the RDKit molecule to test the replacement
         test_mol = Chem.RWMol(self.rdkit_mol)
 
@@ -593,8 +599,8 @@ class MoleculeDesign(BaseTrajectory):
             atom_idx (int): Index of the atom to replace in self.atoms
             new_atom_type (int): New atom type index from vocabulary
         """
-        print(f"Replacing atom {atom_idx} with type {new_atom_type}")
-        print(f"Before replacement, atoms are: {self.atoms}")
+        # print(f"Replacing atom {atom_idx} with type {new_atom_type}")
+        # print(f"Before replacement, atoms are: {self.atoms}")
 
         # Update internal representation
         self.atoms[atom_idx] = new_atom_type
@@ -604,12 +610,12 @@ class MoleculeDesign(BaseTrajectory):
         atom_name = self.vocabulary_atom_names[new_atom_type - 1]
         atom_config = self.atom_vocabulary[atom_name]
 
-        print(f"DEBUG: Replacing with {atom_name}, atomic_number={atom_config['atomic_number']}")
+        # print(f"DEBUG: Replacing with {atom_name}, atomic_number={atom_config['atomic_number']}")
 
         # Work on a copy of the RDKit molecule
         updated_mol = Chem.RWMol(self.rdkit_mol)
         atom = updated_mol.GetAtomWithIdx(rdkit_atom_idx)
-        print(f"DEBUG: RDKit atom before: {atom.GetSymbol()}, atomic num: {atom.GetAtomicNum()}")
+        # print(f"DEBUG: RDKit atom before: {atom.GetSymbol()}, atomic num: {atom.GetAtomicNum()}")
 
         # Update the atom type
         atom.SetAtomicNum(atom_config["atomic_number"])
@@ -644,7 +650,7 @@ class MoleculeDesign(BaseTrajectory):
             print("Keeping original molecule")
             self.infeasibility_flag = True
 
-        print(f"After replacement, atoms are: {self.atoms}")
+        # print(f"After replacement, atoms are: {self.atoms}")
 
     def finalize(self, assert_feasible: bool = False):
         if assert_feasible:

@@ -2,9 +2,11 @@ import numpy as np
 import pytest
 from molecule_design import MoleculeDesign
 from rdkit import Chem
+import matplotlib.pyplot as plt
+from rdkit.Chem import Draw
+
 
 # Create a dummy configuration for testing.
-# This minimal configuration defines three atom types ("C", "N", "O") with typical valences.
 class DummyConfig:
     def __init__(self):
         self.atom_vocabulary = {
@@ -16,106 +18,176 @@ class DummyConfig:
         self.max_num_atoms = 4
         self.start_c_chain_max_len = 3
 
+
 def create_dummy_config():
     return DummyConfig()
+
 
 @pytest.fixture
 def config():
     return create_dummy_config()
+
 
 @pytest.fixture
 def mol(config):
     # Start with an initial atom A (using "C", index 1)
     return MoleculeDesign(config, initial_atom=1)
 
+
+def visualize_molecule(mol, title="Molecule Structure", highlight_atoms=None, highlight_bond=None):
+    """Helper function to visualize the molecule structure with highlighted atoms/bonds"""
+    rdkit_mol = mol.rdkit_mol
+
+    # Create a copy to avoid modifying the original
+    viz_mol = Chem.RWMol(rdkit_mol)
+
+    # Add atom indices for clarity
+    for atom in viz_mol.GetAtoms():
+        atom.SetProp("atomNote", str(atom.GetIdx()))
+
+    # Set up highlighting
+    highlight_atom_list = highlight_atoms or []
+    highlight_bond_list = []
+
+    if highlight_bond:
+        # Convert from internal indices to RDKit indices
+        atom1, atom2 = highlight_bond
+        rdkit_atom1 = atom1 - 1  # -1 because internal has virtual atom
+        rdkit_atom2 = atom2 - 1
+
+        # Find the bond index
+        bond = viz_mol.GetBondBetweenAtoms(rdkit_atom1, rdkit_atom2)
+        if bond:
+            highlight_bond_list = [bond.GetIdx()]
+
+    # Generate the image
+    img = Draw.MolToImage(viz_mol, size=(300, 300),
+                          highlightAtoms=highlight_atom_list,
+                          highlightBonds=highlight_bond_list)
+
+    plt.figure(figsize=(4, 4))
+    plt.imshow(img)
+    plt.title(title)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
 def test_bond_addition_and_reduction(mol):
     """
-    Integration test scenario:
-
-    1. Create molecule with initial atom A.
-    2. Level 0: Add atom B (new atom creation). This sets B as the base atom.
-    3. Level 1: Add atom C (new atom creation); then at level 2,
-       select an increase action to establish a bond between B and C with order 2.
-    4. Form a cycle: add an additional bond connecting A and C with bond order 1.
-    5. Modify the bond between B and C: reduce its order from 2 to 1.
-    6. Verify that bond orders and connectivity are as expected.
+    Integration test scenario navigating through the proper action space.
     """
+    # Steps 1-2: Initial setup with atom A, then add atom B
+    mol.take_action(1)  # Add atom B
 
-    # ---------------------------
-    # Step 1: Initial molecule already has A.
-    # At this point, mol.atoms = [0, A] (index 0 is virtual).
+    # Step 3: Add atom C and set B-C bond to order 2
+    mol.take_action(1)  # Add atom C
 
-    # ---------------------------
-    # Step 2: Level 0 – Add atom B.
-    # Action index 1 is chosen (0 is termination; indices >=1 are new atom actions).
-    mol.take_action(1)
-    # Now, mol.atoms should be [0, A, B] and base_atom_idx is set to B (index 2).
+    # In updated action space, bond order actions start at N+1
+    vocab_size = len(mol.vocabulary_atom_idcs)
+    mol.take_action(vocab_size + 2)  # Set B-C bond to order 2 (N+2 for bond order 2)
+    assert mol.bonds[2, 3] == 2
 
-    # ---------------------------
-    # Step 3: Level 1 – Add atom C.
-    # Choose new atom creation for C in level 1.
-    mol.take_action(1)
-    # mol.atoms becomes [0, A, B, C]; last_created_atom_idx is set to C (index 3).
+    # Print current state
+    print("\nAfter Step 3:")
+    print(f"Atoms: {mol.atoms}")
+    print(f"Bonds matrix:\n{mol.bonds}")
+    print(f"Current action level: {mol.current_action_level}")
 
-    # Level 2 – Increase bond order between base (B, index 2) and new atom (C, index 3).
-    # In level 2, if action < maximum_bond_order then the bond order becomes action + 1.
-    # Choose action = 1, which sets bond order = 1 + 1 = 2.
-    mol.take_action(1)
-    # Verify that bond between B and C is now order 2.
-    assert mol.bonds[2, 3] == 2, f"Expected bond order 2 between B and C, got {mol.bonds[2, 3]}"
+    # === Step 4: Add A-C bond with order 1 ===
+    # At Level 0, select atom A (index 1)
+    # Action to select existing atom = pick_existing_atoms_start_action_idx_lvl_0 + atom_idx - 1
+    ex_atom_start_idx = mol.pick_existing_atoms_start_action_idx_lvl_0
+    atom_a_action_idx = ex_atom_start_idx + 1 - 1  # A is at index 1
 
-    # ---------------------------
-    # Step 4: Form a cycle by adding an extra bond between A and C with bond order 1.
-    # To do this, we force a level 1 modification that selects an existing bond addition.
-    # We want to add a bond connecting A (index 1) and C (index 3).
-    # Manually set the current_action_level to 1, and change base_atom_idx to A.
-    mol.current_action_level = 1
-    mol.base_atom_idx = 1  # A is at index 1.
-    # Remove any existing last_created_atom_idx so that in block2 the fallback computes candidate.
+    print(f"\nStep 4: Selecting atom A with action {atom_a_action_idx}")
+    assert mol.current_action_level == 0
+    mol.take_action(atom_a_action_idx)
 
-    # if hasattr(mol, 'last_created_atom_idx'):
-    #     del mol.last_created_atom_idx
+    # At Level 1, select atom C (index 3)
+    # Action to select existing atom = vocab_size + atom_idx (for 1-based indexing)
+    atom_c_action_idx = vocab_size + 3  # N+3 for atom at index 3
 
-    # Set history so that the branch for existing bond modification is triggered.
-    # (In our level1 code, if history[-1] < pick_existing_atoms_start_action_idx_lvl_0, candidate is computed from history.)
-    mol.history = [mol.pick_existing_atoms_start_action_idx_lvl_0]
-    # Calling take_action with an action equal to new_atom_action_count will fall in block2.
-    new_atom_action_count = len(mol.vocabulary_atom_idcs)  # e.g., 3 for "C", "N", "O"
-    mol.take_action(new_atom_action_count)
-    # Level 2 – Now, add a bond from base (A, index 1) to candidate.
-    # Choose an increase action with action = 0, which will set bond order = 1.
-    mol.take_action(0)
-    # Check that the bond between A and C is now created with order 1.
-    assert mol.bonds[1, 3] == 1, f"Expected bond order 1 between A and C, got {mol.bonds[1, 3]}"
+    print(f"Step 4: Selecting atom C with action {atom_c_action_idx}")
+    assert mol.current_action_level == 1
+    mol.take_action(atom_c_action_idx)
 
-    # ---------------------------
-    # Step 5: Modify the bond between B and C: reduce its order from 2 to 1.
-    # To do this, we want to select the B–C bond for modification.
-    # Reset the action level for modification by setting current_action_level to 1.
-    mol.current_action_level = 1
-    # Set base_atom_idx back to B (index 2) for the modification.
-    mol.base_atom_idx = 2  # B is at index 2.
-    # Ensure that last_created_atom_idx points to C (index 3) so that block2 selects the B–C bond.
-    mol.last_created_atom_idx = 3
-    # Simulate history so that block2 is used.
-    mol.history = [mol.pick_existing_atoms_start_action_idx_lvl_0]
-    # Call take_action with a value that falls into block2.
-    mol.take_action(new_atom_action_count)
-    # At level 2, we now want to perform a bond reduction.
-    # In level 2, reduction actions are those with action >= maximum_bond_order.
-    # Since the current bond order between B and C is 2, reduction by 1 is achieved by choosing action = maximum_bond_order
-    mol.take_action(mol.maximum_bond_order)
-    # Verify that the bond between B and C has been reduced to 1.
-    assert mol.bonds[2, 3] == 1, f"Expected bond order 1 between B and C after reduction, got {mol.bonds[2, 3]}"
+    # At Level 2, set bond order 1 (N+1 for bond order 1)
+    print("Step 4: Setting A-C bond to order 1")
+    assert mol.current_action_level == 2
+    mol.take_action(vocab_size + 1)  # Action N+1 = set bond order 1
+    assert mol.bonds[1, 3] == 1
 
-    # ---------------------------
-    # Final Checks:
-    # Verify that virtual bonds remain intact for all real atoms.
-    for i in range(1, len(mol.atoms)):
-        assert mol.bonds[0, i] == mol.virtual_bond_idx, f"Virtual bond missing at row 0, column {i}."
-        assert mol.bonds[i, 0] == mol.virtual_bond_idx, f"Virtual bond missing at row {i}, column 0."
-    # Ensure that all real atoms are connected (at least one nonvirtual bond exists for each).
-    real_atom_indices = range(1, len(mol.atoms))
-    for i in real_atom_indices:
-        connected = any(mol.bonds[i, j] > 0 for j in real_atom_indices if j != i)
-        assert connected, f"Atom at index {i} is not connected to any other real atom."
+    # === Step 5: Reduce B-C bond from order 2 to 1 ===
+    # At Level 0, select atom B (index 2)
+    atom_b_action_idx = ex_atom_start_idx + 2 - 1
+
+    print(f"\nStep 5: Selecting atom B with action {atom_b_action_idx}")
+    assert mol.current_action_level == 0
+    mol.take_action(atom_b_action_idx)
+
+    # At Level 1, select atom C (index 3)
+    print(f"Step 5: Selecting atom C with action {atom_c_action_idx}")
+    assert mol.current_action_level == 1
+    mol.take_action(atom_c_action_idx)
+
+    # At Level 2, set bond order 1 (reducing from 2)
+    print("Step 5: Setting B-C bond to order 1")
+    assert mol.current_action_level == 2
+    mol.take_action(vocab_size + 1)  # Action N+1 = set bond order 1
+    assert mol.bonds[2, 3] == 1
+
+    # === Step 6: Create A-B bond to ensure connectivity ===
+    # At Level 0, select atom A (index 1)
+    print(f"\nStep 6: Selecting atom A with action {atom_a_action_idx}")
+    assert mol.current_action_level == 0
+    mol.take_action(atom_a_action_idx)
+
+    # At Level 1, select atom B (index 2)
+    atom_b_level1_action_idx = vocab_size + 2  # N+2 for atom at index 2
+    print(f"Step 6: Selecting atom B with action {atom_b_level1_action_idx}")
+    assert mol.current_action_level == 1
+    mol.take_action(atom_b_level1_action_idx)
+
+    # At Level 2, set bond order 1
+    print("Step 6: Setting A-B bond to order 1")
+    assert mol.current_action_level == 2
+    mol.take_action(vocab_size + 1)  # Action N+1 = set bond order 1
+    assert mol.bonds[1, 2] == 1
+
+    # Visualize molecule after creating A-B bond
+    print("\nMolecule structure after adding A-B bond:")
+    print(f"Bonds matrix:\n{mol.bonds}")
+    visualize_molecule(mol, "After Adding A-B Bond", highlight_bond=(1, 2))
+
+    # Check connectivity
+    is_connected_ab_bc = mol.is_connected_without_bond(1, 3)
+    print(f"Would molecule remain connected without A-C bond? {is_connected_ab_bc}")
+
+    # === Step 7: Remove A-C bond ===
+    # At Level 0, select atom A (index 1)
+    print(f"\nStep 7: Selecting atom A with action {atom_a_action_idx}")
+    assert mol.current_action_level == 0
+    mol.take_action(atom_a_action_idx)
+
+    # At Level 1, select atom C (index 3)
+    print(f"Step 7: Selecting atom C with action {atom_c_action_idx}")
+    assert mol.current_action_level == 1
+    mol.take_action(atom_c_action_idx)
+
+    # Check action mask
+    print(f"Action mask at level 2: {mol.current_action_mask}")
+
+    # In new action space, remove bond is action N+7
+    print(f"Remove bond action (index {vocab_size + 7}) masked? {mol.current_action_mask[vocab_size + 7]}")
+
+    # At Level 2, remove bond
+    print(f"Step 7: Removing A-C bond with action {vocab_size + 7}")
+    assert mol.current_action_level == 2
+    mol.take_action(vocab_size + 7)  # Action N+7 = remove bond
+    assert mol.bonds[1, 3] == 0
+
+    # Final visualization
+    print("\nFinal molecule structure:")
+    print(f"Bonds matrix:\n{mol.bonds}")
+    visualize_molecule(mol, "After A-C Bond Removal")

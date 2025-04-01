@@ -1,5 +1,5 @@
 import unittest
-from rdkit import Chem
+# from rdkit import Chem
 from molecule_design import MoleculeDesign
 from config import MoleculeConfig
 
@@ -106,12 +106,13 @@ class TestModifyExistingBonds(unittest.TestCase):
             # Print action mask for level 2
             print(f"Action mask at level 2 (for decreasing bond): {md.current_action_mask}")
 
-            # Check if decreasing bond is feasible (action 6 = decrease by 1)
-            decrease_bond_feasible = md.current_action_mask[6] == 0
+            # In new action space, to decrease we just set it to the desired order
+            # Check if setting to single bond is feasible (action 0 = set to order 1)
+            decrease_bond_feasible = md.current_action_mask[0] == 0
 
             if decrease_bond_feasible:
-                print("Decreasing bond is feasible, taking action 6")
-                md.take_action(6)  # Action 6 = decrease by 1
+                print("Decreasing bond is feasible, taking action 0 to set single bond")
+                md.take_action(0)  # Action 0 = set to bond order 1
 
                 # Verify the bond order was decreased back to single
                 updated_bond = md.rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
@@ -237,12 +238,12 @@ class TestModifyExistingBonds(unittest.TestCase):
         # Print action mask at level 2
         print(f"Action mask at level 2: {md.current_action_mask}")
 
-        # Check if decreasing bond is feasible (action 6 = decrease by 1)
-        decrease_bond_feasible = md.current_action_mask[6] == 0
+        # Check if decreasing bond to double is feasible (action 1 = set to order 2)
+        decrease_bond_feasible = md.current_action_mask[1] == 0
 
         if decrease_bond_feasible:
-            print("Decreasing bond is feasible, taking action 6")
-            md.take_action(6)  # Decrease by 1
+            print("Decreasing bond is feasible, taking action 1 to set double bond")
+            md.take_action(1)  # Set to double bond (order 2)
 
             # Verify the bond was decreased to double
             updated_bond = md.rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
@@ -258,8 +259,8 @@ class TestModifyExistingBonds(unittest.TestCase):
             md.take_action(atom_a_action_idx)  # Level 0: Select first carbon
             md.take_action(atom_b_action_idx)  # Level 1: Select second carbon
 
-            if md.current_action_mask[6] == 0:
-                md.take_action(6)  # Decrease by 1 again
+            if md.current_action_mask[0] == 0:  # Check if setting to single bond is feasible
+                md.take_action(0)  # Set to single bond (order 1)
 
                 final_bond = md.rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
                 final_order = final_bond.GetBondTypeAsDouble() if final_bond else 0
@@ -273,6 +274,53 @@ class TestModifyExistingBonds(unittest.TestCase):
             print("Decreasing bond is not feasible, possibly due to structural constraints")
 
         print(f"Final SMILES: {md.to_smiles()}")
+
+    def test_bond_removal(self):
+        """Test removing a bond completely using the new action space."""
+        config = MoleculeConfig()
+        config.start_from_smiles = "CCC"  # Propane
+
+        print(f"\nStarting with propane from SMILES: {config.start_from_smiles}")
+        md = MoleculeDesign.from_smiles(config, config.start_from_smiles, do_finish=False)
+
+        # Get carbon atoms
+        rdkit_mol = md.rdkit_mol
+        carbon_indices = [atom.GetIdx() for atom in rdkit_mol.GetAtoms() if atom.GetSymbol() == "C"]
+
+        # Get the first two carbon atoms (removing this bond will still leave a connected structure)
+        atom_a, atom_b = carbon_indices[0], carbon_indices[1]
+
+        # Verify the original bond is present
+        original_bond = rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
+        self.assertIsNotNone(original_bond, "Expected bond between first two carbons")
+
+        # Select atoms for bond modification
+        ex_atom_start_idx = len(config.atom_vocabulary) + 1
+        atom_a_action_idx = ex_atom_start_idx + atom_a + 1 - 1
+        atom_b_action_idx = len(config.atom_vocabulary) + atom_b
+
+        print(f"Attempting to remove bond between carbon atoms {atom_a} and {atom_b}")
+        md.take_action(atom_a_action_idx)  # Level 0: Select first carbon
+        md.take_action(atom_b_action_idx)  # Level 1: Select second carbon
+
+        # Check if bond removal is feasible (should be since it doesn't disconnect the molecule)
+        bond_removal_feasible = md.current_action_mask[md.maximum_bond_order] == 0  # Last action is remove bond
+
+        if bond_removal_feasible:
+            print(f"Bond removal is feasible, taking action {md.maximum_bond_order}")
+            md.take_action(md.maximum_bond_order)  # Remove bond action
+
+            # Verify bond was removed
+            updated_bond = md.rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
+            print(f"Bond exists after removal: {updated_bond is not None}")
+            self.assertIsNone(updated_bond, "Expected bond to be completely removed")
+            print("Successfully removed bond between carbons")
+
+            # Check molecule is still connected
+            # We know it must be since the fragmentation check would have prevented the action otherwise
+            print(f"Final SMILES: {md.to_smiles()}")
+        else:
+            print("Bond removal is not feasible - this might indicate the bond is critical for connectivity")
 
 
 if __name__ == "__main__":

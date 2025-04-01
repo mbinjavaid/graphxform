@@ -82,12 +82,16 @@ class TestMoleculeDesign(unittest.TestCase):
         the test is skipped.
         """
         # Step 1 & 2: Create atom B at level 0.
+        print(self.mol.atoms)
         self.mol.take_action(1)  # level 0: new atom creation for B.
+        print(self.mol.atoms)
         # For a realistic scenario, assume the molecule automatically bonds A and B.
         # (The molecule's internal logic should have added the A-B bond.)
 
+        # print(self.mol.current_action_level)
         # Step 3: At level 1, create atom C.
         self.mol.take_action(1)  # level 1: new atom creation for C.
+        print(self.mol.atoms)
         # After this action, the molecule should be at level 2.
         self.assertEqual(self.mol.current_action_level, 2)
 

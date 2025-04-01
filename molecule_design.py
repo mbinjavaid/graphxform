@@ -436,19 +436,6 @@ class MoleculeDesign(BaseTrajectory):
             total_actions = 1 + vocab_size + 7  # Invalid + replacement options + bond operations
             self.current_action_mask = np.ones(total_actions, dtype=bool)  # Default: all masked
 
-            # Determine the atoms involved in this operation
-            if hasattr(self, 'selected_bond'):
-                atom_a_idx, atom_b_idx = self.selected_bond
-
-            else:
-                atom_picked_on_lvl_0 = (
-                    len(self.atoms) - 2 if self.history[-2] < self.pick_existing_atoms_start_action_idx_lvl_0
-                    else self.history[-2] - self.pick_existing_atoms_start_action_idx_lvl_0)
-
-                atom_picked_on_lvl_1 = self.history[-1]
-                atom_a_idx = atom_picked_on_lvl_0 + 1
-                atom_b_idx = atom_picked_on_lvl_1 + 1
-
             if self.is_replacing_atom:
                 # === ATOM REPLACEMENT MODE ===
                 # All bond actions are masked in replacement mode
@@ -462,7 +449,7 @@ class MoleculeDesign(BaseTrajectory):
                 current_bonds = self.bonds[atom_idx, 1:]
 
                 mask = (current_bonds > 0) & (current_bonds != self.virtual_bond_idx) & (
-                            np.arange(len(current_bonds)) > 0)
+                        np.arange(len(current_bonds)) > 0)
                 real_bond_sum = np.sum(current_bonds[mask])
 
                 # Get neighboring bonds for validation
@@ -491,24 +478,36 @@ class MoleculeDesign(BaseTrajectory):
 
             else:
                 # === BOND MODIFICATION MODE ===
+                # Determine the atoms involved in this operation
+                if hasattr(self, 'selected_bond'):
+                    atom_a_idx, atom_b_idx = self.selected_bond
+                else:
+                    atom_picked_on_lvl_0 = (
+                        len(self.atoms) - 2 if self.history[-2] < self.pick_existing_atoms_start_action_idx_lvl_0
+                        else self.history[-2] - self.pick_existing_atoms_start_action_idx_lvl_0)
+
+                    atom_picked_on_lvl_1 = self.history[-1]
+                    atom_a_idx = atom_picked_on_lvl_0 + 1
+                    atom_b_idx = atom_picked_on_lvl_1 + 1
+
                 # All replacement actions are masked in bond mode
                 atom_valence_remaining = np.array([self.vocabulary_valence[x] for x in self.atoms[1:]]) - \
                                          self.bonds[1:, 1:].sum(axis=1)
 
-            current_bond_order = self.bonds[atom_a_idx, atom_b_idx]
+                current_bond_order = self.bonds[atom_a_idx, atom_b_idx]
 
-            # Calculate maximum allowed bond order based on valence
-            extra_increase = min(atom_valence_remaining[atom_a_idx - 1], atom_valence_remaining[atom_b_idx - 1])
-            allowed_final_order = min(int(current_bond_order + extra_increase), self.maximum_bond_order)
+                # Calculate maximum allowed bond order based on valence
+                extra_increase = min(atom_valence_remaining[atom_a_idx - 1], atom_valence_remaining[atom_b_idx - 1])
+                allowed_final_order = min(int(current_bond_order + extra_increase), self.maximum_bond_order)
 
-            # Unmask valid bond order actions (N+1 to N+allowed_final_order)
-            if allowed_final_order > 0:
-                valid_bond_actions = np.arange(vocab_size + 1, vocab_size + 1 + allowed_final_order)
-                self.current_action_mask[valid_bond_actions] = False
+                # Unmask valid bond order actions (N+1 to N+allowed_final_order)
+                if allowed_final_order > 0:
+                    valid_bond_actions = np.arange(vocab_size + 1, vocab_size + 1 + allowed_final_order)
+                    self.current_action_mask[valid_bond_actions] = False
 
-            # Unmask remove bond action if it would maintain connectivity
-            if current_bond_order > 0 and self.is_connected_without_bond(atom_a_idx, atom_b_idx):
-                self.current_action_mask[vocab_size + 7] = False
+                # Unmask remove bond action if it would maintain connectivity
+                if current_bond_order > 0 and self.is_connected_without_bond(atom_a_idx, atom_b_idx):
+                    self.current_action_mask[vocab_size + 7] = False
 
         elif self.current_action_level == 3:
             # Level 3: Fragment handling

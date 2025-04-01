@@ -26,6 +26,9 @@ class TestAtomReplacement(unittest.TestCase):
         self.initial_atom = 1
         self.mol = MoleculeDesign(self.config, self.initial_atom)
 
+        # Store vocabulary size for action indexing
+        self.vocab_size = len(self.config.atom_vocabulary)
+
         # Add vocabulary info for easy access
         self.atom_indices = {
             "C": 1,
@@ -37,15 +40,15 @@ class TestAtomReplacement(unittest.TestCase):
     def debug_action_mask(self, mol, level_name="current"):
         """Helper to print current action mask and feasible actions"""
         mask = mol.current_action_mask
-        feasible = [i for i, m in enumerate(mask) if m == 0]
+        feasible = [i for i, m in enumerate(mask) if not m]
         print(f"Feasible actions at {level_name} level: {feasible}")
 
         # Additional context for level 1
         if mol.current_action_level == 1:
             num_atom_types = len(mol.vocabulary_atom_idcs)
-            create_atoms = [i for i in feasible if i < num_atom_types]
-            bond_atoms = [i for i in feasible if num_atom_types <= i < num_atom_types + len(mol.atoms) - 1]
-            replace_action = [i for i in feasible if i == num_atom_types + len(mol.atoms) - 1]
+            create_atoms = [i for i in feasible if 1 <= i <= num_atom_types]  # Actions 1-N create atoms
+            bond_atoms = [i for i in feasible if i > num_atom_types and i <= num_atom_types + len(mol.atoms) - 1]
+            replace_action = [i for i in feasible if i == num_atom_types + len(mol.atoms)]
 
             print(f"  - Create atoms: {create_atoms}")
             print(f"  - Bond with atoms: {bond_atoms}")
@@ -59,9 +62,9 @@ class TestAtomReplacement(unittest.TestCase):
         self.mol.take_action(1)  # Level 0: Create carbon atom
 
         # Connect with the first carbon to create C-C
-        new_atom_action_count = len(self.mol.vocabulary_atom_idcs)
-        self.mol.take_action(new_atom_action_count)  # Level 1: Select first atom for bonding
-        self.mol.take_action(0)  # Level 2: Create single bond
+        # In new action space: N+1+idx for selecting existing atom
+        self.mol.take_action(self.vocab_size + 1)  # Level 1: Select first atom for bonding (N+1)
+        self.mol.take_action(self.vocab_size + 1)  # Level 2: Create single bond (N+1)
 
         # Verify we have C-C
         self.assertEqual(len(self.mol.atoms), 3)  # 1 virtual + 2 real atoms
@@ -97,7 +100,8 @@ class TestAtomReplacement(unittest.TestCase):
         print(f"Available actions at level 1: {available_actions}")
 
         # Get the replacement action index
-        replace_action_idx = new_atom_action_count + len(self.mol.atoms) - 1
+        # In new action space: N+M+1 for replacement (where M is number of atoms)
+        replace_action_idx = self.vocab_size + len(self.mol.atoms)
         print(f"Replacement action index: {replace_action_idx}")
 
         # Verify replacement is allowed
@@ -116,18 +120,18 @@ class TestAtomReplacement(unittest.TestCase):
         available_actions = [i for i, masked in enumerate(self.mol.current_action_mask) if not masked]
         print(f"Available replacement options at level 2: {available_actions}")
 
-        # Carbon (0) should not be feasible (same type)
-        self.assertNotIn(0, available_actions, "Carbon should not be a feasible replacement (same type)")
+        # Carbon (1) should not be feasible (same type)
+        self.assertNotIn(1, available_actions, "Carbon should not be a feasible replacement (same type)")
 
-        # Nitrogen (1) should be feasible
-        self.assertIn(1, available_actions, "Nitrogen should be a feasible replacement")
+        # Nitrogen (2) should be feasible
+        self.assertIn(2, available_actions, "Nitrogen should be a feasible replacement")
 
         # Store the current atoms before replacement
         atoms_before = self.mol.atoms.copy()
         print(f"Atoms before replacement: {atoms_before}")
 
-        # Replace with nitrogen (action 1)
-        self.mol.take_action(1)
+        # Replace with nitrogen (action 2)
+        self.mol.take_action(2)
 
         # Verify we're back at level 0 and not in replacement mode
         self.assertEqual(self.mol.current_action_level, 0)
@@ -152,9 +156,9 @@ class TestAtomReplacement(unittest.TestCase):
         self.mol.take_action(1)  # Level 0: Create carbon atom
 
         # Connect with the first carbon to create C-C
-        new_atom_action_count = len(self.mol.vocabulary_atom_idcs)
-        self.mol.take_action(new_atom_action_count)  # Level 1: Select first atom for bonding
-        self.mol.take_action(0)  # Level 2: Create single bond
+        # In new action space: N+1+idx for selecting existing atom
+        self.mol.take_action(self.vocab_size + 1)  # Level 1: Select first atom for bonding
+        self.mol.take_action(self.vocab_size + 1)  # Level 2: Create single bond (N+1)
 
         # Verify we have C-C with a single bond
         self.assertEqual(len(self.mol.atoms), 3)  # 1 virtual + 2 real atoms
@@ -202,7 +206,6 @@ class TestAtomReplacement(unittest.TestCase):
 
         # Try to select first atom to modify its bond
         try:
-            # print("BOOGA")
             self.mol.take_action(first_atom_action)
             first_selectable = True
         except AssertionError:
@@ -211,12 +214,11 @@ class TestAtomReplacement(unittest.TestCase):
         # Try to select second atom to modify its bond
         try:
             if first_selectable:
-                # print("OOGA")
                 # Reset the molecule
                 self.mol = MoleculeDesign(self.config, self.initial_atom)
                 self.mol.take_action(1)
-                self.mol.take_action(new_atom_action_count)
-                self.mol.take_action(0)
+                self.mol.take_action(self.vocab_size + 1)  # Updated for new action space
+                self.mol.take_action(self.vocab_size + 1)  # Updated for new action space
 
             self.mol.take_action(second_atom_action)
             second_selectable = True
@@ -245,8 +247,10 @@ class TestAtomReplacement(unittest.TestCase):
 
         # Add second carbon with double bond
         self.mol.take_action(1)  # Level 0: Create carbon atom
-        self.mol.take_action(4)  # Level 1: Select first carbon
-        self.mol.take_action(1)  # Level 2: Create double bond
+
+        # In new action space, we need to select atom using N+1+idx
+        self.mol.take_action(self.vocab_size + 1)  # Level 1: Select first carbon
+        self.mol.take_action(self.vocab_size + 2)  # Level 2: Create double bond (N+2)
 
         print(f"After adding second carbon: {self.mol.atoms}")
         print(f"Bonds:\n{self.mol.bonds}")
@@ -258,8 +262,10 @@ class TestAtomReplacement(unittest.TestCase):
 
         # Add third carbon with single bond
         self.mol.take_action(1)  # Level 0: Create another carbon
-        self.mol.take_action(5)  # Level 1: Select second carbon
-        self.mol.take_action(0)  # Level 2: Create single bond
+
+        # In new action space: N+1+idx
+        self.mol.take_action(self.vocab_size + 2)  # Level 1: Select second carbon (N+2)
+        self.mol.take_action(self.vocab_size + 1)  # Level 2: Create single bond (N+1)
 
         print(f"After adding third carbon: {self.mol.atoms}")
         print(f"Bonds:\n{self.mol.bonds}")
@@ -287,8 +293,8 @@ class TestAtomReplacement(unittest.TestCase):
         print(f"Selecting atom index {atom_idx} with action {atom_select_action}")
         self.mol.take_action(atom_select_action)
 
-        # Get replacement action index
-        replace_action_idx = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+        # Get replacement action index - in new action space it's N+M+1
+        replace_action_idx = self.vocab_size + len(self.mol.atoms)
 
         # Verify replacement action is available
         feasible_l1 = [i for i, masked in enumerate(self.mol.current_action_mask) if not masked]
@@ -315,21 +321,23 @@ class TestAtomReplacement(unittest.TestCase):
         for new_type_idx, atom_type in enumerate(self.mol.vocabulary_atom_idcs):
             atom_name = self.mol.vocabulary_atom_names[new_type_idx]
             atom_valence = self.mol.vocabulary_valence[atom_type]
+            # Skip the first position (index 0) as it's reserved in level 2
+            action_idx = new_type_idx + 1
 
             # Skip if it's the same type
             if atom_type == self.mol.atoms[atom_idx]:
-                self.assertNotIn(new_type_idx, feasible_l2,
+                self.assertNotIn(action_idx, feasible_l2,
                                  f"Same atom type {atom_name} should not be allowed as replacement")
                 continue
 
             # Check valence constraint
             if atom_valence >= atom_bonds_sum:
-                if new_type_idx in feasible_l2:
+                if action_idx in feasible_l2:
                     print(f"{atom_name} with valence {atom_valence} correctly allowed")
                 else:
                     print(f"UNEXPECTED: {atom_name} with valence {atom_valence} not allowed despite sufficient valence")
             else:
-                if new_type_idx in feasible_l2:
+                if action_idx in feasible_l2:
                     print(
                         f"ERROR: {atom_name} with valence {atom_valence} incorrectly allowed for bonds {atom_bonds_sum}")
                     self.fail(
@@ -338,7 +346,7 @@ class TestAtomReplacement(unittest.TestCase):
                     print(f"{atom_name} with valence {atom_valence} correctly disallowed")
 
         # If we have valid replacements, try one (nitrogen)
-        if 1 in feasible_l2:  # Nitrogen is index 1
+        if 2 in feasible_l2:  # Nitrogen is index 2 in level 2
             print("\n--- Performing replacement with Nitrogen ---")
 
             # Capture state before replacement
@@ -346,7 +354,7 @@ class TestAtomReplacement(unittest.TestCase):
             print(f"Before replacement, atoms: {atoms_before}")
 
             # Replace with nitrogen
-            self.mol.take_action(1)
+            self.mol.take_action(2)
 
             # Verify replacement worked
             print(f"After replacement, atoms: {self.mol.atoms}")
@@ -369,14 +377,15 @@ class TestAtomReplacement(unittest.TestCase):
 
         # Start fresh
         self.mol = MoleculeDesign(self.config, self.initial_atom)
+
         # Create a C-C-C chain
         self.mol.take_action(1)  # Add second carbon
-        self.mol.take_action(4)  # Select first carbon
-        self.mol.take_action(0)  # Create single bond
+        self.mol.take_action(self.vocab_size + 1)  # Select first carbon (N+1)
+        self.mol.take_action(self.vocab_size + 1)  # Create single bond (N+1)
 
         self.mol.take_action(1)  # Add third carbon
-        self.mol.take_action(5)  # Select second carbon
-        self.mol.take_action(0)  # Create single bond
+        self.mol.take_action(self.vocab_size + 2)  # Select second carbon (N+2)
+        self.mol.take_action(self.vocab_size + 1)  # Create single bond (N+1)
 
         # Now replace the middle carbon
         middle_atom_idx = 2
@@ -389,9 +398,13 @@ class TestAtomReplacement(unittest.TestCase):
 
         # Replace middle C with N
         self.mol.take_action(middle_atom_action)
-        replace_action = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+
+        # In new action space: N+M+1 for replacement
+        replace_action = self.vocab_size + len(self.mol.atoms)
         self.mol.take_action(replace_action)
-        self.mol.take_action(1)  # Replace with N
+
+        # In new action space: action 2 for Nitrogen (level 2)
+        self.mol.take_action(2)  # Replace with N
 
         # Verify replacement
         self.assertEqual(self.mol.atoms[middle_atom_idx], 2)  # Should be nitrogen now
@@ -402,20 +415,20 @@ class TestAtomReplacement(unittest.TestCase):
         """Test replacing an atom that's using its full valence."""
         # Create a carbon with 4 bonds (full valence)
         self.mol.take_action(1)  # Add second carbon with single bond
-        self.mol.take_action(4)  # Select first carbon
-        self.mol.take_action(0)  # Create single bond
+        self.mol.take_action(self.vocab_size + 1)  # Select first carbon (N+1)
+        self.mol.take_action(self.vocab_size + 1)  # Create single bond (N+1)
 
         self.mol.take_action(1)  # Add third carbon
-        self.mol.take_action(4)  # Select first carbon again
-        self.mol.take_action(0)  # Create single bond
+        self.mol.take_action(self.vocab_size + 1)  # Select first carbon again (N+1)
+        self.mol.take_action(self.vocab_size + 1)  # Create single bond (N+1)
 
         self.mol.take_action(1)  # Add fourth carbon
-        self.mol.take_action(4)  # Select first carbon again
-        self.mol.take_action(0)  # Create single bond
+        self.mol.take_action(self.vocab_size + 1)  # Select first carbon again (N+1)
+        self.mol.take_action(self.vocab_size + 1)  # Create single bond (N+1)
 
         self.mol.take_action(1)  # Add fifth carbon
-        self.mol.take_action(4)  # Select first carbon again
-        self.mol.take_action(0)  # Create single bond
+        self.mol.take_action(self.vocab_size + 1)  # Select first carbon again (N+1)
+        self.mol.take_action(self.vocab_size + 1)  # Create single bond (N+1)
 
         # Now first carbon has 4 bonds (full valence)
         # Verify this
@@ -431,7 +444,9 @@ class TestAtomReplacement(unittest.TestCase):
         center_atom_action = self.mol.pick_existing_atoms_start_action_idx_lvl_0 + center_atom_idx - 1
         if center_atom_action in [i for i, m in enumerate(self.mol.current_action_mask) if not m]:
             self.mol.take_action(center_atom_action)
-            replace_action = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+
+            # In new action space: N+M+1 for replacement
+            replace_action = self.vocab_size + len(self.mol.atoms)
             self.mol.take_action(replace_action)
 
             # Verify only carbon (valence 4) is allowed, others should be masked
@@ -445,14 +460,18 @@ class TestAtomReplacement(unittest.TestCase):
         """Test that replacing atoms preserves double and triple bonds."""
         # Create a C=C molecule
         self.mol.take_action(1)  # Add second carbon
-        self.mol.take_action(4)  # Select first carbon
-        self.mol.take_action(1)  # Create double bond
+        self.mol.take_action(self.vocab_size + 1)  # Select first carbon (N+1)
+        self.mol.take_action(self.vocab_size + 2)  # Create double bond (N+2)
 
         # Replace the first carbon with nitrogen
-        self.mol.take_action(5)  # Select first carbon
-        replace_action = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+        self.mol.take_action(self.mol.pick_existing_atoms_start_action_idx_lvl_0)  # Select first carbon
+
+        # In new action space: N+M+1 for replacement
+        replace_action = self.vocab_size + len(self.mol.atoms)
         self.mol.take_action(replace_action)
-        self.mol.take_action(1)  # Replace with N
+
+        # In new action space: action 2 for Nitrogen (level 2)
+        self.mol.take_action(2)  # Replace with N (action 2)
 
         # Verify double bond preserved
         self.assertEqual(self.mol.bonds[1, 2], 2)
@@ -465,8 +484,8 @@ class TestAtomReplacement(unittest.TestCase):
         """Test replacing the initial atom when it's part of a multi-atom molecule."""
         # Add a second atom to allow replacement of the initial atom
         self.mol.take_action(1)  # Level 0: Create carbon atom
-        self.mol.take_action(4)  # Level 1: Select first carbon
-        self.mol.take_action(0)  # Level 2: Create single bond
+        self.mol.take_action(self.vocab_size + 1)  # Level 1: Select first carbon (N+1)
+        self.mol.take_action(self.vocab_size + 1)  # Level 2: Create single bond (N+1)
 
         # Now the initial atom should be selectable for replacement
         initial_atom_action = self.mol.pick_existing_atoms_start_action_idx_lvl_0
@@ -479,9 +498,13 @@ class TestAtomReplacement(unittest.TestCase):
 
         # Replace with nitrogen
         self.mol.take_action(initial_atom_action)
-        replace_action = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+
+        # In new action space: N+M+1 for replacement
+        replace_action = self.vocab_size + len(self.mol.atoms)
         self.mol.take_action(replace_action)
-        self.mol.take_action(1)  # Replace with N
+
+        # In new action space: action 2 for Nitrogen (level 2)
+        self.mol.take_action(2)  # Replace with N (action 2)
 
         # Verify replacement
         self.assertEqual(self.mol.atoms[1], 2)  # Should be nitrogen now
@@ -500,8 +523,8 @@ class TestAtomReplacement(unittest.TestCase):
 
         # Add carbon with single bond to oxygen
         self.mol.take_action(1)  # Level 0: Create carbon atom
-        self.mol.take_action(4)  # Level 1: Select oxygen atom
-        self.mol.take_action(0)  # Level 2: Create single bond
+        self.mol.take_action(self.vocab_size + 1)  # Level 1: Select oxygen atom (N+1)
+        self.mol.take_action(self.vocab_size + 1)  # Level 2: Create single bond (N+1)
 
         print(f"After adding carbon: {self.mol.atoms}")  # Should show [0, 3, 1]
         print(f"Bonds:\n{self.mol.bonds}")
@@ -524,7 +547,8 @@ class TestAtomReplacement(unittest.TestCase):
         self.mol.take_action(carbon_atom_action)
 
         # Choose replace action
-        replace_action_idx = len(self.mol.vocabulary_atom_idcs) + len(self.mol.atoms) - 1
+        # In new action space: N+M+1 for replacement
+        replace_action_idx = self.vocab_size + len(self.mol.atoms)
         print(f"Level 1 actions: {[i for i, m in enumerate(self.mol.current_action_mask) if not m]}")
         self.mol.take_action(replace_action_idx)
 
@@ -532,13 +556,13 @@ class TestAtomReplacement(unittest.TestCase):
         level_2_actions = [i for i, m in enumerate(self.mol.current_action_mask) if not m]
         print(f"Available replacements: {level_2_actions}")
 
-        # Nitrogen should be a valid replacement (index 1)
-        self.assertIn(1, level_2_actions, "Nitrogen should be a valid replacement for carbon")
+        # Nitrogen should be a valid replacement (action 2 in level 2)
+        self.assertIn(2, level_2_actions, "Nitrogen should be a valid replacement for carbon")
 
         # Replace with nitrogen
         print("\n--- Replacing carbon with nitrogen ---")
         print(f"Before replacement: {self.mol.atoms}")
-        self.mol.take_action(1)  # Replace with nitrogen (action 1 → atom type 2)
+        self.mol.take_action(2)  # Replace with nitrogen (action 2 at level 2)
 
         # Verify replacement
         print(f"After replacement: {self.mol.atoms}")

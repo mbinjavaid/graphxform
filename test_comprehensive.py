@@ -2,7 +2,6 @@ import unittest
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import Draw
-# from rdkit.Chem.Draw import IPythonConsole
 from config import MoleculeConfig
 from molecule_design import MoleculeDesign
 import matplotlib.pyplot as plt
@@ -33,9 +32,13 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
         # Find indices for common atoms in the vocabulary for easier reference
         atom_names = list(self.config.atom_vocabulary.keys())
         self.C_idx = atom_names.index("C") + 1  # Carbon index in vocabulary
+        # print("C_idx", self.C_idx)
         self.N_idx = atom_names.index("N") + 1  # Nitrogen index
         self.O_idx = atom_names.index("O") + 1  # Oxygen index
         self.S_idx = atom_names.index("S") + 1  # Sulfur index
+
+        # Store vocabulary size for action indexing
+        self.vocab_size = len(self.config.atom_vocabulary)
 
         # To easily reference the start index for selecting existing atoms
         self.ex_atom_start_idx = len(self.config.atom_vocabulary) + 1
@@ -153,7 +156,7 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             # Level 1: Bond with the previously added atom
             self.assertEqual(molecule.current_action_level, 1)
 
-            # For the first iteration, bond with the initial atom (nitrogen)
+            # For the first iteration, bond with the initial atom
             # For subsequent iterations, bond with the last carbon added
             target_atom_idx = i
 
@@ -163,7 +166,8 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             print(len(molecule.atom_vocabulary))
 
             # Select existing atom for bonding using the correct offset
-            existing_atom_action = len(self.config.atom_vocabulary) + target_atom_idx
+            # In new action space: N+1 to N+M for existing atoms (1-based indexing)
+            existing_atom_action = self.vocab_size + 1 + target_atom_idx  # N+1+idx
             print("existing_atom_action", existing_atom_action)
             molecule.take_action(existing_atom_action)
 
@@ -173,7 +177,8 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
 
             # Level 2: Create a single bond
             self.assertEqual(molecule.current_action_level, 2)
-            molecule.take_action(0)  # Action 0 = bond order 1 (single bond)
+            # In new action space: N+1 = bond order 1
+            molecule.take_action(self.vocab_size + 1)  # Action N+1 = bond order 1 (single bond)
 
             print(molecule.history)
             print(molecule.atoms)
@@ -196,7 +201,7 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
                     molecule,
                     "6-Carbon Chain",
                     "Built a linear chain of 6 carbon atoms using hierarchical actions: Level 0 (add atom), "
-                    "Level 1 (select existing atom using offset), Level 2 (create single bond). "
+                    "Level 1 (select existing atom using offset N+1+idx), Level 2 (create single bond with action N+1). "
                     "This demonstrates proper atom-atom bonding mechanics."
                 )
 
@@ -220,13 +225,13 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
         molecule.take_action(first_c_action_idx)
 
         # Level 1: Select the last carbon atom (index 6 in molecule.atoms)
-        # We need to use the vocabulary offset to select an existing atom
-        last_c_action_idx = len(self.config.atom_vocabulary) + 5  # 23 + 5 = action 28
+        # In new action space: N+1 to N+M for existing atoms
+        last_c_action_idx = self.vocab_size + 6  # N+6 for atom at index 6
         print(f"Selecting last carbon using action {last_c_action_idx}")
         molecule.take_action(last_c_action_idx)
 
-        # Level 2: Create a single bond
-        molecule.take_action(0)  # Action 0 = bond order 1 (single bond)
+        # Level 2: Create a single bond (N+1 in new action space)
+        molecule.take_action(self.vocab_size + 1)  # Action N+1 = bond order 1 (single bond)
 
         # Verify the ring closure bond exists
         rdkit_bond = molecule.rdkit_mol.GetBondBetweenAtoms(0, 5)
@@ -239,7 +244,7 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             "Cyclohexane (Ring Closed)",
             "Created ring closure bond between the first and last carbon atoms. "
             "This required selecting existing atoms at both level 0 and level 1 using the proper "
-            "action indices (vocabulary_size + atom_index). At this point, the molecule is cyclohexane."
+            "action indices. At this point, the molecule is cyclohexane."
         )
 
         # At this point, we have a cyclohexane. Let's add double bonds to make it benzene.
@@ -254,18 +259,17 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
 
         for pos in bond_positions:
             # Level 0: Select first atom of the bond
-            first_atom_action_idx = self.ex_atom_start_idx + pos[0] + 1 - 1  # Formula: start_idx + atom_idx - 1
+            first_atom_action_idx = self.ex_atom_start_idx + pos[0]  # Formula: start_idx + atom_idx - 1
             molecule.take_action(first_atom_action_idx)
 
             # Level 1: Select second atom of the bond
-            # INCORRECT: molecule.take_action(pos[1])  # This creates a new atom of type pos[1]
-            # CORRECT: Use the vocabulary size offset to select an existing atom
-            second_atom_action_idx = len(self.config.atom_vocabulary) + pos[1]
+            # In new action space: N+1+idx for existing atom at index idx+1
+            second_atom_action_idx = self.vocab_size + 1 + pos[1]
             print(f"Selecting second atom at position {pos[1]} using action {second_atom_action_idx}")
             molecule.take_action(second_atom_action_idx)
 
-            # Level 2: Change to double bond (action 1 = bond order 2)
-            molecule.take_action(1)
+            # Level 2: Change to double bond (N+2 = bond order 2)
+            molecule.take_action(self.vocab_size + 2)  # Action N+2 = bond order 2 (double bond)
 
             # Verify the bond was updated
             rdkit_bond = molecule.rdkit_mol.GetBondBetweenAtoms(pos[0], pos[1])
@@ -277,7 +281,7 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             molecule,
             "Benzene (Added Double Bonds)",
             "Converted single bonds to double bonds at positions (0-1), (2-3), and (4-5) to create benzene. "
-            "This demonstrates the ability to modify existing bonds. Action 1 at level 2 changes single bonds "
+            "This demonstrates the ability to modify existing bonds. Action N+2 at level 2 changes single bonds "
             "to double bonds, respecting valence constraints of carbon atoms."
         )
 
@@ -293,14 +297,13 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
         molecule.take_action(self.O_idx)
 
         # Level 1: Bond with carbon at position 1
-        # INCORRECT: molecule.take_action(1)  # This creates a new atom of type 1
-        # CORRECT: Use the offset to select existing atom
-        carbon1_action_idx = len(self.config.atom_vocabulary) + 1
+        # In new action space: N+1+idx for existing atom at index idx+1
+        carbon1_action_idx = self.vocab_size + 1 + 1  # N+1+1 for atom at index 1+1
         print(f"Selecting carbon at position 1 using action {carbon1_action_idx}")
         molecule.take_action(carbon1_action_idx)
 
-        # Level 2: Create a single bond
-        molecule.take_action(0)  # Action 0 = bond order 1 (single bond)
+        # Level 2: Create a single bond (N+1 in new action space)
+        molecule.take_action(self.vocab_size + 1)  # Action N+1 = bond order 1 (single bond)
 
         # Verify oxygen was added and bonded
         self.assertEqual(molecule.atoms[7], self.O_idx)
@@ -313,8 +316,8 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             molecule,
             "Added Oxygen (Position 1)",
             "Added an oxygen atom (action index O_idx) and bonded it to carbon at position 1. "
-            "This creates a phenol-like structure. Note that we must use the vocabulary offset when "
-            "selecting an existing atom at level 1, otherwise we'd create a new atom instead."
+            "This creates a phenol-like structure. We use action N+1+idx when "
+            "selecting an existing atom at level 1 in the new action space."
         )
 
         # Add a nitrogen to position 3 (forming an aniline-like structure)
@@ -322,14 +325,13 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
         molecule.take_action(self.N_idx)
 
         # Level 1: Bond with carbon at position 3
-        # INCORRECT: molecule.take_action(3)
-        # CORRECT: Use the offset
-        carbon3_action_idx = len(self.config.atom_vocabulary) + 3
+        # In new action space: N+1+idx for existing atom at index idx+1
+        carbon3_action_idx = self.vocab_size + 1 + 3  # N+1+3 for atom at index 3+1
         print(f"Selecting carbon at position 3 using action {carbon3_action_idx}")
         molecule.take_action(carbon3_action_idx)
 
         # Level 2: Create a single bond
-        molecule.take_action(0)  # Action 0 = bond order 1 (single bond)
+        molecule.take_action(self.vocab_size + 1)  # Action N+1 = bond order 1 (single bond)
 
         # Verify nitrogen was added and bonded
         self.assertEqual(molecule.atoms[8], self.N_idx)
@@ -351,14 +353,13 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
         molecule.take_action(self.S_idx)
 
         # Level 1: Bond with carbon at position 5
-        # INCORRECT: molecule.take_action(5)
-        # CORRECT: Use the offset
-        carbon5_action_idx = len(self.config.atom_vocabulary) + 5
+        # In new action space: N+1+idx for existing atom at index idx+1
+        carbon5_action_idx = self.vocab_size + 1 + 5  # N+1+5 for atom at index 5+1
         print(f"Selecting carbon at position 5 using action {carbon5_action_idx}")
         molecule.take_action(carbon5_action_idx)
 
         # Level 2: Create a single bond
-        molecule.take_action(0)  # Action 0 = bond order 1 (single bond)
+        molecule.take_action(self.vocab_size + 1)  # Action N+1 = bond order 1 (single bond)
 
         # Verify sulfur was added and bonded
         self.assertEqual(molecule.atoms[9], self.S_idx)
@@ -386,20 +387,22 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
         molecule.take_action(nitrogen_action_idx)
 
         # Level 1: Select the carbon atom it's bonded to (at position 3)
-        carbon3_action_idx = len(self.config.atom_vocabulary) + 3
+        # In new action space: N+1+idx for existing atom at index idx+1
+        carbon3_action_idx = self.vocab_size + 1 + 3  # N+1+3 for atom at index 3+1
         print(f"Selecting carbon at position 3 using action {carbon3_action_idx}")
         molecule.take_action(carbon3_action_idx)
 
         # Level 2: Check if double bond is feasible before attempting it
         print(f"Action mask at level 2: {molecule.current_action_mask}")
-        double_bond_feasible = molecule.current_action_mask[1] == 0  # Check if action 1 (double bond) is feasible
+        # In new action space: N+2 = bond order 2
+        double_bond_feasible = not molecule.current_action_mask[self.vocab_size + 2]  # Check if N+2 is feasible
 
         attempted_action = "double bond creation"
         action_result = ""
 
         if double_bond_feasible:
-            print("Creating a double bond (action 1) is feasible")
-            molecule.take_action(1)  # Action 1 = bond order 2 (double bond)
+            print("Creating a double bond (action N+2) is feasible")
+            molecule.take_action(self.vocab_size + 2)  # Action N+2 = bond order 2 (double bond)
 
             # Verify the bond order was increased
             rdkit_bond = molecule.rdkit_mol.GetBondBetweenAtoms(3, 7)  # Carbon at idx 3, Nitrogen at idx 7
@@ -408,9 +411,8 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             action_result = "Succeeded: N=C double bond was created."
         else:
             print("Creating a double bond is NOT feasible due to valence constraints")
-            # Maintain single bond by using action 0
-            molecule.take_action(0)  # Keep single bond
-
+            # Maintain single bond by using action N+1
+            molecule.take_action(self.vocab_size + 1)  # Keep single bond
             # Verify the bond remains a single bond
             rdkit_bond = molecule.rdkit_mol.GetBondBetweenAtoms(3, 7)
             self.assertIsNotNone(rdkit_bond)
@@ -437,20 +439,22 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
         molecule.take_action(first_c_action_idx)
 
         # Level 1: Select the second carbon atom (at position 1)
-        carbon1_action_idx = len(self.config.atom_vocabulary) + 1
+        # In new action space: N+1+idx for existing atom at index idx+1
+        carbon1_action_idx = self.vocab_size + 1 + 1  # N+1+1 for atom at index 1+1
         print(f"Selecting second carbon using action {carbon1_action_idx}")
         molecule.take_action(carbon1_action_idx)
 
-        # Level 2: Check if decrease action is feasible
+        # Level 2: Check if single bond action is feasible (we know it should have a double bond currently)
         print(f"Action mask at level 2: {molecule.current_action_mask}")
-        decrease_bond_feasible = molecule.current_action_mask[6] == 0  # Check if action 6 (decrease by 1) is feasible
+        # In new action space: N+1 = bond order 1 (decreasing from 2 to 1)
+        decrease_bond_feasible = not molecule.current_action_mask[self.vocab_size + 1]
 
         attempted_action = "bond order decrease"
         action_result = ""
 
         if decrease_bond_feasible:
-            print("Decreasing bond order (action 6) is feasible")
-            molecule.take_action(6)  # Action 6 = decrease by 1
+            print("Decreasing bond order (action N+1) is feasible")
+            molecule.take_action(self.vocab_size + 1)  # Action N+1 = set to single bond
 
             # Verify the bond order was decreased
             rdkit_bond = molecule.rdkit_mol.GetBondBetweenAtoms(0, 1)
@@ -461,7 +465,7 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             print("Decreasing bond order is NOT feasible")
             # Choose a feasible action instead
             for i in range(len(molecule.current_action_mask)):
-                if molecule.current_action_mask[i] == 0:
+                if not molecule.current_action_mask[i]:
                     print(f"Using feasible action {i} instead")
                     molecule.take_action(i)
                     break
@@ -490,14 +494,14 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             molecule.take_action(sulfur_action_idx)
 
             # Level 1: Select the carbon atom it's bonded to (at position 5)
-            # INCORRECT: molecule.take_action(5)
-            # CORRECT: Use the offset
-            carbon5_action_idx = len(self.config.atom_vocabulary) + 5
+            # In new action space: N+1+idx for existing atom at index idx+1
+            carbon5_action_idx = self.vocab_size + 1 + 5  # N+1+5 for atom at index 5+1
             print(f"Selecting carbon at position 5 using action {carbon5_action_idx}")
             molecule.take_action(carbon5_action_idx)
 
-            # Level 2: Remove the bond (action 7 = decrease by 1 from bond order 1 to 0)
-            molecule.take_action(7)  # Action to completely remove bond
+            # Level 2: Remove the bond
+            # In new action space: N+7 = remove bond completely
+            molecule.take_action(self.vocab_size + 7)  # Action N+7 to remove bond
 
             # Verify the bond was removed
             rdkit_bond = molecule.rdkit_mol.GetBondBetweenAtoms(5, 8)  # Carbon at idx 5, Sulfur at idx 8
@@ -507,7 +511,7 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             self.capture_snapshot(
                 molecule,
                 "Removed S-C Bond",
-                "Successfully removed the bond between sulfur and carbon. Using action 7 at level 2 removes an existing bond. "
+                "Successfully removed the bond between sulfur and carbon. Using action N+7 at level 2 removes an existing bond. "
                 "Removal was possible because it doesn't fragment the molecule (the is_connected_without_bond check passed)."
             )
 
@@ -516,14 +520,13 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             molecule.take_action(sulfur_action_idx)
 
             # Level 1: Select the oxygen atom (at index 7)
-            # INCORRECT: molecule.take_action(7)
-            # CORRECT: Use the offset
-            oxygen_action_idx = len(self.config.atom_vocabulary) + 7
+            # In new action space: N+1+idx for existing atom at index idx+1
+            oxygen_action_idx = self.vocab_size + 1 + 6  # N+1+6 for atom at index 6+1
             print(f"Selecting oxygen atom using action {oxygen_action_idx}")
             molecule.take_action(oxygen_action_idx)
 
             # Level 2: Create a single bond
-            molecule.take_action(0)  # Action 0 = bond order 1 (single bond)
+            molecule.take_action(self.vocab_size + 1)  # Action N+1 = bond order 1 (single bond)
 
             # Verify the new bond was created
             rdkit_bond = molecule.rdkit_mol.GetBondBetweenAtoms(6, 8)  # Oxygen at idx 6, Sulfur at idx 8
@@ -547,14 +550,13 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
             molecule.take_action(self.C_idx)
 
             # Level 1: Bond with the oxygen atom
-            # INCORRECT: molecule.take_action(6)
-            # CORRECT: Use the offset
-            oxygen_action_idx = len(self.config.atom_vocabulary) + 6
+            # In new action space: N+1+idx for existing atom at index idx+1
+            oxygen_action_idx = self.vocab_size + 1 + 6  # N+1+6 for atom at index 6+1
             print(f"Selecting oxygen atom using action {oxygen_action_idx}")
             molecule.take_action(oxygen_action_idx)
 
             # Level 2: Create a single bond
-            molecule.take_action(0)  # Action 0 = bond order 1 (single bond)
+            molecule.take_action(self.vocab_size + 1)  # Action N+1 = bond order 1 (single bond)
 
             # Verify the new carbon was added and bonded to oxygen
             self.assertEqual(molecule.atoms[10], self.C_idx)
@@ -624,7 +626,6 @@ class TestMoleculeDesignComprehensive(unittest.TestCase):
 
         # Create visualization of molecule evolution
         self.visualize_molecule_evolution()
-
 
 if __name__ == "__main__":
     unittest.main()

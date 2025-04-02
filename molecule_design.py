@@ -435,14 +435,12 @@ class MoleculeDesign(BaseTrajectory):
 
             # Apply valence constraints to atom creation
 
-            valid_atom_indices = np.arange(0, min(vocab_size, len(self.atoms)))
-
-            if len(valid_atom_indices) > 0:
-
-                insufficient_valence_indices = valid_atom_indices[atom_valence_remaining[valid_atom_indices] < 1]
-
-                if len(insufficient_valence_indices) > 0:
-                    self.current_action_mask[insufficient_valence_indices] = True
+            # Apply valence constraints to atom creation - only check the valence of the selected atom
+            selected_atom_idx = atom_idx_in_array - 1  # Convert 1-based atom index to 0-based for atom_valence_remaining
+            if selected_atom_idx >= 0 and selected_atom_idx < len(atom_valence_remaining):
+                if atom_valence_remaining[selected_atom_idx] < 1:
+                    # If selected atom has no remaining valence, mask all atom creation actions
+                    self.current_action_mask[:vocab_size] = True
 
             # Handle existing atom selection (V to V+N-1)
 
@@ -853,16 +851,12 @@ class MoleculeDesign(BaseTrajectory):
 
             else:  # action == 2: Keep both fragments
 
-                # Flag that molecule has disconnected fragments
-
                 print("DEBUG: Setting has_disconnected_fragments = True")
-
                 self.has_disconnected_fragments = True
 
-                print(
-                    f"DEBUG: After setting, has_disconnected_fragments exists? = {hasattr(self, 'has_disconnected_fragments')}")
-
-                print(f"DEBUG: Value is: {self.has_disconnected_fragments}")
+                # We need to clean up the fragments attribute since we're done with it
+                if hasattr(self, 'fragments'):
+                    del self.fragments
 
             self.history.append(int(action))
 

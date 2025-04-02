@@ -129,12 +129,12 @@ class MoleculeDesign(BaseTrajectory):
             If fragment information is not available, returns an array of zeros.
         """
         if not hasattr(self, "fragment_atom_indices") or self.fragment_atom_indices is None:
-            print("DEBUG: No fragment indices available, returning zeros.")
+            # print("DEBUG: No fragment indices available, returning zeros.")
             return np.zeros(len(self.atoms) - 1, dtype=int)
 
         # self.fragment_atom_indices is a list of lists, where each inner list contains
         # the atom indices (from the RDKit molecule) that belong to a specific fragment
-        print(f"DEBUG: Fragment indices structure: {self.fragment_atom_indices}")
+        # print(f"DEBUG: Fragment indices structure: {self.fragment_atom_indices}")
 
         # Initialize array with all zeros
         fragment_array = np.zeros(len(self.atoms) - 1, dtype=int)
@@ -146,7 +146,7 @@ class MoleculeDesign(BaseTrajectory):
                 internal_idx = atom_idx + 1 - 1  # +1 for virtual atom, -1 for zero-indexing
                 fragment_array[internal_idx] = fragment_id
 
-        print(f"DEBUG: Constructed fragment array: {fragment_array}")
+        # print(f"DEBUG: Constructed fragment array: {fragment_array}")
         return fragment_array
 
     def is_connected_without_bond(self, atom1: int, atom2: int) -> bool:
@@ -201,7 +201,7 @@ class MoleculeDesign(BaseTrajectory):
         # Make sure we check if this is still disconnected
         frags = Chem.GetMolFrags(self.rdkit_mol, asMols=False)
         if len(frags) > 1:
-            print("DEBUG: Fragment still disconnected after keep_fragment")
+            # print("DEBUG: Fragment still disconnected after keep_fragment")
             self.has_disconnected_fragments = True
         else:
             # Only remove flag if we're now connected
@@ -318,7 +318,7 @@ class MoleculeDesign(BaseTrajectory):
                                          sanitizeFrags=True,
                                          fragsMolAtomMapping=atom_indices)
 
-        print(f"DEBUG: Found {len(fragments_mol)} fragments after bond removal")
+        # print(f"DEBUG: Found {len(fragments_mol)} fragments after bond removal")
 
         if len(fragments_mol) > 1:
             # Store fragment information for Level 3 decision
@@ -339,10 +339,10 @@ class MoleculeDesign(BaseTrajectory):
             self.current_action_mask = None
             return
 
-        print("DEBUG: In update_action_mask, has_disconnected_fragments exists? =",
-              hasattr(self, 'has_disconnected_fragments'))
-        if hasattr(self, 'has_disconnected_fragments'):
-            print("DEBUG: Value is:", self.has_disconnected_fragments)
+        # print("DEBUG: In update_action_mask, has_disconnected_fragments exists? =",
+        #       hasattr(self, 'has_disconnected_fragments'))
+        # if hasattr(self, 'has_disconnected_fragments'):
+        #     print("DEBUG: Value is:", self.has_disconnected_fragments)
 
         atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms[1:]])
         atom_valence_remaining = atom_valence - self.bonds[1:, 1:].sum(axis=1)
@@ -469,11 +469,11 @@ class MoleculeDesign(BaseTrajectory):
             if hasattr(self, "has_disconnected_fragments") and self.has_disconnected_fragments:
                 assignments = self._build_fragment_assignments()
 
-                # Use the correct attribute name if it exists
-                if hasattr(self, "fragment_atom_indices"):
-                    print(f"DEBUG: Fragment indices structure: {self.fragment_atom_indices}")
+                # # Use the correct attribute name if it exists
+                # if hasattr(self, "fragment_atom_indices"):
+                #     print(f"DEBUG: Fragment indices structure: {self.fragment_atom_indices}")
 
-                print(f"DEBUG: Constructed fragment array: {assignments}")
+                # print(f"DEBUG: Constructed fragment array: {assignments}")
 
                 source_fragment = assignments[atom_idx_in_array - 1]
                 different_fragment_mask = assignments[target_atoms - 1] != source_fragment
@@ -541,6 +541,7 @@ class MoleculeDesign(BaseTrajectory):
 
                 for atom_type_idx, atom_type in enumerate(self.vocabulary_atom_idcs):
                     action_idx = atom_type_idx  # 0-indexed action
+
                     # Apply basic constraints
                     if (self.atom_feasibility_mask[atom_type_idx] or  # Not allowed in config
                             atom_type == current_atom_type or  # Same as current atom
@@ -746,32 +747,21 @@ class MoleculeDesign(BaseTrajectory):
 
                 next_level = 2
 
-
             elif action == replace_action_idx:
-
                 # Replace atom action (V+N)
-
                 atom_picked_on_lvl_0 = self.history[-1]  # Level 0 action is the atom index
-
                 self.atom_to_replace = atom_picked_on_lvl_0  # No adjustment needed
-
                 self.is_replacing_atom = True
-
                 self.history.append(int(action))
-
                 next_level = 2
 
-
             else:
-
                 # Bond with existing atom (actions V to V+N-1)
-
                 existing_atom_idx = action - vocab_size  # Convert from V+idx to idx
-
                 target_atom_idx = existing_atom_idx + 1  # +1 for virtual atom
 
                 # Handle the case where the selected atom is the same as base atom
-
+                # (if masking works correctly, this should never happen)
                 if target_atom_idx == self.base_atom_idx:
                     raise ValueError("Cannot bond an atom with itself")
 
@@ -844,7 +834,7 @@ class MoleculeDesign(BaseTrajectory):
                                 del self.fragment_atom_indices
                             if hasattr(self, 'fragments'):
                                 del self.fragments
-                            print("DEBUG: All fragments reconnected, cleaned up fragment tracking")
+                            # print("DEBUG: All fragments reconnected, cleaned up fragment tracking")
 
                     next_level = 0
 
@@ -869,7 +859,7 @@ class MoleculeDesign(BaseTrajectory):
 
             # Level 3: Fragment Handling
 
-            print(f"DEBUG: Level 3 action = {action}")
+            # print(f"DEBUG: Level 3 action = {action}")
 
             if action < 2:
 
@@ -881,7 +871,7 @@ class MoleculeDesign(BaseTrajectory):
 
             else:  # action == 2: Keep both fragments
 
-                print("DEBUG: Setting has_disconnected_fragments = True")
+                # print("DEBUG: Setting has_disconnected_fragments = True")
                 self.has_disconnected_fragments = True
 
                 # We need to clean up the fragments attribute since we're done with it
@@ -979,15 +969,15 @@ class MoleculeDesign(BaseTrajectory):
         else:
             atom.SetChiralTag(Chem.CHI_UNSPECIFIED)
 
-        # Reset hydrogen counts - let RDKit handle them implicitly
-        atom.SetNoImplicit(False)
-        atom.SetNumExplicitHs(0)
+        # # Reset hydrogen counts - let RDKit handle them implicitly
+        # atom.SetNoImplicit(False)
+        # atom.SetNumExplicitHs(0)
 
         # Try to sanitize to recalculate implicit hydrogens
         try:
-            # First reset property cache
-            for a in updated_mol.GetAtoms():
-                a.UpdatePropertyCache(strict=False)
+            # # First reset property cache
+            # for a in updated_mol.GetAtoms():
+            #     a.UpdatePropertyCache(strict=False)
 
             # Sanitize the molecule
             Chem.SanitizeMol(updated_mol)

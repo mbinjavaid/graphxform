@@ -400,6 +400,7 @@ class TestAtomReplacement(unittest.TestCase):
         self.mol.take_action(1)  # Select first atom
         self.mol.take_action(0)  # Create C atom
         self.mol.take_action(self.vocab_size + 0)  # Bond order 1
+        # self.mol.take_action(self.vocab_size + 2)  # Bond order 3
 
         # Then C-C-C
         self.mol.take_action(2)  # Select second atom
@@ -424,9 +425,17 @@ class TestAtomReplacement(unittest.TestCase):
         # In new action space: action 1 for Nitrogen (0-indexed in level 2)
         self.mol.take_action(1)  # Replace with N
 
+        # Just checking if we can terminate the design here (we can):
+        # print("current action level: ", self.mol.current_action_level)
+        # self.mol.take_action(0)
+        # self.mol.take_action(1)
+
+        # print(self.mol.atoms)
+
         # Verify replacement
         self.assertEqual(self.mol.atoms[middle_atom_idx], 2)  # Should be nitrogen now
         self.assertEqual(self.mol.bonds[1, middle_atom_idx], 1)  # Bond to first C preserved
+        # self.assertEqual(self.mol.bonds[1, middle_atom_idx], 3)  # Bond to first C preserved
         self.assertEqual(self.mol.bonds[middle_atom_idx, 3], 1)  # Bond to third C preserved
 
     def test_max_valence_replacement(self):

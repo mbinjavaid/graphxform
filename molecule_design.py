@@ -118,6 +118,37 @@ class MoleculeDesign(BaseTrajectory):
         self.update_action_mask()
         self.update_rdkit_mol(new_atom=initial_atom)
 
+    def _build_fragment_assignments(self):
+        """
+        Converts the RDKit fragsMolAtomMapping (stored in self.fragment_atom_indices)
+        into a NumPy array mapping internal atom indices (1-indexed for real atoms)
+        to fragment IDs.
+
+        Returns:
+            np.ndarray: An array of shape (num_real_atoms,) containing the fragment ID for each real atom.
+            If fragment information is not available, returns an array of zeros.
+        """
+        if not hasattr(self, "fragment_atom_indices") or self.fragment_atom_indices is None:
+            print("DEBUG: No fragment indices available, returning zeros.")
+            return np.zeros(len(self.atoms) - 1, dtype=int)
+
+        # self.fragment_atom_indices is a list of lists, where each inner list contains
+        # the atom indices (from the RDKit molecule) that belong to a specific fragment
+        print(f"DEBUG: Fragment indices structure: {self.fragment_atom_indices}")
+
+        # Initialize array with all zeros
+        fragment_array = np.zeros(len(self.atoms) - 1, dtype=int)
+
+        # Assign fragment IDs (starting from 1) to each atom based on which fragment it belongs to
+        for fragment_id, atom_indices in enumerate(self.fragment_atom_indices, 1):
+            for atom_idx in atom_indices:
+                # RDKit atom index -> internal index (+1 for virtual atom)
+                internal_idx = atom_idx + 1 - 1  # +1 for virtual atom, -1 for zero-indexing
+                fragment_array[internal_idx] = fragment_id
+
+        print(f"DEBUG: Constructed fragment array: {fragment_array}")
+        return fragment_array
+
     def is_connected_without_bond(self, atom1: int, atom2: int) -> bool:
         """
         Checks whether the molecule would remain connected if the bond between atom1 and atom2 were removed,
@@ -166,6 +197,16 @@ class MoleculeDesign(BaseTrajectory):
 
         # Rebuild atoms and bonds arrays from the selected fragment
         self.rebuild_from_rdkit()
+
+        # Make sure we check if this is still disconnected
+        frags = Chem.GetMolFrags(self.rdkit_mol, asMols=False)
+        if len(frags) > 1:
+            print("DEBUG: Fragment still disconnected after keep_fragment")
+            self.has_disconnected_fragments = True
+        else:
+            # Only remove flag if we're now connected
+            if hasattr(self, 'has_disconnected_fragments'):
+                del self.has_disconnected_fragments
 
         # Clean up fragment data
         del self.fragments
@@ -277,6 +318,8 @@ class MoleculeDesign(BaseTrajectory):
                                          sanitizeFrags=True,
                                          fragsMolAtomMapping=atom_indices)
 
+        print(f"DEBUG: Found {len(fragments_mol)} fragments after bond removal")
+
         if len(fragments_mol) > 1:
             # Store fragment information for Level 3 decision
             self.fragments = fragments_mol
@@ -296,23 +339,29 @@ class MoleculeDesign(BaseTrajectory):
             self.current_action_mask = None
             return
 
+        print("DEBUG: In update_action_mask, has_disconnected_fragments exists? =",
+              hasattr(self, 'has_disconnected_fragments'))
+        if hasattr(self, 'has_disconnected_fragments'):
+            print("DEBUG: Value is:", self.has_disconnected_fragments)
+
         atom_valence = np.array([self.vocabulary_valence[x] for x in self.atoms[1:]])
         atom_valence_remaining = atom_valence - self.bonds[1:, 1:].sum(axis=1)
-        ex_action_idx = self.pick_existing_atoms_start_action_idx_lvl_0
 
         if self.current_action_level == 0:
-            self.current_action_mask = np.zeros(len(self.vocabulary_atom_idcs) + len(self.atoms), dtype=bool)
-            self.current_action_mask[1:ex_action_idx] = self.atom_feasibility_mask
-            if (self.upper_limit_atoms is not None and len(self.atoms) - 1 == self.upper_limit_atoms) or (
-                    not np.any(atom_valence_remaining)):
-                self.current_action_mask[1:ex_action_idx] = 1
-            existing_bond = (self.bonds[1:, 1:] > 0).any(axis=1)
-            masked = np.zeros(len(self.atoms) - 1, dtype=bool)
-            masked[np.where(atom_valence_remaining <= 0)] = True
-            masked[np.where(existing_bond)] = False
-            self.current_action_mask[ex_action_idx:] = masked
+            # Level 0: Only allow termination or selecting an existing atom
+            # Action space is now:
+            # - Action 0: Terminate
+            # - Actions 1 to N: Select existing atom (where N = number of real atoms)
 
-            # Check for atoms with modifiable bonds (bonds that can be changed)
+            num_real_atoms = len(self.atoms) - 1  # Exclude virtual atom
+            self.current_action_mask = np.zeros(num_real_atoms + 1, dtype=bool)  # +1 for termination
+
+            # Only allow termination if molecule is connected and has more than 1 atom
+            if hasattr(self, 'has_disconnected_fragments') and self.has_disconnected_fragments:
+                self.current_action_mask[0] = True  # Mask termination action
+
+            # Apply masks to existing atom selection
+            # Check for atoms with modifiable bonds
             has_modifiable_bond = np.zeros(len(self.atoms) - 1, dtype=bool)
             for i in range(len(self.atoms) - 1):
                 atom_idx = i + 1  # Adjust for virtual atom
@@ -330,138 +379,163 @@ class MoleculeDesign(BaseTrajectory):
                             has_modifiable_bond[i] = True
                             break
 
-            # Original free non-neighbor calculation
+            # Check for atoms with free non-neighbors with enough valence
             bond_indicator = np.zeros_like(self.bonds[1:, 1:])
             bond_indicator[np.where(self.bonds[1:, 1:] == 0)] = 1
             np.fill_diagonal(bond_indicator, 0)
             has_free_nonneighbor = np.matmul(bond_indicator, (atom_valence_remaining > 0)[:, None]).squeeze()
 
-            # Only mask atoms with no free non-neighbors AND no modifiable bonds
+            # Mask atoms with no valid actions
             no_valid_actions = (has_free_nonneighbor == 0) & ~has_modifiable_bond
-            self.current_action_mask[ex_action_idx:][np.where(no_valid_actions)] = 1
+            self.current_action_mask[1:][np.where(no_valid_actions)] = True
 
             # Only allow termination if molecule is connected
             if hasattr(self, 'has_disconnected_fragments') and self.has_disconnected_fragments:
                 self.current_action_mask[0] = True  # Mask termination action
 
+            # Special case: if there's only one real atom, always keep it selectable
+            if len(self.atoms) == 2:  # Virtual atom + 1 real atom
+                self.current_action_mask[1] = False
+
         elif self.current_action_level == 1:
+
             vocab_size = len(self.vocabulary_atom_idcs)
+
             num_existing_atoms = len(self.atoms) - 1  # Count of real atoms (excluding virtual)
 
-            # Create action space with 1-based indexing:
-            # - Action 0: Invalid (always masked)
-            # - Actions 1 to N: Create new atom
-            # - Actions N+1 to N+M: Select existing atom
-            # - Action N+M+1: Replace atom
+            # Modified action space:
 
-            total_actions = 1 + vocab_size + num_existing_atoms + 1
+            # - Actions 0 to V-1: Create new atom
+
+            # - Actions V to V+N-1: Select existing atom
+
+            # - Action V+N: Replace atom
+
+            total_actions = vocab_size + num_existing_atoms + 1
 
             self.current_action_mask = np.ones(total_actions, dtype=bool)  # Default: all masked
 
             # Determine which atom was selected at level 0
-            if len(self.history) > 0:
-                latest_action = self.history[-1]
-                if latest_action < self.pick_existing_atoms_start_action_idx_lvl_0:
-                    # We added a new atom - can't replace it yet
-                    atom_picked_on_lvl_0 = len(self.atoms) - 2
-                    can_replace = False
-                else:
-                    # We selected an existing atom - can potentially replace it
-                    atom_picked_on_lvl_0 = latest_action - self.pick_existing_atoms_start_action_idx_lvl_0
-                    can_replace = True
-            else:
-                atom_picked_on_lvl_0 = len(self.atoms) - 2
-                can_replace = False
 
-            # Find the actual index in the atoms array (adding 1 for virtual atom)
-            atom_idx_in_array = atom_picked_on_lvl_0 + 1
+            atom_picked_on_lvl_0 = self.history[-1]  # Action directly maps to atom index
 
-            # Unmask new atom creation actions (1 to N) - applying feasibility masks from config
+            atom_idx_in_array = atom_picked_on_lvl_0  # No adjustment needed anymore
+
+            # Unmask new atom creation actions (0 to V-1)
+
             if len(self.atom_feasibility_mask) == vocab_size:
 
-                # This handles the case where we have exactly one mask entry per atom type
-                self.current_action_mask[1:vocab_size + 1] = np.array(self.atom_feasibility_mask)
+                self.current_action_mask[:vocab_size] = np.array(self.atom_feasibility_mask)
+
             else:
-                # Fallback - copy as many mask entries as possible
+
                 n = min(len(self.atom_feasibility_mask), vocab_size)
-                self.current_action_mask[1:n + 1] = np.array(self.atom_feasibility_mask[:n])
 
-            # Apply valence constraints to atom creation - fixed vectorized version
-            # First, filter indices that are within the bounds of atom_valence_remaining
-            valid_atom_indices = np.arange(1, min(vocab_size + 1, len(self.atoms)))
+                self.current_action_mask[:n] = np.array(self.atom_feasibility_mask[:n])
 
-            # Then check which ones have insufficient valence
-            if len(valid_atom_indices) > 0:  # Only check if we have valid indices
-                insufficient_valence_indices = valid_atom_indices[
-                    atom_valence_remaining[valid_atom_indices - 1] < 1]
+            # Apply valence constraints to atom creation
+
+            valid_atom_indices = np.arange(0, min(vocab_size, len(self.atoms)))
+
+            if len(valid_atom_indices) > 0:
+
+                insufficient_valence_indices = valid_atom_indices[atom_valence_remaining[valid_atom_indices] < 1]
+
                 if len(insufficient_valence_indices) > 0:
                     self.current_action_mask[insufficient_valence_indices] = True
 
-            # Handle existing atom selection (N+1 to N+M)
-            target_atoms = np.arange(1, num_existing_atoms + 1)  # Real atom indices in internal representation
+            # Handle existing atom selection (V to V+N-1)
 
-            selection_actions = np.arange(vocab_size + 1, vocab_size + num_existing_atoms + 1)  # N+1 to N+M
+            target_atoms = np.arange(1, num_existing_atoms + 1)  # Real atom indices
+
+            selection_actions = np.arange(vocab_size, vocab_size + num_existing_atoms)  # V to V+N-1
 
             # Create masks for different conditions
-            # 1. Can't bond with itself
 
             self_mask = target_atoms == atom_idx_in_array
 
-            # 2. Check if atoms already have a bond
             has_bond_mask = self.bonds[atom_idx_in_array, target_atoms] > 0
 
-            # 3. Check valence constraints for new bonds
             selected_atom_valence = atom_valence_remaining[atom_idx_in_array - 1]
+
             target_valences = atom_valence_remaining[target_atoms - 1]
+
             sufficient_valence_mask = (selected_atom_valence > 0) & (target_valences > 0)
 
-            # Valid actions: either has existing bond OR has sufficient valence for new bond
+            # Compute valid bonding mask
+
             valid_bonding_mask = has_bond_mask | (sufficient_valence_mask & ~self_mask)
 
-            # Apply the mask to actions
+            # Handle disconnected fragments
+
+            if hasattr(self, "has_disconnected_fragments") and self.has_disconnected_fragments:
+                assignments = self._build_fragment_assignments()
+
+                source_fragment = assignments[atom_idx_in_array - 1]
+
+                different_fragment_mask = assignments[target_atoms - 1] != source_fragment
+
+                cross_fragment_mask = different_fragment_mask & (target_valences > 0) & (selected_atom_valence > 0)
+
+                valid_bonding_mask = valid_bonding_mask | cross_fragment_mask
+
+            # Apply the mask to selection actions
+
             self.current_action_mask[selection_actions] = ~valid_bonding_mask
 
-            # Handle replacement action (N+M+1)
-            replace_action_idx = vocab_size + num_existing_atoms + 1
+            # Handle replacement action (V+N)
+
+            replace_action_idx = vocab_size + num_existing_atoms
+
+            can_replace = True  # Since Level 0 now only selects existing atoms, we can always replace
+
             self.current_action_mask[replace_action_idx] = not can_replace
 
+
         elif self.current_action_level == 2:
+
             # Unified action space for Level 2:
-            # - Action 0: Invalid (always masked)
-            # - Actions 1 to N: Replace atom with type from vocabulary
-            # - Actions N+1 to N+6: Set bond order 1-6
-            # - Action N+7: Remove bond
+
+            # - Actions 0 to V-1: Replace atom with type from vocabulary
+
+            # - Actions V to V+5: Set bond order 1-6
+
+            # - Action V+6: Remove bond
 
             vocab_size = len(self.vocabulary_atom_idcs)
-            total_actions = 1 + vocab_size + 7  # Invalid + replacement options + bond operations
+
+            total_actions = vocab_size + 7  # V atom replacements + 6 bond orders + 1 remove bond
+
             self.current_action_mask = np.ones(total_actions, dtype=bool)  # Default: all masked
 
             if self.is_replacing_atom:
-                # === ATOM REPLACEMENT MODE ===
-                # All bond actions are masked in replacement mode
-                # Get information about the atom to be replaced
+
+                # When in replacement mode, only unmask valid replacement actions
 
                 atom_idx = self.atom_to_replace
+
                 rdkit_atom_idx = atom_idx - 1
+
                 current_atom_type = self.atoms[atom_idx]
 
                 # Calculate total bond order for valence check (excluding virtual bonds)
+
                 current_bonds = self.bonds[atom_idx, 1:]
 
-                mask = (current_bonds > 0) & (current_bonds != self.virtual_bond_idx) & (
-                        np.arange(len(current_bonds)) > 0)
+                mask = (current_bonds > 0) & (current_bonds != self.virtual_bond_idx)
+
                 real_bond_sum = np.sum(current_bonds[mask])
 
                 # Get neighboring bonds for validation
+
                 neighbor_indices = np.where(mask)[0]
+
                 neighbor_bonds = [(i, current_bonds[i]) for i in neighbor_indices]
 
                 # Check each possible replacement atom type
-                valid_replacements = []
 
                 for atom_type_idx, atom_type in enumerate(self.vocabulary_atom_idcs):
-                    action_idx = atom_type_idx + 1  # 1-based indexing
-
+                    action_idx = atom_type_idx  # 0-indexed action
                     # Apply basic constraints
                     if (self.atom_feasibility_mask[atom_type_idx] or  # Not allowed in config
                             atom_type == current_atom_type or  # Same as current atom
@@ -470,44 +544,62 @@ class MoleculeDesign(BaseTrajectory):
 
                     # Chemical validity check through RDKit
                     if self.validate_atom_replacement(rdkit_atom_idx, atom_type, neighbor_bonds):
-                        valid_replacements.append(action_idx)
+                        self.current_action_mask[action_idx] = False
 
-                # Unmask valid replacement actions
-                if valid_replacements:
-                    self.current_action_mask[valid_replacements] = False
 
             else:
-                # === BOND MODIFICATION MODE ===
-                # Determine the atoms involved in this operation
+
+                # When not in replacement mode, only unmask valid bonding actions
+
+                # Determine atoms for bonding
+
                 if hasattr(self, 'selected_bond'):
+
                     atom_a_idx, atom_b_idx = self.selected_bond
+
                 else:
-                    atom_picked_on_lvl_0 = (
-                        len(self.atoms) - 2 if self.history[-2] < self.pick_existing_atoms_start_action_idx_lvl_0
-                        else self.history[-2] - self.pick_existing_atoms_start_action_idx_lvl_0)
 
-                    atom_picked_on_lvl_1 = self.history[-1]
-                    atom_a_idx = atom_picked_on_lvl_0 + 1
-                    atom_b_idx = atom_picked_on_lvl_1 + 1
+                    atom_picked_on_lvl_0 = self.history[-2]  # Level 0 action directly maps to atom index
 
-                # All replacement actions are masked in bond mode
-                atom_valence_remaining = np.array([self.vocabulary_valence[x] for x in self.atoms[1:]]) - \
-                                         self.bonds[1:, 1:].sum(axis=1)
+                    # Need to extract the target atom from Level 1 action
+
+                    lvl1_action = self.history[-1]
+
+                    if lvl1_action < vocab_size:  # Created new atom
+
+                        atom_b_idx = len(self.atoms) - 1  # Last atom added
+
+                    else:  # Selected existing atom
+
+                        atom_b_idx = (lvl1_action - vocab_size) + 1  # +1 for virtual atom
+
+                    atom_a_idx = atom_picked_on_lvl_0
+
+                # Calculate valence constraints
+
+                atom_valence_remaining = np.array([self.vocabulary_valence[x] for x in self.atoms[1:]]) - self.bonds[1:,
+                                                                                                          1:].sum(
+                    axis=1)
 
                 current_bond_order = self.bonds[atom_a_idx, atom_b_idx]
 
-                # Calculate maximum allowed bond order based on valence
+                # Calculate maximum allowed bond order
+
                 extra_increase = min(atom_valence_remaining[atom_a_idx - 1], atom_valence_remaining[atom_b_idx - 1])
+
                 allowed_final_order = min(int(current_bond_order + extra_increase), self.maximum_bond_order)
 
-                # Unmask valid bond order actions (N+1 to N+allowed_final_order)
-                if allowed_final_order > 0:
-                    valid_bond_actions = np.arange(vocab_size + 1, vocab_size + 1 + allowed_final_order)
-                    self.current_action_mask[valid_bond_actions] = False
+                # Unmask valid bond order actions (V to V+allowed_final_order-1)
 
-                # Unmask remove bond action if it would maintain connectivity
-                if current_bond_order > 0 and self.is_connected_without_bond(atom_a_idx, atom_b_idx):
-                    self.current_action_mask[vocab_size + 7] = False
+                for i in range(1, allowed_final_order + 1):
+                    action_idx = vocab_size + i - 1  # -1 to convert to 0-indexed
+
+                    self.current_action_mask[action_idx] = False
+
+                # Unmask remove bond action if a bond exists
+
+                if current_bond_order > 0:
+                    self.current_action_mask[vocab_size + 6] = False
 
         elif self.current_action_level == 3:
             # Level 3: Fragment handling
@@ -572,63 +664,81 @@ class MoleculeDesign(BaseTrajectory):
         next_level = 0
 
         if self.current_action_level == 0:
-            # Level 0: Termination or Atom Selection
+            # Level 0: Termination or Atom Selection (NO NEW ATOM CREATION HERE)
             if action == 0:
                 # Terminate molecule design
                 self.synthesis_done = True
                 self.finalize()
-            elif 1 <= action < self.pick_existing_atoms_start_action_idx_lvl_0:
-                # Create new atom
-                self.atoms = np.append(self.atoms, action)
-                self.bonds = np.pad(self.bonds, [(0, 1), (0, 1)], mode='constant', constant_values=0)
-                new_atom_idx = len(self.atoms) - 1
-                self.bonds[0, new_atom_idx] = self.bonds[new_atom_idx, 0] = self.virtual_bond_idx
-                self.update_rdkit_mol(new_atom=action)
-                self.update_topological_distance_matrix(new_atom_created=True)
-                self.history.append(int(action))
-                self.base_atom_idx = new_atom_idx
-                next_level = 1
             else:
-                # Select existing atom
-                selected_atom_idx = action - self.pick_existing_atoms_start_action_idx_lvl_0 + 1
+                # Select existing atom - modified to be the only valid non-termination action
+                # The action space now starts from index 1, mapping directly to existing atoms
+                # (Adding 1 to adjust for 1-based indexing of atoms, where 0 is the virtual atom)
+                selected_atom_idx = action  # Action directly maps to atom index (1-based)
                 self.base_atom_idx = selected_atom_idx
                 self.history.append(int(action))
                 next_level = 1
 
-        elif self.current_action_level == 1:
-            # Level 1: Second Atom Selection or Replacement
-            vocab_size = len(self.vocabulary_atom_idcs)
-            num_existing_atoms = len(self.atoms) - 1
-            replace_action_idx = vocab_size + num_existing_atoms + 1  # N+M+1
 
-            if action == 0:
-                # Invalid action - should never happen due to masking
-                raise ValueError("Invalid action 0 selected in Level 1")
-            elif action <= vocab_size:
-                # Create new atom (actions 1 to N)
-                atom_type = action  # In 1-based indexing, action is the atom type
+        elif self.current_action_level == 1:
+
+            # Level 1: Second Atom Selection or Replacement
+
+            vocab_size = len(self.vocabulary_atom_idcs)
+
+            num_existing_atoms = len(self.atoms) - 1
+
+            replace_action_idx = vocab_size + num_existing_atoms  # V+N
+
+            if action < vocab_size:
+
+                # Create new atom (actions 0 to V-1)
+
+                atom_type = action + 1  # Convert 0-indexed action to 1-indexed atom type
+
                 self.atoms = np.append(self.atoms, atom_type)
+
                 self.bonds = np.pad(self.bonds, [(0, 1), (0, 1)], mode='constant', constant_values=0)
+
                 new_atom_idx = len(self.atoms) - 1
+
                 self.bonds[0, new_atom_idx] = self.bonds[new_atom_idx, 0] = self.virtual_bond_idx
+
                 self.update_rdkit_mol(new_atom=atom_type)
+
                 self.update_topological_distance_matrix(new_atom_created=True)
+
                 self.history.append(int(action))
+
                 self.last_created_atom_idx = new_atom_idx
+
                 next_level = 2
+
+
             elif action == replace_action_idx:
-                # Replace atom action (N+M+1)
-                atom_picked_on_lvl_0 = self.history[-1] - self.pick_existing_atoms_start_action_idx_lvl_0
-                self.atom_to_replace = atom_picked_on_lvl_0 + 1  # +1 for virtual atom
+
+                # Replace atom action (V+N)
+
+                atom_picked_on_lvl_0 = self.history[-1]  # Level 0 action is the atom index
+
+                self.atom_to_replace = atom_picked_on_lvl_0  # No adjustment needed
+
                 self.is_replacing_atom = True
+
                 self.history.append(int(action))
+
                 next_level = 2
+
+
             else:
-                # Bond with existing atom (actions N+1 to N+M)
-                existing_atom_idx = action - vocab_size - 1  # Convert from N+1+idx to idx
+
+                # Bond with existing atom (actions V to V+N-1)
+
+                existing_atom_idx = action - vocab_size  # Convert from V+idx to idx
+
                 target_atom_idx = existing_atom_idx + 1  # +1 for virtual atom
 
                 # Handle the case where the selected atom is the same as base atom
+
                 if target_atom_idx == self.base_atom_idx:
                     raise ValueError("Cannot bond an atom with itself")
 
@@ -636,66 +746,126 @@ class MoleculeDesign(BaseTrajectory):
                 self.history.append(int(action))
                 next_level = 2
 
+
         elif self.current_action_level == 2:
+
             # Level 2: Bond Order Setting or Atom Replacement
+
             vocab_size = len(self.vocabulary_atom_idcs)
 
-            if action == 0:
-                # Invalid action - should never happen due to masking
-                raise ValueError("Invalid action 0 selected in Level 2")
+            if action < vocab_size:
 
-            if self.is_replacing_atom and action <= vocab_size:
-                # Atom replacement (actions 1 to N)
-                new_atom_type = action  # Direct use of 1-based indexing
+                # Atom replacement (actions 0 to V-1)
+
+                if not self.is_replacing_atom:
+                    raise ValueError("Atom replacement action selected when not in replacement mode")
+
+                new_atom_type = action + 1  # Convert 0-indexed action to 1-indexed atom type
+
                 self.replace_atom(self.atom_to_replace, new_atom_type)
+
                 self.history.append(int(action))
+
                 self.is_replacing_atom = False
+
                 self.atom_to_replace = None
+
                 self.update_topological_distance_matrix()
+
                 next_level = 0
 
-            elif not self.is_replacing_atom:
+
+            else:
+
+                # Bond operations (actions V to V+6)
+
+                if self.is_replacing_atom:
+                    raise ValueError("Bond action selected when in replacement mode")
+
                 # Determine atoms for bonding
+
                 if hasattr(self, 'selected_bond'):
+
                     atom_a_idx, atom_b_idx = self.selected_bond
+
                 else:
+
                     atom_a_idx = self.base_atom_idx
+
                     atom_b_idx = self.last_created_atom_idx
 
-                if vocab_size < action <= vocab_size + 6:
-                    # Set bond order (actions N+1 to N+6)
-                    bond_order = action - vocab_size
+                if vocab_size <= action < vocab_size + 6:
+
+                    # Set bond order (actions V to V+5)
+
+                    bond_order = action - vocab_size + 1  # +1 to convert to 1-based bond order
+
                     self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = bond_order
+
+                    # Update the RDKit molecule
+
                     self.update_rdkit_mol(set_bond=(atom_a_idx - 1, atom_b_idx - 1, bond_order))
+
+                    # After setting a bond, check if the molecule is now fully connected
+
+                    if hasattr(self, 'has_disconnected_fragments') and self.has_disconnected_fragments:
+
+                        frags = Chem.GetMolFrags(self.rdkit_mol, asMols=False)
+
+                        if len(frags) == 1:
+                            del self.has_disconnected_fragments
+
                     next_level = 0
 
-                elif action == vocab_size + 7:
-                    # Remove bond (action N+7)
+
+                elif action == vocab_size + 6:
+
+                    # Remove bond (action V+6)
+
                     entered_fragment_mode = self.remove_bond(atom_a_idx, atom_b_idx)
+
                     next_level = 3 if entered_fragment_mode else 0
 
                 # Update distances after bond modification
+
                 self.update_topological_distance_matrix()
+
                 self.history.append(int(action))
 
                 # Clean up
+
                 if hasattr(self, 'selected_bond'):
                     del self.selected_bond
 
-            # Invalid combination - should never happen
-            else:
-                raise ValueError(f"Invalid action {action} for Level 2 in current mode")
-
         elif self.current_action_level == 3:
+
             # Level 3: Fragment Handling
+
+            print(f"DEBUG: Level 3 action = {action}")
+
             if action < 2:
+
                 # Keep fragment 0 or 1
+
                 self.keep_fragment(action)
+
+                # Flag will be handled in keep_fragment based on actual connectivity
+
             else:  # action == 2: Keep both fragments
+
                 # Flag that molecule has disconnected fragments
+
+                print("DEBUG: Setting has_disconnected_fragments = True")
+
                 self.has_disconnected_fragments = True
 
+                print(
+                    f"DEBUG: After setting, has_disconnected_fragments exists? = {hasattr(self, 'has_disconnected_fragments')}")
+
+                print(f"DEBUG: Value is: {self.has_disconnected_fragments}")
+
             self.history.append(int(action))
+
             next_level = 0
 
         self.current_action_level = next_level

@@ -33,117 +33,145 @@ class TestMoleculeDesign(unittest.TestCase):
         self.mol.take_action(0)
         self.assertTrue(self.mol.synthesis_done)
 
-    def test_level0_new_atom_creation(self):
+    def test_level0_atom_selection(self):
         self.mol = MoleculeDesign(self.config, self.initial_atom)
         initial_num_atoms = len(self.mol.atoms)
-        self.mol.take_action(1)  # level 0: new atom creation.
-        self.assertEqual(len(self.mol.atoms), initial_num_atoms + 1)
+        # In new action space: level 0 selects existing atom
+        self.mol.take_action(1)  # Select atom at index 1
+        # No new atoms should be created by this action
+        self.assertEqual(len(self.mol.atoms), initial_num_atoms)
+        # Should advance to level 1
         self.assertEqual(self.mol.current_action_level, 1)
         self.assertEqual(self.mol.history[-1], 1)
 
     def test_level1_new_atom_vs_existing_bond_masking(self):
         # Check proper segmentation of the level 1 action mask.
+        # We'll build a valid molecule with 3 atoms to test both paths
+
+        # Create first bond: A-B
+        # Level 0: Select atom A (index 1)
         self.mol.take_action(1)
+        # Level 1: Create new atom B (Carbon)
+        self.mol.take_action(0)  # Create C atom
+        # Level 2: Set bond order 1
+        self.mol.take_action(self.vocab_size + 0)  # Action V+0 = bond order 1
+
+        # Create second bond: A-C
+        # Level 0: Select atom A again (index 1)
+        self.mol.take_action(1)
+        # Level 1: Create new atom C (Carbon)
+        self.mol.take_action(0)  # Create C atom
+        # Level 2: Set bond order 1
+        self.mol.take_action(self.vocab_size + 0)  # Action V+0 = bond order 1
+
+        # Now we have a molecule with 3 atoms connected as A-B and A-C
+
+        # Check action mask at level 0
+        self.assertEqual(self.mol.current_action_level, 0)
+
+        # Select atom A to examine level 1 mask
+        self.mol.take_action(1)  # Select atom 1 at level 0
+
+        # At level 1:
+        # - Actions 0 to V-1 create new atoms
+        # - Actions V to V+N-1 select existing atoms
+        # - Action V+N is for replacement
+
         new_atom_action_count = len(self.mol.vocabulary_atom_idcs)
-        existing_bond_action_count = len(self.mol.atoms) - 1  # real atoms only.
-        total_expected_actions = 1 + new_atom_action_count + existing_bond_action_count + 1  # +1 for replacement action, +1 for invalid action 0
+        existing_atom_count = len(self.mol.atoms) - 1  # real atoms only
+        total_expected_actions = new_atom_action_count + existing_atom_count + 1  # +1 for replacement action
+
         mask = self.mol.current_action_mask
         self.assertEqual(len(mask), total_expected_actions)
-        self.assertTrue(
-            np.any(mask[1:new_atom_action_count + 1] == 0))  # Check that some atom creation actions are valid
 
-        # Create a bond between the atom chosen at level 0 and a target atom:
-        atom_lvl0_idx = 0  # corresponds to atoms[1].
-        if len(self.mol.atoms) < 3:
-            self.mol.take_action(1)  # add extra atom if needed.
-        self.mol.bonds[atom_lvl0_idx + 1, 2] = 1
-        self.mol.bonds[2, atom_lvl0_idx + 1] = 1
-        self.mol.update_action_mask()
-        block2_mask = self.mol.current_action_mask[new_atom_action_count + 1:]  # +1 for the invalid action 0
-        self.assertTrue(np.any(block2_mask == 0))
-        # print(self.mol.bonds)
+        # Check that some atom creation actions are valid
+        self.assertTrue(np.any(mask[:new_atom_action_count] == 0))
+
+        # Check that existing atom selections are valid (specifically atoms 2 and 3)
+        # In level 1, existing atom actions start at index V
+        self.assertFalse(mask[new_atom_action_count + 1])  # Atom B (index 2) should be selectable
+        self.assertFalse(mask[new_atom_action_count + 2])  # Atom C (index 3) should be selectable
 
     def test_level2_bond_order_increase_and_reduction(self):
         """
-        This test builds a more natural molecule (with a cycle) that allows bond reduction.
+        This test builds a molecule with a cycle that allows bond reduction.
 
         Steps:
         1. Start with atom A.
-        2. Level 0: add atom B.
-           (The design should naturally form a bond between A and B.)
-        3. Level 1: add atom C.
-           (The design forms a bond between B (base) and C (last created).)
-        4. At level 2, select an increase action to boost the bond order on the B–C bond from 1 to 2.
-        5. Allow the molecule to naturally form extra bonds. Here, once atom C is present,
-           we simulate a realistic scenario by "designing" an extra bond between A and C.
-           This creates a cycle (A–B, B–C, A–C) meaning that reducing the B–C bond won't disconnect the molecule.
-        6. Reset the action level and select the B–C bond for modification.
-        7. At level 2, if the action mask shows any feasible reduction action (which should now be allowed),
-           apply it to bring the bond order from 2 back to 1.
-        8. Verify the bond order change.
-        If no feasible reduction action is available (which might occur naturally),
-        the test is skipped.
+        2. Select atom A, create atom B, set bond order.
+        3. Select atom B, create atom C, set bond order.
+        4. Increase the bond order between B-C from 1 to 2.
+        5. Create a bond between A and C to form a cycle.
+        6. Decrease the bond order between B-C from 2 to 1.
         """
-        # Step 1 & 2: Create atom B at level 0.
-        print(self.mol.atoms)
-        self.mol.take_action(1)  # level 0: new atom creation for B.
-        print(self.mol.atoms)
-        # For a realistic scenario, assume the molecule automatically bonds A and B.
-        # (The molecule's internal logic should have added the A-B bond.)
+        # Step 1: Start with atom A (already initialized)
+        print("Initial atoms:", self.mol.atoms)
 
-        # Step 3: At level 1, create atom C.
-        self.mol.take_action(1)  # level 1: new atom creation for C.
-        print(self.mol.atoms)
-        # After this action, the molecule should be at level 2.
-        self.assertEqual(self.mol.current_action_level, 2)
+        # Step 2: Create atom B and bond it to A
+        # Level 0: Select atom A
+        self.mol.take_action(1)  # Select atom 1
+        # Level 1: Create new atom B (carbon, action 0)
+        self.mol.take_action(0)  # Create C atom
+        # Level 2: Set bond order 1
+        self.mol.take_action(self.vocab_size + 0)  # Action V+0 = bond order 1
+        print("After adding B:", self.mol.atoms)
+        print("Bonds matrix:\n", self.mol.bonds)
 
-        # Step 4: Increase the bond order on the bond between B (base) and C (last created)
-        # In new action space: N+2 = bond order 2
-        self.mol.take_action(self.vocab_size + 2)  # Set bond order to 2
-        base_idx = self.mol.base_atom_idx  # Expect this to be the index for B.
-        last_created_idx = self.mol.last_created_atom_idx  # Expected to be the index for C.
-        bond_order = self.mol.bonds[base_idx, last_created_idx]
-        # Verify that the bond order increased from 1 to 2.
-        self.assertEqual(bond_order, 2)
+        # Step 3: Create atom C and bond it to B
+        # Level 0: Select atom B (index 2)
+        self.mol.take_action(2)  # Select atom 2
+        # Level 1: Create new atom C (carbon, action 0)
+        self.mol.take_action(0)  # Create C atom
+        # Level 2: Set bond order 1
+        self.mol.take_action(self.vocab_size + 0)  # Action V+0 = bond order 1
+        print("After adding C:", self.mol.atoms)
+        print("Bonds matrix:\n", self.mol.bonds)
 
-        # Step 5: Simulate the formation of an extra bond between A and C.
-        # In this design, the initial atom A is at index 1.
-        # This additional bond creates a cycle (A–B, B–C, A–C).
-        if len(self.mol.atoms) >= 3:
-            self.mol.bonds[1, last_created_idx] = 1
-            self.mol.bonds[last_created_idx, 1] = 1
-        self.mol.update_action_mask()  # Allow the internal logic to recalc feasible moves.
+        # Step 4: Increase the bond order between B-C
+        # Level 0: Select atom B (index 2)
+        self.mol.take_action(2)
+        # Level 1: Select atom C (index 3)
+        self.mol.take_action(self.vocab_size + 2)  # V+2 for atom at index 3
+        # Level 2: Set bond order 2
+        self.mol.take_action(self.vocab_size + 1)  # Action V+1 = bond order 2
 
-        # Step 6: Reset to level 1 and select the existing B–C bond.
-        self.mol.current_action_level = 0
+        # Verify bond order increased
+        self.assertEqual(self.mol.bonds[2, 3], 2)
+        print("After increasing B-C bond:", self.mol.bonds)
 
-        # At level 0, select atom B
-        self.mol.take_action(self.mol.pick_existing_atoms_start_action_idx_lvl_0 + base_idx - 1)
+        # Step 5: Create a bond between A and C to form a cycle
+        # Level 0: Select atom A (index 1)
+        self.mol.take_action(1)
+        # Level 1: Select atom C (index 3)
+        self.mol.take_action(self.vocab_size + 2)  # V+2 for atom at index 3
+        # Level 2: Set bond order 1
+        self.mol.take_action(self.vocab_size + 0)  # Action V+0 = bond order 1
 
-        # At level 1, select atom C using the new action space indexing (N+1+idx)
-        self.mol.take_action(self.vocab_size + last_created_idx)
-        self.assertEqual(self.mol.current_action_level, 2)
+        # Verify A-C bond created (forming a cycle)
+        self.assertEqual(self.mol.bonds[1, 3], 1)
+        print("After creating A-C bond:", self.mol.bonds)
 
-        # Step 7: At level 2, check for a feasible reduction action.
-        mask = self.mol.current_action_mask
+        # Step 6: Decrease the bond order between B-C
+        # Level 0: Select atom B (index 2)
+        self.mol.take_action(2)
+        # Level 1: Select atom C (index 3)
+        self.mol.take_action(self.vocab_size + 2)  # V+2 for atom at index 3
 
-        # In the new action space, we want to go from bond order 2 to 1
-        # Setting bond order N+1 should do this
-        reduction_action = self.vocab_size + 1  # Action to set bond order 1
+        # Debug action mask
+        print("Action mask at level 2:", self.mol.current_action_mask)
 
-        if mask[reduction_action]:
+        # Check if bond order 1 action is feasible
+        reduction_action = self.vocab_size + 0  # Action V+0 = bond order 1
+
+        if self.mol.current_action_mask[reduction_action]:
             self.skipTest("No feasible reduction action available in the current molecular configuration")
 
-        # Debug snippet to print details about reduction candidates
-        print("Full action mask at level 2:", self.mol.current_action_mask)
-        print(f"Attempting to set bond order to 1 using action {reduction_action}")
-
-        # Apply the action to reduce bond order to 1
+        # Reduce bond order to 1
         self.mol.take_action(reduction_action)
 
-        # Step 8: Verify that the bond order on B–C has reduced from 2 to 1.
-        reduced_bond_order = self.mol.bonds[base_idx, last_created_idx]
-        self.assertEqual(reduced_bond_order, 1)
+        # Verify bond order decreased
+        self.assertEqual(self.mol.bonds[2, 3], 1)
+        print("After decreasing B-C bond:", self.mol.bonds)
 
 
 if __name__ == '__main__':

@@ -77,15 +77,27 @@ def test_bond_addition_and_reduction(mol):
     """
     Integration test scenario navigating through the proper action space.
     """
+    vocab_size = len(mol.vocabulary_atom_idcs)
+
     # Steps 1-2: Initial setup with atom A, then add atom B
-    mol.take_action(1)  # Add atom B
+    # At level 0, select atom A (index 1)
+    mol.take_action(1)  # Select atom 1 (A)
+
+    # At level 1, create new atom B (carbon, index 0 in vocabulary)
+    mol.take_action(0)  # Create new atom B (C)
+
+    # At level 2, set bond order 1
+    mol.take_action(vocab_size + 0)  # Create single bond (V+0)
 
     # Step 3: Add atom C and set B-C bond to order 2
-    mol.take_action(1)  # Add atom C
+    # At level 0, select atom B (index 2)
+    mol.take_action(2)  # Select atom 2 (B)
 
-    # In updated action space, bond order actions start at N+1
-    vocab_size = len(mol.vocabulary_atom_idcs)
-    mol.take_action(vocab_size + 2)  # Set B-C bond to order 2 (N+2 for bond order 2)
+    # At level 1, create new atom C (carbon, index 0 in vocabulary)
+    mol.take_action(0)  # Create new atom C (C)
+
+    # At level 2, set bond order 2
+    mol.take_action(vocab_size + 1)  # Create double bond (V+1)
     assert mol.bonds[2, 3] == 2
 
     # Print current state
@@ -96,35 +108,27 @@ def test_bond_addition_and_reduction(mol):
 
     # === Step 4: Add A-C bond with order 1 ===
     # At Level 0, select atom A (index 1)
-    # Action to select existing atom = pick_existing_atoms_start_action_idx_lvl_0 + atom_idx - 1
-    ex_atom_start_idx = mol.pick_existing_atoms_start_action_idx_lvl_0
-    atom_a_action_idx = ex_atom_start_idx + 1 - 1  # A is at index 1
-
-    print(f"\nStep 4: Selecting atom A with action {atom_a_action_idx}")
+    print(f"\nStep 4: Selecting atom A (index 1)")
     assert mol.current_action_level == 0
-    mol.take_action(atom_a_action_idx)
+    mol.take_action(1)  # Directly select atom 1
 
     # At Level 1, select atom C (index 3)
-    # Action to select existing atom = vocab_size + atom_idx (for 1-based indexing)
-    atom_c_action_idx = vocab_size + 3  # N+3 for atom at index 3
-
+    atom_c_action_idx = vocab_size + 2  # V+3 for atom at RDKit index 3 (internal index 2)
     print(f"Step 4: Selecting atom C with action {atom_c_action_idx}")
     assert mol.current_action_level == 1
     mol.take_action(atom_c_action_idx)
 
-    # At Level 2, set bond order 1 (N+1 for bond order 1)
+    # At Level 2, set bond order 1 (V+0 for bond order 1)
     print("Step 4: Setting A-C bond to order 1")
     assert mol.current_action_level == 2
-    mol.take_action(vocab_size + 1)  # Action N+1 = set bond order 1
+    mol.take_action(vocab_size + 0)  # Action V+0 = set bond order 1
     assert mol.bonds[1, 3] == 1
 
     # === Step 5: Reduce B-C bond from order 2 to 1 ===
     # At Level 0, select atom B (index 2)
-    atom_b_action_idx = ex_atom_start_idx + 2 - 1
-
-    print(f"\nStep 5: Selecting atom B with action {atom_b_action_idx}")
+    print(f"\nStep 5: Selecting atom B (index 2)")
     assert mol.current_action_level == 0
-    mol.take_action(atom_b_action_idx)
+    mol.take_action(2)  # Directly select atom 2
 
     # At Level 1, select atom C (index 3)
     print(f"Step 5: Selecting atom C with action {atom_c_action_idx}")
@@ -134,17 +138,17 @@ def test_bond_addition_and_reduction(mol):
     # At Level 2, set bond order 1 (reducing from 2)
     print("Step 5: Setting B-C bond to order 1")
     assert mol.current_action_level == 2
-    mol.take_action(vocab_size + 1)  # Action N+1 = set bond order 1
+    mol.take_action(vocab_size + 0)  # Action V+0 = set bond order 1
     assert mol.bonds[2, 3] == 1
 
     # === Step 6: Create A-B bond to ensure connectivity ===
     # At Level 0, select atom A (index 1)
-    print(f"\nStep 6: Selecting atom A with action {atom_a_action_idx}")
+    print(f"\nStep 6: Selecting atom A (index 1)")
     assert mol.current_action_level == 0
-    mol.take_action(atom_a_action_idx)
+    mol.take_action(1)  # Directly select atom 1
 
     # At Level 1, select atom B (index 2)
-    atom_b_level1_action_idx = vocab_size + 2  # N+2 for atom at index 2
+    atom_b_level1_action_idx = vocab_size + 1  # V+2 for atom at RDKit index 2 (internal index 1)
     print(f"Step 6: Selecting atom B with action {atom_b_level1_action_idx}")
     assert mol.current_action_level == 1
     mol.take_action(atom_b_level1_action_idx)
@@ -152,7 +156,7 @@ def test_bond_addition_and_reduction(mol):
     # At Level 2, set bond order 1
     print("Step 6: Setting A-B bond to order 1")
     assert mol.current_action_level == 2
-    mol.take_action(vocab_size + 1)  # Action N+1 = set bond order 1
+    mol.take_action(vocab_size + 0)  # Action V+0 = set bond order 1
     assert mol.bonds[1, 2] == 1
 
     # Visualize molecule after creating A-B bond
@@ -166,9 +170,9 @@ def test_bond_addition_and_reduction(mol):
 
     # === Step 7: Remove A-C bond ===
     # At Level 0, select atom A (index 1)
-    print(f"\nStep 7: Selecting atom A with action {atom_a_action_idx}")
+    print(f"\nStep 7: Selecting atom A (index 1)")
     assert mol.current_action_level == 0
-    mol.take_action(atom_a_action_idx)
+    mol.take_action(1)  # Directly select atom 1
 
     # At Level 1, select atom C (index 3)
     print(f"Step 7: Selecting atom C with action {atom_c_action_idx}")
@@ -178,13 +182,13 @@ def test_bond_addition_and_reduction(mol):
     # Check action mask
     print(f"Action mask at level 2: {mol.current_action_mask}")
 
-    # In new action space, remove bond is action N+7
-    print(f"Remove bond action (index {vocab_size + 7}) masked? {mol.current_action_mask[vocab_size + 7]}")
+    # In new action space, remove bond is action V+6
+    print(f"Remove bond action (index {vocab_size + 6}) masked? {mol.current_action_mask[vocab_size + 6]}")
 
     # At Level 2, remove bond
-    print(f"Step 7: Removing A-C bond with action {vocab_size + 7}")
+    print(f"Step 7: Removing A-C bond with action {vocab_size + 6}")
     assert mol.current_action_level == 2
-    mol.take_action(vocab_size + 7)  # Action N+7 = remove bond
+    mol.take_action(vocab_size + 6)  # Action V+6 = remove bond
     assert mol.bonds[1, 3] == 0
 
     # Final visualization

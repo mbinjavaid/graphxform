@@ -465,16 +465,22 @@ class MoleculeDesign(BaseTrajectory):
             valid_bonding_mask = has_bond_mask | (sufficient_valence_mask & ~self_mask)
 
             # Handle disconnected fragments
-
             if hasattr(self, "has_disconnected_fragments") and self.has_disconnected_fragments:
                 assignments = self._build_fragment_assignments()
 
-                source_fragment = assignments[atom_idx_in_array - 1]
+                # Use the correct attribute name if it exists
+                if hasattr(self, "fragment_atom_indices"):
+                    print(f"DEBUG: Fragment indices structure: {self.fragment_atom_indices}")
 
+                print(f"DEBUG: Constructed fragment array: {assignments}")
+
+                source_fragment = assignments[atom_idx_in_array - 1]
                 different_fragment_mask = assignments[target_atoms - 1] != source_fragment
 
-                cross_fragment_mask = different_fragment_mask & (target_valences > 0) & (selected_atom_valence > 0)
+                # More aggressive cross-fragment bonding logic - prioritize connecting fragments
+                cross_fragment_mask = different_fragment_mask & (target_valences > 0)
 
+                # Update valid bonding mask to allow cross-fragment bonding even if other conditions aren't met
                 valid_bonding_mask = valid_bonding_mask | cross_fragment_mask
 
             # Apply the mask to selection actions
@@ -598,6 +604,34 @@ class MoleculeDesign(BaseTrajectory):
 
                 if current_bond_order > 0:
                     self.current_action_mask[vocab_size + 6] = False
+
+
+
+
+
+                # Allow higher bond orders between fragments
+                if hasattr(self, 'has_disconnected_fragments') and self.has_disconnected_fragments:
+                    # Check if atoms are in different fragments
+                    assignments = self._build_fragment_assignments()
+                    source_fragment = assignments[atom_a_idx - 1]
+                    target_fragment = assignments[atom_b_idx - 1]
+
+                    if source_fragment != target_fragment:
+                        # For cross-fragment bonding, allow up to min(atom_valence) bond order
+                        max_cross_fragment_order = min(
+                            self.vocabulary_valence[self.atoms[atom_a_idx]],
+                            self.vocabulary_valence[self.atoms[atom_b_idx]]
+                        )
+
+                        # Unmask bond orders up to allowed maximum for cross-fragment connections
+                        valid_cross_fragment_actions = np.arange(
+                            vocab_size,
+                            min(vocab_size + max_cross_fragment_order, vocab_size + 6)
+                        )
+                        self.current_action_mask[valid_cross_fragment_actions] = False
+
+
+
 
         elif self.current_action_level == 3:
             # Level 3: Fragment handling

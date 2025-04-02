@@ -366,8 +366,9 @@ class MoleculeDesign(BaseTrajectory):
             for i in range(len(self.atoms) - 1):
                 atom_idx = i + 1  # Adjust for virtual atom
 
-                # Check for bonds that can be decreased (order > 1)
-                if np.any(self.bonds[atom_idx, 1:] > 1):
+                # Check for ANY existing bonds - if an atom has any bonds,
+                # it should be selectable for potential bond removal
+                if np.any(self.bonds[atom_idx, 1:] > 0):
                     has_modifiable_bond[i] = True
                     continue
 
@@ -827,33 +828,28 @@ class MoleculeDesign(BaseTrajectory):
                     atom_b_idx = self.last_created_atom_idx
 
                 if vocab_size <= action < vocab_size + 6:
-
                     # Set bond order (actions V to V+5)
-
                     bond_order = action - vocab_size + 1  # +1 to convert to 1-based bond order
-
                     self.bonds[atom_a_idx, atom_b_idx] = self.bonds[atom_b_idx, atom_a_idx] = bond_order
-
                     # Update the RDKit molecule
-
                     self.update_rdkit_mol(set_bond=(atom_a_idx - 1, atom_b_idx - 1, bond_order))
 
                     # After setting a bond, check if the molecule is now fully connected
-
                     if hasattr(self, 'has_disconnected_fragments') and self.has_disconnected_fragments:
-
                         frags = Chem.GetMolFrags(self.rdkit_mol, asMols=False)
-
                         if len(frags) == 1:
+                            # Clean up all fragment-related attributes
                             del self.has_disconnected_fragments
+                            if hasattr(self, 'fragment_atom_indices'):
+                                del self.fragment_atom_indices
+                            if hasattr(self, 'fragments'):
+                                del self.fragments
+                            print("DEBUG: All fragments reconnected, cleaned up fragment tracking")
 
                     next_level = 0
 
-
                 elif action == vocab_size + 6:
-
                     # Remove bond (action V+6)
-
                     entered_fragment_mode = self.remove_bond(atom_a_idx, atom_b_idx)
 
                     next_level = 3 if entered_fragment_mode else 0

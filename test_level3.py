@@ -683,6 +683,158 @@ class TestFragmentHandling(unittest.TestCase):
 
         print("Successfully completed multi-step fragment operations")
 
+    def test_multiple_fragments_handling(self):
+        """Test handling of molecules with 3 or more fragments after bond removal"""
+        # Build a "star" molecule with a central carbon and 4 branches
+        # Structure:    C
+        #               |
+        #           C---C---C
+        #               |
+        #               C
+
+        # Start with central carbon
+        mol = MoleculeDesign(self.config, self.atom_types["C"])
+
+        # Add first branch (top)
+        mol.take_action(1)  # Select central C
+        mol.take_action(0)  # Create new C atom
+        mol.take_action(self.vocab_size + 0)  # Single bond
+        print(f"After adding first branch: {mol.atoms[1:]} Bonds:\n{mol.bonds}")
+
+        # Add second branch (left)
+        mol.take_action(1)  # Select central C
+        mol.take_action(0)  # Create new C atom
+        mol.take_action(self.vocab_size + 0)  # Single bond
+        print(f"After adding second branch: {mol.atoms[1:]} Bonds:\n{mol.bonds}")
+
+        # Add third branch (right)
+        mol.take_action(1)  # Select central C
+        mol.take_action(0)  # Create new C atom
+        mol.take_action(self.vocab_size + 0)  # Single bond
+        print(f"After adding third branch: {mol.atoms[1:]} Bonds:\n{mol.bonds}")
+
+        # Add fourth branch (bottom)
+        mol.take_action(1)  # Select central C
+        mol.take_action(0)  # Create new C atom
+        mol.take_action(self.vocab_size + 0)  # Single bond
+        print(f"After adding fourth branch: {mol.atoms[1:]} Bonds:\n{mol.bonds}")
+
+        # Verify we've built a star with 5 carbon atoms (1 central + 4 branches)
+        self.assertEqual(len(mol.atoms), 6)  # 5 real atoms + 1 virtual
+
+        # Debug the bond matrix
+        print("Central atom bonds:", mol.bonds[1, :])
+        print("Number of bonds:", np.sum(mol.bonds[1, :] > 0))
+        print("Bond values:", mol.bonds[1, np.where(mol.bonds[1, :] > 0)])
+
+        # The central atom (idx 1) should have 4 bonds (to the 4 branches)
+        real_atom_bonds = np.sum(mol.bonds[1, 1:6] > 0)
+        print(f"Real atom bonds: {real_atom_bonds}")
+        self.assertEqual(real_atom_bonds, 4)
+
+        initial_smiles = mol.to_smiles()
+        print(f"Initial star molecule: {initial_smiles}")
+
+        # Now break multiple bonds to create 3+ fragments
+        # Break bond between central C (idx 1) and first branch C (idx 2)
+        mol.take_action(1)  # Select central C
+        mol.take_action(self.vocab_size + 2 - 1)  # Select first branch C
+        mol.take_action(self.vocab_size + 6)  # Remove bond
+        mol.take_action(2)  # Keep both fragments
+
+        # Verify we have disconnected fragments
+        self.assertTrue(hasattr(mol, 'has_disconnected_fragments'))
+        self.assertTrue(mol.has_disconnected_fragments)
+
+        # Break another bond: central C (idx 1) and second branch C (idx 3)
+        mol.take_action(1)  # Select central C
+        mol.take_action(self.vocab_size + 3 - 1)  # Select second branch C
+        mol.take_action(self.vocab_size + 6)  # Remove bond
+        mol.take_action(2)  # Keep both fragments
+
+        # We should still have disconnected fragments
+        self.assertTrue(mol.has_disconnected_fragments)
+
+        # Break a third bond: central C (idx 1) and third branch C (idx 4)
+        mol.take_action(1)  # Select central C
+        mol.take_action(self.vocab_size + 4 - 1)  # Select third branch C
+        mol.take_action(self.vocab_size + 6)  # Remove bond
+        mol.take_action(2)  # Keep both fragments
+
+        # We should now have 4 fragments
+        fragments = Chem.GetMolFrags(mol.rdkit_mol, asMols=False)
+        print(f"Number of fragments after breaking 3 bonds: {len(fragments)}")
+        self.assertEqual(len(fragments), 4)
+
+        # Verify termination is blocked
+        self.assertTrue(mol.current_action_mask[0])
+        with self.assertRaises(AssertionError):
+            mol.take_action(0)  # Try to terminate - should fail
+
+        # Connect two fragments: central C (idx 1) with first branch C (idx 2)
+        mol.take_action(1)  # Select central C
+        mol.take_action(self.vocab_size + 2 - 1)  # Select first branch C
+        mol.take_action(self.vocab_size + 0)  # Create single bond
+
+        # We should still have disconnected fragments (now 3 fragments)
+        self.assertTrue(hasattr(mol, 'has_disconnected_fragments'))
+        self.assertTrue(mol.has_disconnected_fragments)
+
+        # Modify one of the disconnected fragments: change a C atom to N
+        mol.take_action(3)  # Select second branch C
+        mol.take_action(self.vocab_size + len(mol.atoms) - 1)  # Replacement action
+        mol.take_action(self.atom_types["N"] - 1)  # Replace with N
+
+        # Connect another fragment with SINGLE bond (not double like before)
+        mol.take_action(1)  # Select central C
+        mol.take_action(self.vocab_size + 3 - 1)  # Select (now N) atom
+        mol.take_action(self.vocab_size + 0)  # Create SINGLE bond (not +1 for double)
+
+        # We should still have disconnected fragments (now 2 fragments)
+        self.assertTrue(hasattr(mol, 'has_disconnected_fragments'))
+        self.assertTrue(mol.has_disconnected_fragments)
+
+        # Add a new atom to one of the remaining disconnected fragments
+        mol.take_action(5)  # Select fourth branch C
+        mol.take_action(self.atom_types["F"] - 1)  # Create F atom
+        mol.take_action(self.vocab_size + 0)  # Create single bond
+
+        # Connect the third branch that's still disconnected
+        mol.take_action(1)  # Select central C
+        mol.take_action(self.vocab_size + 4 - 1)  # Select third branch C
+        mol.take_action(self.vocab_size + 0)  # Create single bond
+
+        # Connect the fourth branch (with newly added F atom)
+        mol.take_action(1)  # Select central C
+        mol.take_action(self.vocab_size + 5 - 1)  # Select fourth branch C
+        mol.take_action(self.vocab_size + 0)  # Create single bond
+
+        # Debug check after final connection
+        frags = Chem.GetMolFrags(mol.rdkit_mol, asMols=False)
+        print(f"DEBUG: After final connection, number of fragments: {len(frags)}")
+        print(f"DEBUG: has_disconnected_fragments attribute exists? {hasattr(mol, 'has_disconnected_fragments')}")
+        if hasattr(mol, 'has_disconnected_fragments'):
+            print(f"DEBUG: has_disconnected_fragments value: {mol.has_disconnected_fragments}")
+
+        # Now that all fragments are connected, the has_disconnected_fragments flag should be gone
+        self.assertFalse(hasattr(mol, 'has_disconnected_fragments'))
+
+        # Termination should now be allowed
+        self.assertFalse(mol.current_action_mask[0])
+
+        # Verify the final structure
+        final_smiles = mol.to_smiles()
+        print(f"Final reconnected molecule: {final_smiles}")
+
+        # The molecule should be a single connected structure with no disconnected fragments
+        self.assertNotIn(".", final_smiles)
+
+        # Successfully terminate the molecule
+        mol.take_action(0)
+        self.assertTrue(mol.synthesis_done)
+
+        print("Successfully handled multiple (3+) fragments")
+
 if __name__ == '__main__':
     unittest.main()
 

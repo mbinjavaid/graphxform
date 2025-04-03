@@ -38,10 +38,8 @@ class TestModifyExistingBonds(unittest.TestCase):
         # Now let's modify the bond using the action API
         # First, we need the action indices for selecting existing atoms
 
-        # At level 0, to select an existing atom we use:
-        # ex_atom_start_idx + atom_idx - 1 where ex_atom_start_idx = len(config.atom_vocabulary) + 1
-        ex_atom_start_idx = len(config.atom_vocabulary) + 1
-        atom_a_action_idx = ex_atom_start_idx + atom_a + 1 - 1  # +1 because we have a virtual atom
+        # At level 0, select atom action is just the internal atom index
+        atom_a_action_idx = atom_a + 1  # +1 because RDKit index 0 = internal index 1
 
         # Execute level 0 action to select the first carbon atom
         print(f"\nTaking level 0 action {atom_a_action_idx} to select the first carbon atom")
@@ -49,8 +47,9 @@ class TestModifyExistingBonds(unittest.TestCase):
         md.take_action(atom_a_action_idx)
 
         # At level 1, to select an existing atom we use:
-        # len(config.atom_vocabulary) + atom_idx
-        atom_b_action_idx = len(config.atom_vocabulary) + atom_b
+        # V + rdkit_idx = V + atom_b
+        vocab_size = len(config.atom_vocabulary)
+        atom_b_action_idx = vocab_size + atom_b
 
         # Execute level 1 action to select the second carbon atom
         print(f"Taking level 1 action {atom_b_action_idx} to select the second carbon atom")
@@ -61,13 +60,15 @@ class TestModifyExistingBonds(unittest.TestCase):
         print(f"Action mask at level 2: {md.current_action_mask}")
 
         # Check if creating a double bond is feasible
-        double_bond_feasible = md.current_action_mask[1] == 0  # 0 means feasible in the mask
+        # In new action space: V+1 = double bond
+        double_bond_action = vocab_size + 1  # V + 1 = double bond
+        double_bond_feasible = not md.current_action_mask[double_bond_action]
 
         if double_bond_feasible:
-            # Execute level 2 action to change bond to double bond (action 1 = bond order 2)
-            print("Double bond is feasible, taking level 2 action 1 to create double bond")
+            # Execute level 2 action to change bond to double bond (V+1 = bond order 2)
+            print(f"Double bond is feasible, taking level 2 action {double_bond_action} to create double bond")
             self.assertEqual(md.current_action_level, 2, "Expected to be at action level 2")
-            md.take_action(1)  # Action 1 = bond order 2 (double bond)
+            md.take_action(double_bond_action)  # V+1 = bond order 2 (double bond)
 
             # Verify the bond order was updated
             updated_bond = md.rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
@@ -106,13 +107,13 @@ class TestModifyExistingBonds(unittest.TestCase):
             # Print action mask for level 2
             print(f"Action mask at level 2 (for decreasing bond): {md.current_action_mask}")
 
-            # In new action space, to decrease we just set it to the desired order
-            # Check if setting to single bond is feasible (action 0 = set to order 1)
-            decrease_bond_feasible = md.current_action_mask[0] == 0
+            # In new action space, V+0 = single bond
+            single_bond_action = vocab_size + 0  # V+0 = bond order 1
+            decrease_bond_feasible = not md.current_action_mask[single_bond_action]
 
             if decrease_bond_feasible:
-                print("Decreasing bond is feasible, taking action 0 to set single bond")
-                md.take_action(0)  # Action 0 = set to bond order 1
+                print(f"Decreasing bond is feasible, taking action {single_bond_action} to set single bond")
+                md.take_action(single_bond_action)  # V+0 = set to bond order 1
 
                 # Verify the bond order was decreased back to single
                 updated_bond = md.rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
@@ -169,9 +170,12 @@ class TestModifyExistingBonds(unittest.TestCase):
         self.assertEqual(original_order, 1, "Expected methyl-benzene bond to be a single bond")
 
         # Get the action indices for the two atoms
-        ex_atom_start_idx = len(config.atom_vocabulary) + 1
-        methyl_action_idx = ex_atom_start_idx + methyl_carbon + 1 - 1
-        benzene_action_idx = len(config.atom_vocabulary) + benzene_carbon
+        # In new action space: Level 0 action = internal atom index
+        methyl_action_idx = methyl_carbon + 1  # +1 because RDKit index -> internal index
+
+        # In new action space: Level 1 action V+rdkit_idx
+        vocab_size = len(config.atom_vocabulary)
+        benzene_action_idx = vocab_size + benzene_carbon
 
         # Try to increase the bond order
         print("\nAttempting to increase methyl-benzene bond to double bond")
@@ -182,11 +186,13 @@ class TestModifyExistingBonds(unittest.TestCase):
         print(f"Action mask at level 2: {md.current_action_mask}")
 
         # Check if double bond is feasible (should be infeasible due to valence constraints)
-        double_bond_feasible = md.current_action_mask[1] == 0
+        # In new action space: V+1 = double bond
+        double_bond_action = vocab_size + 1
+        double_bond_feasible = not md.current_action_mask[double_bond_action]
 
         if double_bond_feasible:
             print("Double bond is feasible (unexpected)")
-            md.take_action(1)  # Create double bond
+            md.take_action(double_bond_action)  # Create double bond
         else:
             print("Double bond is correctly infeasible due to valence constraints")
             # Take a valid action to continue the test
@@ -227,9 +233,12 @@ class TestModifyExistingBonds(unittest.TestCase):
         self.assertEqual(original_order, 3, "Expected C≡C to be a triple bond (order 3)")
 
         # Try to decrease the bond to a double bond
-        ex_atom_start_idx = len(config.atom_vocabulary) + 1
-        atom_a_action_idx = ex_atom_start_idx + atom_a + 1 - 1
-        atom_b_action_idx = len(config.atom_vocabulary) + atom_b
+        # In new action space: Level 0 action = internal atom index
+        atom_a_action_idx = atom_a + 1  # +1 because RDKit index -> internal index
+
+        # In new action space: Level 1 action V+rdkit_idx
+        vocab_size = len(config.atom_vocabulary)
+        atom_b_action_idx = vocab_size + atom_b
 
         print("\nAttempting to decrease triple bond to double bond")
         md.take_action(atom_a_action_idx)  # Level 0: Select first carbon
@@ -238,12 +247,14 @@ class TestModifyExistingBonds(unittest.TestCase):
         # Print action mask at level 2
         print(f"Action mask at level 2: {md.current_action_mask}")
 
-        # Check if decreasing bond to double is feasible (action 1 = set to order 2)
-        decrease_bond_feasible = md.current_action_mask[1] == 0
+        # Check if decreasing bond to double is feasible
+        # In new action space: V+1 = double bond
+        double_bond_action = vocab_size + 1
+        decrease_bond_feasible = not md.current_action_mask[double_bond_action]
 
         if decrease_bond_feasible:
-            print("Decreasing bond is feasible, taking action 1 to set double bond")
-            md.take_action(1)  # Set to double bond (order 2)
+            print(f"Decreasing bond is feasible, taking action {double_bond_action} to set double bond")
+            md.take_action(double_bond_action)  # Set to double bond (order 2)
 
             # Verify the bond was decreased to double
             updated_bond = md.rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
@@ -259,8 +270,10 @@ class TestModifyExistingBonds(unittest.TestCase):
             md.take_action(atom_a_action_idx)  # Level 0: Select first carbon
             md.take_action(atom_b_action_idx)  # Level 1: Select second carbon
 
-            if md.current_action_mask[0] == 0:  # Check if setting to single bond is feasible
-                md.take_action(0)  # Set to single bond (order 1)
+            # In new action space: V+0 = single bond
+            single_bond_action = vocab_size + 0
+            if not md.current_action_mask[single_bond_action]:  # Check if setting to single bond is feasible
+                md.take_action(single_bond_action)  # Set to single bond (order 1)
 
                 final_bond = md.rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)
                 final_order = final_bond.GetBondTypeAsDouble() if final_bond else 0
@@ -295,20 +308,25 @@ class TestModifyExistingBonds(unittest.TestCase):
         self.assertIsNotNone(original_bond, "Expected bond between first two carbons")
 
         # Select atoms for bond modification
-        ex_atom_start_idx = len(config.atom_vocabulary) + 1
-        atom_a_action_idx = ex_atom_start_idx + atom_a + 1 - 1
-        atom_b_action_idx = len(config.atom_vocabulary) + atom_b
+        # In new action space: Level 0 action = internal atom index
+        atom_a_action_idx = atom_a + 1  # +1 because RDKit index -> internal index
+
+        # In new action space: Level 1 action V+rdkit_idx
+        vocab_size = len(config.atom_vocabulary)
+        atom_b_action_idx = vocab_size + atom_b
 
         print(f"Attempting to remove bond between carbon atoms {atom_a} and {atom_b}")
         md.take_action(atom_a_action_idx)  # Level 0: Select first carbon
         md.take_action(atom_b_action_idx)  # Level 1: Select second carbon
 
-        # Check if bond removal is feasible (should be since it doesn't disconnect the molecule)
-        bond_removal_feasible = md.current_action_mask[md.maximum_bond_order] == 0  # Last action is remove bond
+        # Check if bond removal is feasible
+        # In new action space: V+6 = remove bond
+        remove_bond_action = vocab_size + 6
+        bond_removal_feasible = not md.current_action_mask[remove_bond_action]
 
         if bond_removal_feasible:
-            print(f"Bond removal is feasible, taking action {md.maximum_bond_order}")
-            md.take_action(md.maximum_bond_order)  # Remove bond action
+            print(f"Bond removal is feasible, taking action {remove_bond_action}")
+            md.take_action(remove_bond_action)  # Remove bond action
 
             # Verify bond was removed
             updated_bond = md.rdkit_mol.GetBondBetweenAtoms(atom_a, atom_b)

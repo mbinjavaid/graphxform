@@ -1255,14 +1255,18 @@ class MoleculeDesign(BaseTrajectory):
                        compare_smiles=True) -> 'MoleculeDesign':
         """
         Creates an instance of `MoleculeDesign` from an RDKit molecule.
-        Directly constructs the internal representation by bypassing the action system.
+        Updated to work with the new action space:
+        - Level 0: Select existing atom (actions 1 to N)
+        - Level 1: Create new atom (0 to V-1) or select existing atom (V to V+N-1)
+        - Level 2: Set bond order (V to V+5 for orders 1-6)
         """
-        # Create an empty molecule design with the first atom
         Chem.Kekulize(rdkit_mol)
         atoms = rdkit_mol.GetAtoms()
-        atom_idcs_for_design = []  # Atom types in our vocabulary
+        adjacency_matrix = Chem.rdmolops.GetAdjacencyMatrix(rdkit_mol, useBO=True)
 
-        # Map atomic numbers to indices in our vocabulary
+        # We keep the floating point values to preserve aromatic bond information (1.5)
+
+        # Map atomic numbers to vocabulary indices
         atomic_num_to_atom_idx = {}
         for i, atom_name in enumerate(config.atom_vocabulary.keys()):
             k = config.atom_vocabulary[atom_name]["atomic_number"]
@@ -1270,9 +1274,11 @@ class MoleculeDesign(BaseTrajectory):
                 k = f"{k}_{config.atom_vocabulary[atom_name]['formal_charge']}"
             if "chiral_tag" in config.atom_vocabulary[atom_name]:
                 k = f"{k}@{config.atom_vocabulary[atom_name]['chiral_tag']}"
-            atomic_num_to_atom_idx[k] = i + 1
+            # Store 0-indexed vocabulary position (for Level 1 atom creation)
+            atomic_num_to_atom_idx[k] = i
 
-        # Get atom types for all atoms in the molecule
+        # Convert RDKit atoms to vocabulary indices
+        atom_idcs_for_design = []
         for atom in atoms:
             k = atom.GetAtomicNum()
             formal_charge = int(atom.GetFormalCharge())
@@ -1281,75 +1287,89 @@ class MoleculeDesign(BaseTrajectory):
             chiral_tag = int(atom.GetChiralTag())
             if chiral_tag != 0:
                 k = f"{k}@{chiral_tag}"
+            # Get 0-indexed position in vocabulary
             atom_idx = atomic_num_to_atom_idx[k]
             atom_idcs_for_design.append(atom_idx)
 
-        # Initialize with the first atom
-        design = MoleculeDesign(config, atom_idcs_for_design[0])
+        # Start with the first atom as our initial molecule
+        vocab_idx_first_atom = atom_idcs_for_design[0]
+        atom_type_first_atom = vocab_idx_first_atom + 1  # Convert to 1-indexed for the initial atom
+        design = MoleculeDesign(config, atom_type_first_atom)
 
-        # CRUCIAL CHANGE: Instead of using the action system, we'll build the molecule directly
+        # Track which atoms have been placed and which bonds have been created
+        placed_atoms = {0: True}  # RDKit atom index 0 is already placed
+        processed_bonds = set()  # Set of (min_idx, max_idx) tuples to avoid duplicates
 
-        # 1. First, recreate the RDKit molecule from scratch
-        design.rdkit_mol = Chem.RWMol()
+        # Get vocabulary size for action indexing
+        vocab_size = len(config.atom_vocabulary)
 
-        # 2. Add all atoms to both the design.atoms array and the RDKit molecule
-        for i in range(len(atoms)):
-            if i == 0:
-                # First atom is already added during initialization
-                atom_config = config.atom_vocabulary[list(config.atom_vocabulary.keys())[atom_idcs_for_design[0] - 1]]
-                a = Chem.Atom(atom_config["atomic_number"])
-                design.rdkit_mol.AddAtom(a)
-            else:
-                atom_type = atom_idcs_for_design[i]
-                design.atoms = np.append(design.atoms, atom_type)
-                atom_config = config.atom_vocabulary[list(config.atom_vocabulary.keys())[atom_type - 1]]
-                a = Chem.Atom(atom_config["atomic_number"])
-                design.rdkit_mol.AddAtom(a)
+        # Phase 1: Add all remaining atoms
+        for i in range(1, len(atom_idcs_for_design)):
+            # Find an existing atom this new atom is bonded to
+            found_connection = False
 
-        # 3. Update the bonds matrix and add bonds to the RDKit molecule
-        num_atoms = len(design.atoms)
-        design.bonds = np.zeros((num_atoms, num_atoms), dtype=np.uint8)
-        design.bonds[0, 1:] = design.bonds[1:, 0] = design.virtual_bond_idx  # Connect virtual atom
+            for j in range(i):
+                # Skip if already processed this bond
+                if (min(i, j), max(i, j)) in processed_bonds:
+                    continue
 
-        # 4. Add bonds between atoms based on the adjacency matrix
-        adjacency_matrix = Chem.rdmolops.GetAdjacencyMatrix(rdkit_mol, useBO=True)
-        for i in range(len(atoms)):
-            for j in range(i + 1, len(atoms)):
-                bond_order = int(adjacency_matrix[i, j])
+                bond_order = adjacency_matrix[i, j]
                 if bond_order > 0:
-                    # Add bond to the design's bond matrix
-                    design.bonds[i + 1, j + 1] = design.bonds[j + 1, i + 1] = bond_order
+                    # Found a bond to an existing atom
+                    found_connection = True
 
-                    # Add bond to the RDKit molecule
-                    design.rdkit_mol.AddBond(i, j, design.bond_types[bond_order])
+                    # Level 0: Select existing atom - action = atom internal index (j+1)
+                    design.take_action(j + 1)  # +1 because RDKit index -> internal index
 
-        # 5. Initialize and update the topological distance matrix
-        # First create a distance matrix of the right size (including virtual atom)
-        design.topological_distance_matrix = np.full((num_atoms, num_atoms),
-                                                     design.infinity_distance,
-                                                     dtype=np.uint8)
+                    # Level 1: Create new atom - action = vocabulary index (0 to V-1)
+                    atom_vocab_idx = atom_idcs_for_design[i]  # 0-indexed vocab position
+                    design.take_action(atom_vocab_idx)
 
-        # Set the diagonal to 0 (distance to self)
-        np.fill_diagonal(design.topological_distance_matrix, 0)
+                    # Level 2: Set bond order - action = V + int(order-1)
+                    # This preserves the original handling where aromatic bonds (1.5)
+                    # become int(1.5-1) = 0, mapped to V+0 (single bond)
+                    bond_action = vocab_size + int(bond_order - 1)
+                    design.take_action(bond_action)
 
-        # Set distances to virtual atom
-        design.topological_distance_matrix[0, 1:] = design.topological_distance_matrix[1:, 0] = design.virtual_distance
+                    # Mark this bond as processed
+                    processed_bonds.add((min(i, j), max(i, j)))
+                    placed_atoms[i] = True
+                    break
 
-        # Set actual distances between atoms
-        if len(atoms) > 0:
-            rdkit_distance_matrix = Chem.GetDistanceMatrix(design.rdkit_mol, force=True).astype(np.uint8)
-            design.topological_distance_matrix[1:len(atoms) + 1, 1:len(atoms) + 1] = rdkit_distance_matrix
+            if not found_connection:
+                raise ValueError(f"Couldn't find a connection for atom {i}")
 
-        # 6. Set the current action level to 0 (choosing atoms)
-        design.current_action_level = 0
-        design.update_action_mask()
+        # Phase 2: Add any remaining bonds between existing atoms
+        for i in range(len(atom_idcs_for_design)):
+            for j in range(i + 1, len(atom_idcs_for_design)):
+                # Skip if already processed this bond
+                if (i, j) in processed_bonds:
+                    continue
 
-        # 7. Finalize if needed
+                bond_order = adjacency_matrix[i, j]
+                if bond_order > 0:
+                    # Level 0: Select first atom (i+1 for internal index)
+                    design.take_action(i + 1)
+
+                    # Level 1: Select second atom - action = V + rdkit_idx
+                    existing_atom_action = vocab_size + j
+                    design.take_action(existing_atom_action)
+
+                    # Level 2: Set bond order - action = V + int(order-1)
+                    # This preserves the original handling where aromatic bonds (1.5)
+                    # become int(1.5-1) = 0, mapped to V+0 (single bond)
+                    bond_action = vocab_size + int(bond_order - 1)
+                    design.take_action(bond_action)
+
+                    # Mark this bond as processed
+                    processed_bonds.add((i, j))
+
+        # Terminate if requested
         if do_finish:
-            design.synthesis_done = True
-            design.finalize()
+            design.take_action(0)
             if compare_smiles:
-                assert Chem.CanonSmiles(design.smiles_string) == Chem.CanonSmiles(
-                    smiles), f"Converted: {Chem.CanonSmiles(design.smiles_string)}, RDKit: {Chem.CanonSmiles(smiles)}"
+                assert Chem.CanonSmiles(design.smiles_string) == Chem.CanonSmiles(smiles), \
+                    f"Converted: {Chem.CanonSmiles(design.smiles_string)}, RDKit: {Chem.CanonSmiles(smiles)}"
+            design.assert_feasible()
 
         return design

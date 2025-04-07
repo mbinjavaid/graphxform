@@ -49,9 +49,11 @@ class MoleculeConfig:
             "I": {"allowed": True, "atomic_number": 53, "valence": 1}
         }
 
-        self.start_from_c_chains = True
+        # self.start_from_c_chains = True
+        self.start_from_c_chains = False
         self.start_c_chain_max_len = 1
-        self.start_from_smiles = None  # Give SMILES and set `start_from_c_chains=False`.
+        # self.start_from_smiles = None  # Give SMILES and set `start_from_c_chains=False`.
+        self.start_from_smiles = True  # Give SMILES and set `start_from_c_chains=False`.
         self.repeat_start_instances = 1
         # Positive value x, where the actual objective with our molecule score will be set to obj = score - x * SA_score
         self.synthetic_accessibility_in_objective_scale = 0

@@ -1255,16 +1255,13 @@ class MoleculeDesign(BaseTrajectory):
                        compare_smiles=True) -> 'MoleculeDesign':
         """
         Creates an instance of `MoleculeDesign` from an RDKit molecule.
-        Updated to work with the new action space:
-        - Level 0: Select existing atom (actions 1 to N)
-        - Level 1: Create new atom (0 to V-1) or select existing atom (V to V+N-1)
-        - Level 2: Set bond order (V to V+5 for orders 1-6)
         """
+        # Create a copy to avoid modifying the input
+        rdkit_mol = Chem.Mol(rdkit_mol)
         Chem.Kekulize(rdkit_mol)
+
         atoms = rdkit_mol.GetAtoms()
         adjacency_matrix = Chem.rdmolops.GetAdjacencyMatrix(rdkit_mol, useBO=True)
-
-        # We keep the floating point values to preserve aromatic bond information (1.5)
 
         # Map atomic numbers to vocabulary indices
         atomic_num_to_atom_idx = {}
@@ -1274,8 +1271,7 @@ class MoleculeDesign(BaseTrajectory):
                 k = f"{k}_{config.atom_vocabulary[atom_name]['formal_charge']}"
             if "chiral_tag" in config.atom_vocabulary[atom_name]:
                 k = f"{k}@{config.atom_vocabulary[atom_name]['chiral_tag']}"
-            # Store 0-indexed vocabulary position (for Level 1 atom creation)
-            atomic_num_to_atom_idx[k] = i
+            atomic_num_to_atom_idx[k] = i  # 0-indexed for the new action space
 
         # Convert RDKit atoms to vocabulary indices
         atom_idcs_for_design = []
@@ -1287,89 +1283,77 @@ class MoleculeDesign(BaseTrajectory):
             chiral_tag = int(atom.GetChiralTag())
             if chiral_tag != 0:
                 k = f"{k}@{chiral_tag}"
-            # Get 0-indexed position in vocabulary
             atom_idx = atomic_num_to_atom_idx[k]
             atom_idcs_for_design.append(atom_idx)
 
         # Start with the first atom as our initial molecule
         vocab_idx_first_atom = atom_idcs_for_design[0]
-        atom_type_first_atom = vocab_idx_first_atom + 1  # Convert to 1-indexed for the initial atom
+        atom_type_first_atom = vocab_idx_first_atom + 1  # Convert to 1-indexed
         design = MoleculeDesign(config, atom_type_first_atom)
 
-        # Track which atoms have been placed and which bonds have been created
-        placed_atoms = {0: True}  # RDKit atom index 0 is already placed
-        processed_bonds = set()  # Set of (min_idx, max_idx) tuples to avoid duplicates
+        # Track atoms that have been placed
+        placed_atoms = {0: 1}  # Maps RDKit atom index -> design atom index
 
         # Get vocabulary size for action indexing
         vocab_size = len(config.atom_vocabulary)
 
-        # Phase 1: Add all remaining atoms
+        # This is the key part that adapts the old implementation pattern
+        # to preserve stereochemistry while using the new action space
         for i in range(1, len(atom_idcs_for_design)):
-            # Find an existing atom this new atom is bonded to
-            found_connection = False
+            atom_to_add_idx = atom_idcs_for_design[i]  # 0-indexed vocabulary position
+            atom_is_placed = False
 
+            # Iterate through previous atoms to find connections - same order as old implementation
             for j in range(i):
-                # Skip if already processed this bond
-                if (min(i, j), max(i, j)) in processed_bonds:
-                    continue
-
                 bond_order = adjacency_matrix[i, j]
                 if bond_order > 0:
-                    # Found a bond to an existing atom
-                    found_connection = True
+                    design_j = placed_atoms[j]  # Get the design atom index
 
-                    # Level 0: Select existing atom - action = atom internal index (j+1)
-                    design.take_action(j + 1)  # +1 because RDKit index -> internal index
+                    if not atom_is_placed:
+                        # First connection for this atom - create the atom
+                        # Level 0: Select existing atom
+                        design.take_action(design_j)
 
-                    # Level 1: Create new atom - action = vocabulary index (0 to V-1)
-                    atom_vocab_idx = atom_idcs_for_design[i]  # 0-indexed vocab position
-                    design.take_action(atom_vocab_idx)
+                        # Level 1: Create new atom
+                        design.take_action(atom_to_add_idx)
 
-                    # Level 2: Set bond order - action = V + int(order-1)
-                    # This preserves the original handling where aromatic bonds (1.5)
-                    # become int(1.5-1) = 0, mapped to V+0 (single bond)
-                    bond_action = vocab_size + int(bond_order - 1)
-                    design.take_action(bond_action)
+                        # Level 2: Set bond order
+                        bond_action = vocab_size + int(bond_order - 1)
+                        design.take_action(bond_action)
 
-                    # Mark this bond as processed
-                    processed_bonds.add((min(i, j), max(i, j)))
-                    placed_atoms[i] = True
-                    break
+                        # Mark atom as placed and record its position
+                        atom_is_placed = True
+                        placed_atoms[i] = len(design.atoms) - 1
+                    else:
+                        # Additional bonds to this atom - just create the bond
+                        # Level 0: Select first atom
+                        design.take_action(design_j)
 
-            if not found_connection:
+                        # Level 1: Select second atom - already placed
+                        design_i = placed_atoms[i]
+                        existing_atom_action = vocab_size + (design_i - 1)
+                        design.take_action(existing_atom_action)
+
+                        # Level 2: Set bond order
+                        bond_action = vocab_size + int(bond_order - 1)
+                        design.take_action(bond_action)
+
+            # Ensure we've placed the atom
+            if not atom_is_placed:
                 raise ValueError(f"Couldn't find a connection for atom {i}")
-
-        # Phase 2: Add any remaining bonds between existing atoms
-        for i in range(len(atom_idcs_for_design)):
-            for j in range(i + 1, len(atom_idcs_for_design)):
-                # Skip if already processed this bond
-                if (i, j) in processed_bonds:
-                    continue
-
-                bond_order = adjacency_matrix[i, j]
-                if bond_order > 0:
-                    # Level 0: Select first atom (i+1 for internal index)
-                    design.take_action(i + 1)
-
-                    # Level 1: Select second atom - action = V + rdkit_idx
-                    existing_atom_action = vocab_size + j
-                    design.take_action(existing_atom_action)
-
-                    # Level 2: Set bond order - action = V + int(order-1)
-                    # This preserves the original handling where aromatic bonds (1.5)
-                    # become int(1.5-1) = 0, mapped to V+0 (single bond)
-                    bond_action = vocab_size + int(bond_order - 1)
-                    design.take_action(bond_action)
-
-                    # Mark this bond as processed
-                    processed_bonds.add((i, j))
 
         # Terminate if requested
         if do_finish:
             design.take_action(0)
             if compare_smiles:
-                assert Chem.CanonSmiles(design.smiles_string) == Chem.CanonSmiles(smiles), \
-                    f"Converted: {Chem.CanonSmiles(design.smiles_string)}, RDKit: {Chem.CanonSmiles(smiles)}"
+                result_smiles = design.smiles_string
+                if Chem.CanonSmiles(result_smiles) != Chem.CanonSmiles(smiles):
+                    print(f"WARNING: SMILES mismatch")
+                    print(f"Constructed: {result_smiles}")
+                    print(f"Reference:   {smiles}")
+                    assert Chem.CanonSmiles(result_smiles) == Chem.CanonSmiles(smiles), \
+                        f"Constructed SMILES doesn't match reference"
             design.assert_feasible()
 
         return design
+

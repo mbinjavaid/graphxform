@@ -26,7 +26,7 @@ MAX_ATOMS = 50
 SIMILARITY_LOWER_BOUND = 0.4  # Min similarity for pairs
 SIMILARITY_UPPER_BOUND = 0.7  # Max similarity for pairs
 # NUM_PAIRS = 10000  # Target number of pairs to generate
-NUM_PAIRS = int(1574970*0.5)  # Target number of pairs to generate
+NUM_PAIRS = int(1574970*1)  # Target number of pairs to generate
 RANDOM_SEED = 42
 CHECKPOINT_DIR = "./data/chembl/checkpoints"
 CHECKPOINT_FREQUENCY = 100  # Save progress after every 100 pairs
@@ -119,17 +119,20 @@ def create_molecule_pairs(
         molecules: List[Tuple[Chem.Mol, str]],
         similarity_lower: float = SIMILARITY_LOWER_BOUND,
         similarity_upper: float = SIMILARITY_UPPER_BOUND,
-        num_pairs: int = NUM_PAIRS
+        num_pairs: int = NUM_PAIRS,
+        max_pairs_per_molecule: int = 1000  # New parameter to limit pairs per molecule
 ) -> List[Tuple[Chem.Mol, Chem.Mol, float]]:
     """
     Create pairs of molecules within a specified similarity range using optimized approach.
-    Each molecule appears in at most one pair. Uses checkpointing for fingerprints and progress.
+    Each molecule can appear in up to max_pairs_per_molecule pairs.
+    Uses checkpointing for fingerprints and progress.
 
     Args:
         molecules: List of (molecule, SMILES) tuples
         similarity_lower: Minimum similarity threshold
         similarity_upper: Maximum similarity threshold
         num_pairs: Target number of pairs to generate
+        max_pairs_per_molecule: Maximum number of pairs a single molecule can appear in
 
     Returns:
         List of (mol1, mol2, similarity) tuples
@@ -187,10 +190,13 @@ def create_molecule_pairs(
 
     # Step 3: Try to load progress checkpoint
     pairs = []
-    used_indices = set()
+    molecule_pair_counts = defaultdict(int)  # Replace used_indices with a counter
     processed_count = 0
     indices = list(range(len(molecules)))
     random.shuffle(indices)
+
+    # Variable to track checkpoint milestones
+    prev_checkpoint_milestone = 0
 
     if os.path.exists(pairs_progress_checkpoint_path):
         print(f"Loading pairs progress from checkpoint {pairs_progress_checkpoint_path}")
@@ -198,19 +204,40 @@ def create_molecule_pairs(
             with open(pairs_progress_checkpoint_path, "rb") as f:
                 progress_data = pickle.load(f)
                 pairs = progress_data['pairs']
-                used_indices = progress_data['used_indices']
+
+                # Handle backward compatibility with old checkpoint format
+                if 'molecule_pair_counts' in progress_data:
+                    molecule_pair_counts = progress_data['molecule_pair_counts']
+                elif 'used_indices' in progress_data:
+                    # Convert old format to new format
+                    used_indices = progress_data['used_indices']
+                    for idx in used_indices:
+                        molecule_pair_counts[idx] = 1
+                    print("Converted old checkpoint format to new format")
+
                 processed_count = progress_data['processed_count']
-                # We don't restore indices because we want to keep the original random order
-                # But we need to know how many we've processed
-            print(f"Resuming from checkpoint: {len(pairs)} pairs found, {len(used_indices)} molecules used, "
+
+            # Calculate actual molecules used statistics from pairs
+            molecules_in_pairs = set()
+            for mol1, mol2, _ in pairs:
+                for i, (m, _) in enumerate(molecules):
+                    if Chem.MolToSmiles(m) == Chem.MolToSmiles(mol1) or Chem.MolToSmiles(m) == Chem.MolToSmiles(mol2):
+                        molecules_in_pairs.add(i)
+
+            print(f"Resuming from checkpoint: {len(pairs)} pairs found, {len(molecules_in_pairs)} molecules used, "
                   f"processed {processed_count} indices")
+
+            # Set the checkpoint milestone based on loaded data
+            prev_checkpoint_milestone = len(pairs) // 5000
+
         except Exception as e:
             print(f"Failed to load progress checkpoint: {e}. Starting from beginning.")
             pairs = []
-            used_indices = set()
+            molecule_pair_counts = defaultdict(int)
             processed_count = 0
 
     print(f"Finding molecule pairs with similarity between {similarity_lower} and {similarity_upper}")
+    print(f"Each molecule can appear in up to {max_pairs_per_molecule} pairs")
 
     # Step 4: Find pairs
     pbar = tqdm(total=num_pairs, initial=len(pairs))
@@ -223,8 +250,8 @@ def create_molecule_pairs(
         if len(pairs) >= num_pairs:
             break
 
-        # Skip if already used
-        if i in used_indices:
+        # Skip if molecule has reached its maximum allowed pairs
+        if molecule_pair_counts[i] >= max_pairs_per_molecule:
             processed_count += 1
             continue
 
@@ -232,8 +259,9 @@ def create_molecule_pairs(
         fp1 = fingerprints[i]
 
         # Calculate similarities in batches
-        batch_size = 1000
-        remaining_indices = [j for j in indices if j > i and j not in used_indices]
+        batch_size = 1000000
+        # Only consider molecules that haven't reached their pair limit
+        remaining_indices = [j for j in indices if j > i and molecule_pair_counts[j] < max_pairs_per_molecule]
 
         for batch_start in range(0, len(remaining_indices), batch_size):
             batch_indices = remaining_indices[batch_start:batch_start + batch_size]
@@ -248,30 +276,56 @@ def create_molecule_pairs(
             for k, sim in enumerate(similarities):
                 if similarity_lower <= sim <= similarity_upper:
                     j = batch_indices[k]
+
+                    # Double-check that neither molecule has reached its limit
+                    # (could happen if another batch just paired it)
+                    if (molecule_pair_counts[i] >= max_pairs_per_molecule or
+                            molecule_pair_counts[j] >= max_pairs_per_molecule):
+                        continue
+
                     mol2, smiles2 = mol_smiles_map[j]
 
                     pairs.append((mol1, mol2, sim))
-                    used_indices.add(i)
-                    used_indices.add(j)
+                    molecule_pair_counts[i] += 1
+                    molecule_pair_counts[j] += 1
                     pbar.update(1)
+
+                    # Check if we've crossed a checkpoint milestone (every 5000 pairs)
+                    current_milestone = len(pairs) // 5000
+                    if current_milestone > prev_checkpoint_milestone:
+                        progress_data = {
+                            'pairs': pairs,
+                            'molecule_pair_counts': molecule_pair_counts,
+                            'processed_count': processed_count
+                        }
+                        with open(pairs_progress_checkpoint_path, "wb") as f:
+                            pickle.dump(progress_data, f)
+
+                        # Calculate statistics about molecule reuse
+                        used_molecules = sum(1 for count in molecule_pair_counts.values() if count > 0)
+                        max_reuse = max(molecule_pair_counts.values()) if molecule_pair_counts else 0
+                        avg_reuse = sum(molecule_pair_counts.values()) / used_molecules if used_molecules > 0 else 0
+
+                        print(
+                            f"\nCheckpoint saved at {len(pairs)} pairs: {processed_count}/{len(indices)} molecules processed")
+                        print(
+                            f"Molecules used: {used_molecules}, Max pairs per molecule: {max_reuse}, Avg pairs per molecule: {avg_reuse:.2f}")
+
+                        # Update the milestone
+                        prev_checkpoint_milestone = current_milestone
 
                     if len(pairs) >= num_pairs:
                         break
 
-            if len(pairs) >= num_pairs or i in used_indices:
+                    # If this molecule has reached its limit, stop looking for more partners
+                    if molecule_pair_counts[i] >= max_pairs_per_molecule:
+                        break
+
+            if len(pairs) >= num_pairs or molecule_pair_counts[i] >= max_pairs_per_molecule:
                 break
 
-        # Checkpoint progress every 1000 pairs or every 1000 processed indices
+        # Update processed count
         processed_count += 1
-        if len(pairs) % 1000 == 0 or processed_count % 1000 == 0:
-            progress_data = {
-                'pairs': pairs,
-                'used_indices': used_indices,
-                'processed_count': processed_count
-            }
-            with open(pairs_progress_checkpoint_path, "wb") as f:
-                pickle.dump(progress_data, f)
-            print(f"\nCheckpoint saved: {len(pairs)} pairs, {processed_count}/{len(indices)} molecules processed")
 
     pbar.close()
     print(f"Created {len(pairs)} molecule pairs")

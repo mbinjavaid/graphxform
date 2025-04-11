@@ -1,5 +1,5 @@
 """
-This script generates paired molecule transformation datasets.
+This script generates paired molecule transformation datasets for both training and validation data.
 We find pairs of molecules, calculate their Graph Edit Distance (GED),
 and record the edit sequences required to transform one into the other.
 Includes checkpointing to save intermediate results.
@@ -15,15 +15,18 @@ from tqdm import tqdm
 from typing import List, Tuple, Dict
 from datetime import datetime
 
+# Chem.CanonicalRankAtoms
+
 # Suppress RDKit warnings
 RDLogger.DisableLog('rdApp.*')
 
 # Configuration
 MAX_ATOMS = 50
-NUM_PAIRS = 1574970  # Target number of pairs to generate
+# NUM_PAIRS is now determined by dataset size
 RANDOM_SEED = 42
 CHECKPOINT_DIR = "./data/chembl/checkpoints"
 CHECKPOINT_FREQUENCY = 5000  # Save progress after every 5000 transformations
+DATATYPES = ["train", "valid"]
 
 # Set random seed for reproducibility
 random.seed(RANDOM_SEED)
@@ -45,15 +48,17 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS) -> List[Tup
     Returns:
         List of (RDKit molecule, canonical SMILES) tuples
     """
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, "filtered_molecules.pkl")
+    # Extract datatype from path for checkpoint naming
+    datatype = "train" if "train" in path else "valid"
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"filtered_molecules_{datatype}.pkl")
 
     # Try to load from checkpoint
     if os.path.exists(checkpoint_path):
-        print(f"Loading filtered molecules from checkpoint {checkpoint_path}")
+        print(f"Loading filtered {datatype} molecules from checkpoint {checkpoint_path}")
         try:
             with open(checkpoint_path, "rb") as f:
                 molecules = pickle.load(f)
-            print(f"Loaded {len(molecules)} molecules from checkpoint")
+            print(f"Loaded {len(molecules)} {datatype} molecules from checkpoint")
             return molecules
         except Exception as e:
             print(f"Failed to load checkpoint: {e}. Processing from scratch.")
@@ -74,6 +79,9 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS) -> List[Tup
             try:
                 Chem.SanitizeMol(mol)
                 canonical_smiles = Chem.CanonSmiles(Chem.MolToSmiles(mol))
+                order = Chem.CanonicalRankAtoms(mol, inclueChirality=True)
+                # enforce canonical atom ordering
+                mol = Chem.RenumberAtoms(mol, order)
 
                 if mol.GetNumAtoms() <= max_atoms:
                     molecules.append((mol, canonical_smiles))
@@ -90,28 +98,32 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS) -> List[Tup
     return molecules
 
 
-def create_molecule_pairs(molecules: List[Tuple[Chem.Mol, str]], num_pairs: int = NUM_PAIRS) -> List[
+def create_molecule_pairs(molecules: List[Tuple[Chem.Mol, str]], datatype: str) -> List[
     Tuple[Chem.Mol, Chem.Mol, str, str]]:
     """
     Create random pairs of molecules where each molecule appears in exactly two pairs.
     Returns kekulized molecules and their canonical SMILES.
+    Uses the number of molecules as the target number of pairs.
 
     Args:
         molecules: List of (molecule, SMILES) tuples
-        num_pairs: Target number of pairs to generate
+        datatype: "train" or "valid" for checkpoint naming
 
     Returns:
         List of (mol1, mol2, smiles1, smiles2) tuples with kekulized molecules and canonical SMILES
     """
-    pairs_checkpoint_path = os.path.join(CHECKPOINT_DIR, "molecule_pairs.pkl")
+    pairs_checkpoint_path = os.path.join(CHECKPOINT_DIR, f"molecule_pairs_{datatype}.pkl")
+
+    # Use the number of molecules as the target number of pairs
+    num_pairs = len(molecules)
 
     # Check if we already have the final pairs
     if os.path.exists(pairs_checkpoint_path):
-        print(f"Loading molecule pairs from checkpoint {pairs_checkpoint_path}")
+        print(f"Loading {datatype} molecule pairs from checkpoint {pairs_checkpoint_path}")
         try:
             with open(pairs_checkpoint_path, "rb") as f:
                 pairs = pickle.load(f)
-            print(f"Loaded {len(pairs)} molecule pairs from checkpoint")
+            print(f"Loaded {len(pairs)} {datatype} molecule pairs from checkpoint")
             return pairs
         except Exception as e:
             print(f"Failed to load pairs checkpoint: {e}. Creating pairs from scratch.")
@@ -121,10 +133,7 @@ def create_molecule_pairs(molecules: List[Tuple[Chem.Mol, str]], num_pairs: int 
     if num_molecules < 2:
         raise ValueError("Need at least 2 molecules to create pairs")
 
-    # We want each molecule to appear exactly twice
-    # This means we can create at most num_molecules pairs
-    num_pairs = min(num_pairs, num_molecules)
-    print(f"Creating {num_pairs} pairs with each molecule appearing twice")
+    print(f"Creating {num_pairs} {datatype} pairs with each molecule appearing twice")
 
     # Simple algorithm to pair molecules:
     # 1. Create a list of molecule indices that should appear in pairs
@@ -175,17 +184,17 @@ def create_molecule_pairs(molecules: List[Tuple[Chem.Mol, str]], num_pairs: int 
         mol1, smiles1 = molecules[idx1]
         mol2, smiles2 = molecules[idx2]
 
-        # # Create kekulized copies
-        # mol1_kekulized = Chem.Mol(mol1)
-        # mol2_kekulized = Chem.Mol(mol2)
-
         try:
+            # # Create kekulized copies
+            # mol1_kekulized = Chem.Mol(mol1)
+            # mol2_kekulized = Chem.Mol(mol2)
+
             Chem.Kekulize(mol1, clearAromaticFlags=True)
             Chem.Kekulize(mol2, clearAromaticFlags=True)
 
             # # Get canonical SMILES of kekulized molecules
-            # smiles1 = Chem.MolToSmiles(mol1, canonical=True)
-            # smiles2 = Chem.MolToSmiles(mol2, canonical=True)
+            # smiles1_kek = Chem.MolToSmiles(mol1_kekulized, canonical=True)
+            # smiles2_kek = Chem.MolToSmiles(mol2_kekulized, canonical=True)
 
             # Store the pair
             pairs.append((mol1, mol2, smiles1, smiles2))
@@ -194,7 +203,7 @@ def create_molecule_pairs(molecules: List[Tuple[Chem.Mol, str]], num_pairs: int 
             print(f"Warning: Failed to kekulize molecule pair: {e}")
             continue
 
-    print(f"Created {len(pairs)} molecule pairs")
+    print(f"Created {len(pairs)} {datatype} molecule pairs")
 
     # Save the pairs
     with open(pairs_checkpoint_path, "wb") as f:
@@ -371,24 +380,24 @@ def calculate_edit_path(mol1: Chem.Mol, mol2: Chem.Mol) -> List[dict]:
     return chemical_path
 
 
-def main():
-    """Main function to create the transformation dataset with checkpointing"""
+def process_dataset(datatype):
+    """Process a single dataset (train or valid)"""
     start_time = time.time()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Checkpoint path for transformation data
-    transformation_checkpoint_path = os.path.join(CHECKPOINT_DIR, f"transformation_data_{timestamp}.pkl")
-    final_output_path = "./data/chembl/transformation_dataset.pickle"
+    # Set up paths and checkpoints
+    transformation_checkpoint_path = os.path.join(CHECKPOINT_DIR, f"transformation_data_{datatype}_{timestamp}.pkl")
+    final_output_path = f"./data/chembl/transformation_dataset_{datatype}.pickle"
 
     # Load previously saved transformation data if exists
     transformation_data = []
-    checkpoint_files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("transformation_data_")]
+    checkpoint_files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith(f"transformation_data_{datatype}_")]
 
     if checkpoint_files:
         # Sort by timestamp to get the most recent checkpoint
         checkpoint_files.sort(reverse=True)
         latest_checkpoint = os.path.join(CHECKPOINT_DIR, checkpoint_files[0])
-        print(f"Found transformation checkpoint: {latest_checkpoint}")
+        print(f"Found {datatype} transformation checkpoint: {latest_checkpoint}")
         try:
             with open(latest_checkpoint, "rb") as f:
                 transformation_data = pickle.load(f)
@@ -405,13 +414,13 @@ def main():
         processed_pairs = set()
 
     # 1. Load molecules
-    molecules = load_and_filter_molecules("./data/chembl/chembl_train_filtered.smiles")
+    molecules = load_and_filter_molecules(f"./data/chembl/chembl_{datatype}_filtered.smiles")
 
-    # 2. Create molecule pairs - already kekulized with canonical SMILES
-    pairs = create_molecule_pairs(molecules)
+    # 2. Create molecule pairs - using the number of molecules as target
+    pairs = create_molecule_pairs(molecules, datatype)
 
     # 3. Calculate GED and edit paths for each pair
-    print("Calculating Graph Edit Distances and edit paths")
+    print(f"Calculating Graph Edit Distances and edit paths for {datatype} dataset")
     print(f"Processing {len(pairs)} molecule pairs")
 
     for i, (mol1, mol2, smiles1, smiles2) in enumerate(tqdm(pairs)):
@@ -437,14 +446,27 @@ def main():
                 print(f"Checkpoint saved after {len(transformation_data)} transformations")
 
         except Exception as e:
-            print(f"Error processing pair ({smiles1}, {smiles2}): {str(e)}")
+            print(f"Error processing {datatype} pair ({smiles1}, {smiles2}): {str(e)}")
 
     # 4. Save the final transformation dataset
     with open(final_output_path, "wb") as f:
         pickle.dump(transformation_data, f)
 
-    print(f"Saved {len(transformation_data)} transformations to {final_output_path}")
-    print(f"Total processing time: {time.time() - start_time:.2f} seconds")
+    print(f"Saved {len(transformation_data)} {datatype} transformations to {final_output_path}")
+    print(f"Total processing time for {datatype}: {time.time() - start_time:.2f} seconds")
+
+
+def main():
+    """Main function to create transformation datasets for both train and validation"""
+
+    # Process each dataset separately
+    for datatype in DATATYPES:
+        print(f"\n{'='*50}")
+        print(f"Processing {datatype.upper()} dataset")
+        print(f"{'='*50}\n")
+        process_dataset(datatype)
+
+    print("\nAll datasets processed successfully!")
 
 
 if __name__ == "__main__":

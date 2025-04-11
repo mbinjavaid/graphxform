@@ -8,14 +8,11 @@ import time
 import pickle
 import os
 import random
-from collections import defaultdict
 import numpy as np
 import networkx as nx
 from rdkit import Chem, RDLogger
-from rdkit.Chem import AllChem
-from rdkit.Chem import DataStructs
 from tqdm import tqdm
-from typing import List, Tuple, Dict, Optional, Set, Any
+from typing import List, Tuple, Dict
 from datetime import datetime
 
 # Suppress RDKit warnings
@@ -23,13 +20,10 @@ RDLogger.DisableLog('rdApp.*')
 
 # Configuration
 MAX_ATOMS = 50
-SIMILARITY_LOWER_BOUND = 0.4  # Min similarity for pairs
-SIMILARITY_UPPER_BOUND = 0.7  # Max similarity for pairs
-# NUM_PAIRS = 10000  # Target number of pairs to generate
-NUM_PAIRS = int(1574970*1)  # Target number of pairs to generate
+NUM_PAIRS = 1574970  # Target number of pairs to generate
 RANDOM_SEED = 42
 CHECKPOINT_DIR = "./data/chembl/checkpoints"
-CHECKPOINT_FREQUENCY = 100  # Save progress after every 100 pairs
+CHECKPOINT_FREQUENCY = 5000  # Save progress after every 5000 transformations
 
 # Set random seed for reproducibility
 random.seed(RANDOM_SEED)
@@ -96,241 +90,113 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS) -> List[Tup
     return molecules
 
 
-def calculate_similarity(mol1: Chem.Mol, mol2: Chem.Mol) -> float:
+def create_molecule_pairs(molecules: List[Tuple[Chem.Mol, str]], num_pairs: int = NUM_PAIRS) -> List[
+    Tuple[Chem.Mol, Chem.Mol, str, str]]:
     """
-    Calculate Tanimoto similarity between two molecules using Morgan fingerprints.
-
-    Args:
-        mol1: First molecule
-        mol2: Second molecule
-
-    Returns:
-        Similarity score between 0 and 1
-    """
-    # Generate Morgan fingerprints with radius 2 (ECFP4-like)
-    fp1 = AllChem.GetMorganFingerprint(mol1, 2)
-    fp2 = AllChem.GetMorganFingerprint(mol2, 2)
-
-    # Calculate Tanimoto similarity
-    return DataStructs.TanimotoSimilarity(fp1, fp2)
-
-
-def create_molecule_pairs(
-        molecules: List[Tuple[Chem.Mol, str]],
-        similarity_lower: float = SIMILARITY_LOWER_BOUND,
-        similarity_upper: float = SIMILARITY_UPPER_BOUND,
-        num_pairs: int = NUM_PAIRS,
-        max_pairs_per_molecule: int = 1000  # New parameter to limit pairs per molecule
-) -> List[Tuple[Chem.Mol, Chem.Mol, float]]:
-    """
-    Create pairs of molecules within a specified similarity range using optimized approach.
-    Each molecule can appear in up to max_pairs_per_molecule pairs.
-    Uses checkpointing for fingerprints and progress.
+    Create random pairs of molecules where each molecule appears in exactly two pairs.
+    Returns kekulized molecules and their canonical SMILES.
 
     Args:
         molecules: List of (molecule, SMILES) tuples
-        similarity_lower: Minimum similarity threshold
-        similarity_upper: Maximum similarity threshold
         num_pairs: Target number of pairs to generate
-        max_pairs_per_molecule: Maximum number of pairs a single molecule can appear in
 
     Returns:
-        List of (mol1, mol2, similarity) tuples
+        List of (mol1, mol2, smiles1, smiles2) tuples with kekulized molecules and canonical SMILES
     """
-    # Define checkpoint paths
-    fingerprint_checkpoint_path = os.path.join(CHECKPOINT_DIR, "molecule_fingerprints.pkl")
     pairs_checkpoint_path = os.path.join(CHECKPOINT_DIR, "molecule_pairs.pkl")
-    pairs_progress_checkpoint_path = os.path.join(CHECKPOINT_DIR, "pairs_progress.pkl")
 
-    # Initialize state variables
-    fingerprints = []
-    mol_smiles_map = {}
-
-    # Step 1: Load or compute fingerprints
-    if os.path.exists(fingerprint_checkpoint_path):
-        print(f"Loading fingerprints from checkpoint {fingerprint_checkpoint_path}")
-        try:
-            with open(fingerprint_checkpoint_path, "rb") as f:
-                fingerprint_data = pickle.load(f)
-                fingerprints = fingerprint_data['fingerprints']
-                mol_smiles_map = fingerprint_data['mol_smiles_map']
-            print(f"Loaded {len(fingerprints)} fingerprints from checkpoint")
-        except Exception as e:
-            print(f"Failed to load fingerprint checkpoint: {e}. Computing from scratch.")
-            fingerprints = []
-            mol_smiles_map = {}
-
-    # Compute fingerprints if not loaded from checkpoint
-    if not fingerprints:
-        print("Pre-computing all fingerprints...")
-        for i, (mol, smiles) in enumerate(tqdm(molecules)):
-            fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
-            fingerprints.append(fp)
-            mol_smiles_map[i] = (mol, smiles)
-
-        # Save fingerprint checkpoint
-        fingerprint_data = {
-            'fingerprints': fingerprints,
-            'mol_smiles_map': mol_smiles_map
-        }
-        with open(fingerprint_checkpoint_path, "wb") as f:
-            pickle.dump(fingerprint_data, f)
-        print(f"Saved {len(fingerprints)} fingerprints to {fingerprint_checkpoint_path}")
-
-    # Step 2: Try to load final pairs result
+    # Check if we already have the final pairs
     if os.path.exists(pairs_checkpoint_path):
-        print(f"Loading final molecule pairs from checkpoint {pairs_checkpoint_path}")
+        print(f"Loading molecule pairs from checkpoint {pairs_checkpoint_path}")
         try:
             with open(pairs_checkpoint_path, "rb") as f:
                 pairs = pickle.load(f)
-            print(f"Loaded {len(pairs)} molecule pairs from final checkpoint")
+            print(f"Loaded {len(pairs)} molecule pairs from checkpoint")
             return pairs
         except Exception as e:
-            print(f"Failed to load final pairs checkpoint: {e}. Continuing from progress checkpoint if available.")
+            print(f"Failed to load pairs checkpoint: {e}. Creating pairs from scratch.")
 
-    # Step 3: Try to load progress checkpoint
-    pairs = []
-    molecule_pair_counts = defaultdict(int)  # Replace used_indices with a counter
-    processed_count = 0
-    indices = list(range(len(molecules)))
-    random.shuffle(indices)
+    # Calculate total molecules needed
+    num_molecules = len(molecules)
+    if num_molecules < 2:
+        raise ValueError("Need at least 2 molecules to create pairs")
 
-    # Variable to track checkpoint milestones
-    prev_checkpoint_milestone = 0
+    # We want each molecule to appear exactly twice
+    # This means we can create at most num_molecules pairs
+    num_pairs = min(num_pairs, num_molecules)
+    print(f"Creating {num_pairs} pairs with each molecule appearing twice")
 
-    if os.path.exists(pairs_progress_checkpoint_path):
-        print(f"Loading pairs progress from checkpoint {pairs_progress_checkpoint_path}")
-        try:
-            with open(pairs_progress_checkpoint_path, "rb") as f:
-                progress_data = pickle.load(f)
-                pairs = progress_data['pairs']
+    # Simple algorithm to pair molecules:
+    # 1. Create a list of molecule indices that should appear in pairs
+    # 2. Each index should appear twice in this list
+    # 3. Shuffle this list
+    # 4. Create pairs by taking consecutive pairs from the list
 
-                # Handle backward compatibility with old checkpoint format
-                if 'molecule_pair_counts' in progress_data:
-                    molecule_pair_counts = progress_data['molecule_pair_counts']
-                elif 'used_indices' in progress_data:
-                    # Convert old format to new format
-                    used_indices = progress_data['used_indices']
-                    for idx in used_indices:
-                        molecule_pair_counts[idx] = 1
-                    print("Converted old checkpoint format to new format")
-
-                processed_count = progress_data['processed_count']
-
-            # Calculate actual molecules used statistics from pairs
-            molecules_in_pairs = set()
-            for mol1, mol2, _ in pairs:
-                for i, (m, _) in enumerate(molecules):
-                    if Chem.MolToSmiles(m) == Chem.MolToSmiles(mol1) or Chem.MolToSmiles(m) == Chem.MolToSmiles(mol2):
-                        molecules_in_pairs.add(i)
-
-            print(f"Resuming from checkpoint: {len(pairs)} pairs found, {len(molecules_in_pairs)} molecules used, "
-                  f"processed {processed_count} indices")
-
-            # Set the checkpoint milestone based on loaded data
-            prev_checkpoint_milestone = len(pairs) // 5000
-
-        except Exception as e:
-            print(f"Failed to load progress checkpoint: {e}. Starting from beginning.")
-            pairs = []
-            molecule_pair_counts = defaultdict(int)
-            processed_count = 0
-
-    print(f"Finding molecule pairs with similarity between {similarity_lower} and {similarity_upper}")
-    print(f"Each molecule can appear in up to {max_pairs_per_molecule} pairs")
-
-    # Step 4: Find pairs
-    pbar = tqdm(total=num_pairs, initial=len(pairs))
-
-    for idx, i in enumerate(indices):
-        # Skip already processed indices
-        if idx < processed_count:
-            continue
-
-        if len(pairs) >= num_pairs:
+    # Create list where each molecule index appears exactly twice
+    mol_indices = []
+    for i in range(num_molecules):
+        mol_indices.extend([i, i])
+        if len(mol_indices) >= 2 * num_pairs:
             break
 
-        # Skip if molecule has reached its maximum allowed pairs
-        if molecule_pair_counts[i] >= max_pairs_per_molecule:
-            processed_count += 1
+    # Shuffle the indices
+    random.shuffle(mol_indices)
+
+    # Make sure no molecule is paired with itself
+    # by swapping indices if needed
+    for i in range(0, len(mol_indices), 2):
+        if i + 1 < len(mol_indices):
+            if mol_indices[i] == mol_indices[i+1]:
+                # Find a position to swap with
+                for j in range(i+2, len(mol_indices), 2):
+                    if mol_indices[j] != mol_indices[i] and mol_indices[j+1] != mol_indices[i]:
+                        # Swap i+1 with j
+                        mol_indices[i+1], mol_indices[j] = mol_indices[j], mol_indices[i+1]
+                        break
+
+    # Create the pairs
+    pairs = []
+    paired_together = set()  # Track pairs to avoid duplicates
+
+    for i in range(0, len(mol_indices), 2):
+        if i + 1 >= len(mol_indices):
+            break
+
+        idx1 = mol_indices[i]
+        idx2 = mol_indices[i+1]
+
+        # Skip if same molecule or already paired
+        pair_key = tuple(sorted([idx1, idx2]))
+        if idx1 == idx2 or pair_key in paired_together:
             continue
 
-        mol1, smiles1 = mol_smiles_map[i]
-        fp1 = fingerprints[i]
+        paired_together.add(pair_key)
 
-        # Calculate similarities in batches
-        batch_size = 1000000
-        # Only consider molecules that haven't reached their pair limit
-        remaining_indices = [j for j in indices if j > i and molecule_pair_counts[j] < max_pairs_per_molecule]
+        mol1, smiles1 = molecules[idx1]
+        mol2, smiles2 = molecules[idx2]
 
-        for batch_start in range(0, len(remaining_indices), batch_size):
-            batch_indices = remaining_indices[batch_start:batch_start + batch_size]
+        # # Create kekulized copies
+        # mol1_kekulized = Chem.Mol(mol1)
+        # mol2_kekulized = Chem.Mol(mol2)
 
-            # Use bulk similarity calculation
-            batch_fps = [fingerprints[j] for j in batch_indices]
+        try:
+            Chem.Kekulize(mol1, clearAromaticFlags=True)
+            Chem.Kekulize(mol2, clearAromaticFlags=True)
 
-            # Calculate similarities for the batch
-            similarities = DataStructs.BulkTanimotoSimilarity(fp1, batch_fps)
+            # # Get canonical SMILES of kekulized molecules
+            # smiles1 = Chem.MolToSmiles(mol1, canonical=True)
+            # smiles2 = Chem.MolToSmiles(mol2, canonical=True)
 
-            # Find matches in the right similarity range
-            for k, sim in enumerate(similarities):
-                if similarity_lower <= sim <= similarity_upper:
-                    j = batch_indices[k]
+            # Store the pair
+            pairs.append((mol1, mol2, smiles1, smiles2))
 
-                    # Double-check that neither molecule has reached its limit
-                    # (could happen if another batch just paired it)
-                    if (molecule_pair_counts[i] >= max_pairs_per_molecule or
-                            molecule_pair_counts[j] >= max_pairs_per_molecule):
-                        continue
+        except Exception as e:
+            print(f"Warning: Failed to kekulize molecule pair: {e}")
+            continue
 
-                    mol2, smiles2 = mol_smiles_map[j]
-
-                    pairs.append((mol1, mol2, sim))
-                    molecule_pair_counts[i] += 1
-                    molecule_pair_counts[j] += 1
-                    pbar.update(1)
-
-                    # Check if we've crossed a checkpoint milestone (every 5000 pairs)
-                    current_milestone = len(pairs) // 5000
-                    if current_milestone > prev_checkpoint_milestone:
-                        progress_data = {
-                            'pairs': pairs,
-                            'molecule_pair_counts': molecule_pair_counts,
-                            'processed_count': processed_count
-                        }
-                        with open(pairs_progress_checkpoint_path, "wb") as f:
-                            pickle.dump(progress_data, f)
-
-                        # Calculate statistics about molecule reuse
-                        used_molecules = sum(1 for count in molecule_pair_counts.values() if count > 0)
-                        max_reuse = max(molecule_pair_counts.values()) if molecule_pair_counts else 0
-                        avg_reuse = sum(molecule_pair_counts.values()) / used_molecules if used_molecules > 0 else 0
-
-                        print(
-                            f"\nCheckpoint saved at {len(pairs)} pairs: {processed_count}/{len(indices)} molecules processed")
-                        print(
-                            f"Molecules used: {used_molecules}, Max pairs per molecule: {max_reuse}, Avg pairs per molecule: {avg_reuse:.2f}")
-
-                        # Update the milestone
-                        prev_checkpoint_milestone = current_milestone
-
-                    if len(pairs) >= num_pairs:
-                        break
-
-                    # If this molecule has reached its limit, stop looking for more partners
-                    if molecule_pair_counts[i] >= max_pairs_per_molecule:
-                        break
-
-            if len(pairs) >= num_pairs or molecule_pair_counts[i] >= max_pairs_per_molecule:
-                break
-
-        # Update processed count
-        processed_count += 1
-
-    pbar.close()
     print(f"Created {len(pairs)} molecule pairs")
 
-    # Save final checkpoint
+    # Save the pairs
     with open(pairs_checkpoint_path, "wb") as f:
         pickle.dump(pairs, f)
     print(f"Saved molecule pairs to {pairs_checkpoint_path}")
@@ -391,54 +257,118 @@ def edge_match(edge1: Dict, edge2: Dict) -> bool:
     return edge1['bond_type'] == edge2['bond_type']
 
 
-def calculate_edit_path(mol1: Chem.Mol, mol2: Chem.Mol) -> List[Tuple[str, Any, Any]]:
+def calculate_edit_path(mol1: Chem.Mol, mol2: Chem.Mol) -> List[dict]:
     """
-    Calculate the edit path between two molecules using Graph Edit Distance.
+    Calculate a chemically meaningful edit path between molecules with full chemical details.
 
     Args:
         mol1: Source molecule
         mol2: Target molecule
 
     Returns:
-        Edit path as a list of (operation, source, target) tuples
+        List of operation dictionaries with complete chemical information
     """
-    # Convert molecules to NetworkX graphs
     graph1 = mol_to_nx_graph(mol1)
     graph2 = mol_to_nx_graph(mol2)
 
-    # Get the edit path directly using optimize_edit_paths
+    # Get raw edit path
     path_generator = nx.optimize_edit_paths(
         graph1, graph2,
         node_match=node_match,
         edge_match=edge_match
     )
-
-    # Take the first (optimal) path
     node_edit_path, edge_edit_path, cost = next(path_generator)
 
-    # Convert the path to a readable format
-    readable_path = []
+    # Enhanced chemical edit path
+    chemical_path = []
 
-    # Process node operations
+    # Process node operations with chemical details
     for u, v in node_edit_path:
-        if u is None:  # Node insertion (v was inserted)
-            readable_path.append(('insert_node', None, v))
-        elif v is None:  # Node deletion (u was deleted)
-            readable_path.append(('delete_node', u, None))
+        if u is None:  # Node insertion
+            atom_props = graph2.nodes[v]
+            chemical_path.append({
+                'operation': 'insert_node',
+                'target_idx': v,
+                'element': atom_props['atomic_num'],
+                'charge': atom_props.get('formal_charge', 0),
+                'chiral_tag': atom_props.get('chiral_tag', 0)
+            })
+        elif v is None:  # Node deletion
+            atom_props = graph1.nodes[u]
+            chemical_path.append({
+                'operation': 'delete_node',
+                'source_idx': u,
+                'element': atom_props['atomic_num'],
+                'charge': atom_props.get('formal_charge', 0),
+                'chiral_tag': atom_props.get('chiral_tag', 0)
+            })
         elif not node_match(graph1.nodes[u], graph2.nodes[v]):  # Node substitution
-            readable_path.append(('substitute_node', u, v))
+            source_props = graph1.nodes[u]
+            target_props = graph2.nodes[v]
+            chemical_path.append({
+                'operation': 'substitute_node',
+                'source_idx': u,
+                'target_idx': v,
+                'from_element': source_props['atomic_num'],
+                'to_element': target_props['atomic_num'],
+                'from_charge': source_props.get('formal_charge', 0),
+                'to_charge': target_props.get('formal_charge', 0),
+                'from_chiral': source_props.get('chiral_tag', 0),
+                'to_chiral': target_props.get('chiral_tag', 0)
+            })
 
-    # Process edge operations
+    # Process edge operations with bond chemistry details
     for edge1, edge2 in edge_edit_path:
         if edge1 is None:  # Edge insertion
-            readable_path.append(('insert_edge', None, edge2))
+            u, v = edge2
+            bond_props = graph2.edges[edge2]
+            chemical_path.append({
+                'operation': 'insert_edge',
+                'atom1_idx': u,
+                'atom2_idx': v,
+                'bond_type': bond_props['bond_type'],
+                'bond_name': str(Chem.BondType.values[bond_props['bond_type']])
+            })
         elif edge2 is None:  # Edge deletion
-            readable_path.append(('delete_edge', edge1, None))
-        else:  # Edge might be substituted (if attributes don't match)
-            if not edge_match(graph1.edges[edge1], graph2.edges[edge2]):
-                readable_path.append(('substitute_edge', edge1, edge2))
+            u, v = edge1
+            bond_props = graph1.edges[edge1]
+            chemical_path.append({
+                'operation': 'delete_edge',
+                'atom1_idx': u,
+                'atom2_idx': v,
+                'bond_type': bond_props['bond_type'],
+                'bond_name': str(Chem.BondType.values[bond_props['bond_type']])
+            })
+        else:  # Edge substitution
+            u1, v1 = edge1
+            u2, v2 = edge2
+            bond1_props = graph1.edges[edge1]
+            bond2_props = graph2.edges[edge2]
 
-    return readable_path
+            if not edge_match(bond1_props, bond2_props):
+                chemical_path.append({
+                    'operation': 'substitute_edge',
+                    'source_atom1': u1,
+                    'source_atom2': v1,
+                    'target_atom1': u2,
+                    'target_atom2': v2,
+                    'from_bond_type': bond1_props['bond_type'],
+                    'to_bond_type': bond2_props['bond_type'],
+                    'from_bond_name': str(Chem.BondType.values[bond1_props['bond_type']]),
+                    'to_bond_name': str(Chem.BondType.values[bond2_props['bond_type']])
+                })
+
+    # Add molecule-level metadata to help with mapping to action space
+    chemical_path.append({
+        'operation': 'metadata',
+        'source_num_atoms': mol1.GetNumAtoms(),
+        'target_num_atoms': mol2.GetNumAtoms(),
+        'source_smiles': Chem.MolToSmiles(mol1),
+        'target_smiles': Chem.MolToSmiles(mol2),
+        'edit_distance': cost
+    })
+
+    return chemical_path
 
 
 def main():
@@ -477,21 +407,18 @@ def main():
     # 1. Load molecules
     molecules = load_and_filter_molecules("./data/chembl/chembl_train_filtered.smiles")
 
-    # 2. Create molecule pairs
+    # 2. Create molecule pairs - already kekulized with canonical SMILES
     pairs = create_molecule_pairs(molecules)
 
     # 3. Calculate GED and edit paths for each pair
     print("Calculating Graph Edit Distances and edit paths")
-    pairs_to_process = []
-    for mol1, mol2, similarity in pairs:
-        smiles1 = Chem.MolToSmiles(mol1)
-        smiles2 = Chem.MolToSmiles(mol2)
-        if (smiles1, smiles2) not in processed_pairs:
-            pairs_to_process.append((mol1, mol2, similarity, smiles1, smiles2))
+    print(f"Processing {len(pairs)} molecule pairs")
 
-    print(f"Processing {len(pairs_to_process)} remaining pairs")
+    for i, (mol1, mol2, smiles1, smiles2) in enumerate(tqdm(pairs)):
+        # Skip already processed pairs
+        if (smiles1, smiles2) in processed_pairs:
+            continue
 
-    for i, (mol1, mol2, similarity, smiles1, smiles2) in enumerate(tqdm(pairs_to_process)):
         try:
             edit_path = calculate_edit_path(mol1, mol2)
 
@@ -499,7 +426,6 @@ def main():
             transformation = {
                 'source_smiles': smiles1,
                 'target_smiles': smiles2,
-                'similarity': similarity,
                 'edit_path': edit_path
             }
             transformation_data.append(transformation)
@@ -517,38 +443,8 @@ def main():
     with open(final_output_path, "wb") as f:
         pickle.dump(transformation_data, f)
 
-    # Also save final checkpoint
-    with open(transformation_checkpoint_path, "wb") as f:
-        pickle.dump(transformation_data, f)
-
     print(f"Saved {len(transformation_data)} transformations to {final_output_path}")
     print(f"Total processing time: {time.time() - start_time:.2f} seconds")
-
-    # Load and display transformation data
-    print("\n===== Viewing Sample Transformation Data =====")
-    try:
-        # Load the transformation data if we don't already have it
-        if not transformation_data:
-            with open(final_output_path, "rb") as f:
-                transformation_data = pickle.load(f)
-
-        # Display 10 samples (or fewer if we have less than 10)
-        sample_size = min(10, len(transformation_data))
-        print(f"\nShowing {sample_size} sample transformations:")
-
-        for i, transform in enumerate(transformation_data[:sample_size]):
-            print(f"\n[{i + 1}] Source → Target (similarity: {transform['similarity']:.3f})")
-            print(f"Source SMILES: {transform['source_smiles']}")
-            print(f"Target SMILES: {transform['target_smiles']}")
-
-            # Print first 5 edit operations (or all if fewer than 5)
-            print("Edit sequence (first 5 operations):")
-            for j, operation in enumerate(transform['edit_path']):
-                print(f"  {j + 1}. {operation[0]}: {operation[1]} → {operation[2]}")
-                print(f"Total number of operations: {len(transform['edit_path'])})")
-
-    except Exception as e:
-        print(f"Error displaying transformation data: {e}")
 
 
 if __name__ == "__main__":

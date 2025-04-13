@@ -11,6 +11,7 @@ import random
 import numpy as np
 import networkx as nx
 from rdkit import Chem, RDLogger
+from rdkit.Chem import rdmolfiles, rdmolops
 from tqdm import tqdm
 from typing import List, Tuple, Dict
 from datetime import datetime
@@ -73,20 +74,19 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS) -> List[Tup
                 continue
 
             mol = Chem.MolFromSmiles(smiles)
+
             if mol is None:
                 continue
 
-            try:
-                Chem.SanitizeMol(mol)
-                canonical_smiles = Chem.CanonSmiles(Chem.MolToSmiles(mol))
-                order = Chem.CanonicalRankAtoms(mol, inclueChirality=True)
-                # enforce canonical atom ordering
-                mol = Chem.RenumberAtoms(mol, order)
+            Chem.SanitizeMol(mol)
+            canonical_smiles = Chem.CanonSmiles(Chem.MolToSmiles(mol))
+            order = rdmolfiles.CanonicalRankAtoms(mol)
+            # enforce canonical atom ordering
+            mol = rdmolops.RenumberAtoms(mol, order)
 
-                if mol.GetNumAtoms() <= max_atoms:
-                    molecules.append((mol, canonical_smiles))
-            except:
-                continue
+            if mol.GetNumAtoms() <= max_atoms:
+                molecules.append((mol, canonical_smiles))
+            # print(len(molecules))
 
     print(f"Loaded {len(molecules)} valid molecules with ≤{max_atoms} atoms")
 
@@ -444,6 +444,7 @@ def process_dataset(datatype):
                 with open(transformation_checkpoint_path, "wb") as f:
                     pickle.dump(transformation_data, f)
                 print(f"Checkpoint saved after {len(transformation_data)} transformations")
+                # print(transformation)
 
         except Exception as e:
             print(f"Error processing {datatype} pair ({smiles1}, {smiles2}): {str(e)}")

@@ -79,10 +79,12 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS) -> List[Tup
                 continue
 
             Chem.SanitizeMol(mol)
-            canonical_smiles = Chem.CanonSmiles(Chem.MolToSmiles(mol))
-            order = rdmolfiles.CanonicalRankAtoms(mol)
+            # Chem.Kekulize(mol, clearAromaticFlags=True)
+            # canonical_smiles = Chem.CanonSmiles(Chem.MolToSmiles(mol))
+            # order = rdmolfiles.CanonicalRankAtoms(mol)
             # enforce canonical atom ordering
-            mol = rdmolops.RenumberAtoms(mol, order)
+            # mol = rdmolops.RenumberAtoms(mol, order)
+            canonical_smiles = Chem.MolToSmiles(mol, canonical=True)
 
             if mol.GetNumAtoms() <= max_atoms:
                 molecules.append((mol, canonical_smiles))
@@ -170,7 +172,8 @@ def create_molecule_pairs(molecules: List[Tuple[Chem.Mol, str]], datatype: str) 
     for i in range(0, len(mol_indices), 2):
         if i + 1 >= len(mol_indices):
             break
-
+        if i % 1000 == 0:
+            print(f"Processing pair {i//2 + 1}/{num_pairs}...")
         idx1 = mol_indices[i]
         idx2 = mol_indices[i+1]
 
@@ -185,22 +188,26 @@ def create_molecule_pairs(molecules: List[Tuple[Chem.Mol, str]], datatype: str) 
         mol2, smiles2 = molecules[idx2]
 
         try:
-            # # Create kekulized copies
-            # mol1_kekulized = Chem.Mol(mol1)
-            # mol2_kekulized = Chem.Mol(mol2)
+            Chem.SanitizeMol(mol1)
+            Chem.SanitizeMol(mol2)
 
             Chem.Kekulize(mol1, clearAromaticFlags=True)
             Chem.Kekulize(mol2, clearAromaticFlags=True)
 
-            # # Get canonical SMILES of kekulized molecules
-            # smiles1_kek = Chem.MolToSmiles(mol1_kekulized, canonical=True)
-            # smiles2_kek = Chem.MolToSmiles(mol2_kekulized, canonical=True)
+            mol1 = rdmolops.RenumberAtoms(mol1, rdmolfiles.CanonicalRankAtoms(mol1))
+            mol2 = rdmolops.RenumberAtoms(mol2, rdmolfiles.CanonicalRankAtoms(mol2))
 
-            # Store the pair
-            pairs.append((mol1, mol2, smiles1, smiles2))
+            # --- Generate SMILES AFTER Kekulization ---
+            smiles1_kek = Chem.MolToSmiles(mol1, canonical=True)
+            smiles2_kek = Chem.MolToSmiles(mol2, canonical=True)
+            # ---
+
+            # Store the pair with kekulized SMILES
+            # Note: mol1/mol2 are already the kekulized objects
+            pairs.append((mol1, mol2, smiles1_kek, smiles2_kek))  # Use kekulized SMILES
 
         except Exception as e:
-            print(f"Warning: Failed to kekulize molecule pair: {e}")
+            print(f"Warning: Failed to kekulize/get SMILES for molecule pair: {e}")
             continue
 
     print(f"Created {len(pairs)} {datatype} molecule pairs")

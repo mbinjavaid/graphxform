@@ -1,14 +1,17 @@
+# -*- coding: utf-8 -*-
 """
 GED to MoleculeDesign Mapping - Graph-based efficient fragmentation strategy.
-Version: 2025-04-16 14:57:00 UTC (Fix Level 3 action mapping)
+Version: 2025-04-18 01:41:50 UTC (Strict Sanitization)
 """
 import pickle
 import os
 import numpy as np
+from rdkit.Chem import Draw
 from rdkit import Chem, RDLogger
 from rdkit.Chem import rdmolfiles, rdmolops, AllChem
 from collections import defaultdict, deque
 import datetime # For timestamp
+from tqdm import tqdm # Added tqdm for main loop
 
 # --- User Info ---
 CURRENT_USER = "mbinjavaid"
@@ -22,6 +25,7 @@ RDLogger.DisableLog('rdApp.*')
 CHECKPOINT_DIR = "./data/chembl/checkpoints"
 DEBUG = True
 MAX_TRANSFORMATIONS = 100
+CHECKPOINT_FREQUENCY = 100 # Lowered for testing, adjust as needed
 
 
 def log_message(message):
@@ -66,12 +70,26 @@ def load_transformation_data(datatype="train"):
         checkpoint_files.sort(reverse=True)
         latest_checkpoint = os.path.join(CHECKPOINT_DIR, checkpoint_files[0])
         log_message(f"Loading from checkpoint: {latest_checkpoint}")
-        with open(latest_checkpoint, "rb") as f:
-            transformation_data = pickle.load(f)
-        log_message(f"Loaded {len(transformation_data)} transformations")
-        return transformation_data[:MAX_TRANSFORMATIONS]
+        try: # Added try-except for loading
+            with open(latest_checkpoint, "rb") as f:
+                # Assuming checkpoint stores full transformation dicts including edit paths
+                transformation_data = pickle.load(f)
+            log_message(f"Loaded {len(transformation_data)} transformations from checkpoint")
+            # Return only the raw data needed (smiles, edit_path)
+            processed_data = [{'source_smiles': t['source_smiles'],
+                               'target_smiles': t['target_smiles'],
+                               'edit_path': t['edit_path']}
+                              for t in transformation_data if 'edit_path' in t] # Ensure edit_path exists
+            return processed_data[:MAX_TRANSFORMATIONS]
+        except Exception as e:
+            log_message(f"ERROR loading checkpoint {latest_checkpoint}: {e}. Loading from scratch if possible.")
+            # Fall through to load from original file if checkpoint fails
 
-    log_message(f"No transformation data found for {datatype}")
+    # If no checkpoint or checkpoint failed, load from original (assuming this logic exists elsewhere or is added)
+    # Placeholder: Assuming you have a function like `load_raw_data(datatype)`
+    # raw_data = load_raw_data(datatype)
+    # return raw_data[:MAX_TRANSFORMATIONS]
+    log_message(f"No usable transformation data checkpoint found for {datatype}. Need raw data source.")
     return []
 
 
@@ -79,17 +97,27 @@ def categorize_operations(edit_path):
     """Categorize GED operations by type."""
     log_message("Categorizing GED operations...")
     metadata = None
-    for i, op in enumerate(edit_path):
-        if op['operation'] == 'metadata':
-            metadata = op
-            edit_path = edit_path[:i]
-            break
+    clean_edit_path = [] # Use a new list to avoid modifying original
 
-    edit_path = edit_path or []
+    if not edit_path: # Handle empty edit_path
+        log_message("Warning: Empty edit path provided.")
+        return {'metadata': None, 'substitutions': [], 'deletions': [],
+                'insertions': [], 'edge_operations': [], 'raw_edit_path': []}
+
+    for i, op in enumerate(edit_path):
+        if isinstance(op, dict) and op.get('operation') == 'metadata':
+            metadata = op
+            # Don't modify the original edit_path, just stop iterating here for categorization
+            break
+        elif isinstance(op, dict): # Ensure op is a dict before proceeding
+             clean_edit_path.append(op)
+        else:
+             log_message(f"Warning: Non-dict item found in edit path at index {i}: {op}. Skipping.")
+
 
     substitutions, deletions, insertions, edge_operations = [], [], [], []
 
-    for op in edit_path:
+    for op in clean_edit_path: # Iterate over the cleaned path
         op_type = op.get('operation')
         if op_type == 'substitute_node': substitutions.append(op)
         elif op_type == 'delete_node': deletions.append(op)
@@ -103,7 +131,7 @@ def categorize_operations(edit_path):
 
     return {
         'metadata': metadata, 'substitutions': substitutions, 'deletions': deletions,
-        'insertions': insertions, 'edge_operations': edge_operations
+        'insertions': insertions, 'edge_operations': edge_operations, 'raw_edit_path': edit_path # Keep original path if needed
     }
 
 
@@ -131,10 +159,15 @@ def build_atom_fate_map(operations, source_mol, target_mol):
             if target_idx is not None: source_to_target[source_idx] = target_idx
             log_message(f"Atom {source_idx} -> {target_idx if target_idx is not None else '?'} (substituted {from_element_num_str} -> {to_element_num_str})")
 
+    # Infer remaining atoms as kept
     for i in range(num_atoms_source):
         if atom_fate[i] == "unknown":
             atom_fate[i] = "kept"
-            log_message(f"Atom {i} implicitly kept but target index unknown (needs inference)")
+            # Find corresponding target index if possible (simple case: not deleted, not substituted)
+            # More complex inference might be needed if GED path is minimal
+            # For now, just mark as kept
+            log_message(f"Atom {i} implicitly kept")
+
 
     kept_count = sum(1 for fate in atom_fate.values() if fate == "kept")
     doomed_count = sum(1 for fate in atom_fate.values() if fate == "doomed")
@@ -173,37 +206,44 @@ def analyze_graph_structure(source_mol, atom_fate, operations):
                     if v not in visited and atom_fate.get(v) == "kept": q.append(v)
             if component: kept_components.append(component)
 
-    # Find initial Doomed Fragments
+    # Find initial Doomed Fragments based on explicit deletions and connectivity
     visited_doomed = set()
     for i in range(num_atoms):
         if atom_fate.get(i) == "doomed" and i not in visited_doomed:
             component, q = set(), deque([i])
             while q:
                 u = q.popleft()
+                # Only traverse through other doomed atoms
                 if u in visited_doomed or atom_fate.get(u) != "doomed": continue
                 visited_doomed.add(u); component.add(u)
                 for v in adj.get(u, []):
+                     # Only add neighbors that are also doomed to the queue
                     if v not in visited_doomed and atom_fate.get(v) == "doomed": q.append(v)
             if component: doomed_fragments.append(component)
+
 
     log_message(f"Identified {len(kept_components)} Kept Components (Sizes: {[len(c) for c in kept_components]}).")
     log_message(f"Identified {len(doomed_fragments)} initial Doomed Fragments (Sizes: {[len(f) for f in doomed_fragments]}).")
 
+    # Identify single doomed atoms attached only to kept atoms (form their own fragment)
     critically_attached_single_doomed = set()
     all_doomed_in_fragments = set().union(*doomed_fragments) if doomed_fragments else set()
     for i in range(num_atoms):
         if atom_fate.get(i) == "doomed" and i not in all_doomed_in_fragments:
             neighbors = adj.get(i, [])
             neighbor_fates = [atom_fate.get(n) for n in neighbors]
+            # Check if it has neighbors AND all neighbors are 'kept'
             if neighbors and all(fate == "kept" for fate in neighbor_fates):
                 critically_attached_single_doomed.add(i)
     if critically_attached_single_doomed:
         log_message(f"Identified {len(critically_attached_single_doomed)} single doomed atoms connected only to Kept components: {critically_attached_single_doomed}")
-        for idx in critically_attached_single_doomed: doomed_fragments.append({idx})
+        for idx in critically_attached_single_doomed: doomed_fragments.append({idx}) # Add as single-atom fragments
         log_message(f"Total Doomed Fragments (including singles): {len(doomed_fragments)}")
+
 
     all_kept_atoms = set().union(*kept_components) if kept_components else set()
 
+    # Identify critical bonds (kept <-> doomed) based on atom fate and doomed fragments
     critical_bonds = []
     delete_edge_ops = [op for op in operations.get('edge_operations', []) if op.get('operation') == 'delete_edge']
     for op in delete_edge_ops:
@@ -214,23 +254,29 @@ def analyze_graph_structure(source_mol, atom_fate, operations):
         if (fate1 == "kept" and fate2 == "doomed") or (fate1 == "doomed" and fate2 == "kept"):
             kept_atom = a1 if fate1 == "kept" else a2
             doomed_atom = a1 if fate1 == "doomed" else a2
+            # Check if the doomed atom belongs to one of the identified doomed fragments
             fragment_involved = next((frag for frag in doomed_fragments if doomed_atom in frag), None)
             kept_component_involved = next((comp for comp in kept_components if kept_atom in comp), None)
 
+            # Only consider it critical if the doomed atom is part of a defined doomed fragment
             if fragment_involved is not None:
                  critical_bonds.append({
                      'bond': tuple(sorted((a1, a2))), 'kept_atom': kept_atom, 'doomed_atom': doomed_atom,
-                     'doomed_fragment': fragment_involved, 'kept_component': kept_component_involved, 'original_op': op
+                     'doomed_fragment': fragment_involved, # The specific fragment
+                     'kept_component': kept_component_involved, # Can be None if kept atom isolated? Unlikely.
+                     'original_op': op
                  })
 
-    log_message(f"Identified {len(critical_bonds)} critical bonds connecting Kept/Doomed components.")
+    log_message(f"Identified {len(critical_bonds)} critical bonds connecting Kept atoms to identified Doomed fragments.")
 
+    # Identify internal kept deletions (kept <-> kept)
     internal_kept_deletions = []
     critical_bond_keys = {cb['bond'] for cb in critical_bonds}
     for op in delete_edge_ops:
          a1, a2 = op.get('atom1_idx'), op.get('atom2_idx')
          if a1 is None or a2 is None or not (0 <= a1 < num_atoms and 0 <= a2 < num_atoms): continue
          bond_key = tuple(sorted((a1, a2)))
+         # Ensure both atoms are marked as 'kept' AND this bond wasn't already classified as critical
          if atom_fate.get(a1) == "kept" and atom_fate.get(a2) == "kept" and bond_key not in critical_bond_keys:
              internal_kept_deletions.append(op)
 
@@ -244,104 +290,162 @@ def analyze_graph_structure(source_mol, atom_fate, operations):
 
 def analyze_fragment(fragment_indices, atom_fate):
     """Analyze a fragment based on atom fates (indices only)."""
-    if not hasattr(fragment_indices, '__iter__'): return {"kept_count": 0, "should_discard": True}
+    if not hasattr(fragment_indices, '__iter__') or not fragment_indices: # Check if iterable and not empty
+        return {"kept_count": 0, "should_discard": True} # Empty fragment should be discarded
     kept_count = sum(1 for idx in fragment_indices if atom_fate.get(idx) == "kept")
     return {"kept_count": kept_count, "should_discard": kept_count == 0}
 
 
+# ==============================================================================
+# START OF MODIFIED analyze_bond_removals_efficient
+# ==============================================================================
 def analyze_bond_removals_efficient(graph_analysis, source_mol, fate_info, operations):
-    """Analyzes bond removals. Failed criticals treated as internal."""
-    log_message("\n=== Analyzing Bond Removals (Efficient Strategy) ===")
+    """
+    Analyzes bond removals. Focuses on the split component for L3 actions.
+    Stops analysis for the entire pair if sanitization fails at any step.
+    """
+    log_message("\n=== Analyzing Bond Removals (Strict Sanitization Strategy) ===")
     critical_bonds = graph_analysis.get('critical_bonds', [])
     internal_kept_deletions = graph_analysis.get('internal_kept_deletions', [])
     atom_fate = fate_info.get('atom_fate', {})
     bond_analyses, processed_bond_keys = [], set()
-    working_mol = Chem.Mol(source_mol)
+    working_mol = Chem.Mol(source_mol) # Start with a copy
 
     log_message(f"\n--- Processing {len(critical_bonds)} Critical Bonds ---")
     for i, cb_info in enumerate(critical_bonds):
         op, bond_key = cb_info['original_op'], cb_info['bond']
         atom1_idx, atom2_idx = bond_key
+        kept_atom_idx = cb_info.get('kept_atom')
         original_doomed_atom = cb_info.get('doomed_atom')
 
-        if bond_key in processed_bond_keys or original_doomed_atom is None: continue
-        log_message(f"\nCritical Bond {i + 1}: atoms {atom1_idx}-{atom2_idx} (Targeting doomed {original_doomed_atom})")
+        if bond_key in processed_bond_keys or original_doomed_atom is None or kept_atom_idx is None: continue
+        log_message(f"\nCritical Bond {i + 1}: atoms {atom1_idx}-{atom2_idx} (Kept: {kept_atom_idx}, Doomed: {original_doomed_atom})")
 
         bond = working_mol.GetBondBetweenAtoms(atom1_idx, atom2_idx)
-        if bond is None: log_message(f"  WARNING: Bond {bond_key} not found. Skipping."); continue
+        if bond is None:
+            atom1_exists = working_mol.GetAtomWithIdx(atom1_idx) is not None
+            atom2_exists = working_mol.GetAtomWithIdx(atom2_idx) is not None
+            reason = "Unknown"
+            if not atom1_exists: reason = f"Atom {atom1_idx} no longer exists"
+            elif not atom2_exists: reason = f"Atom {atom2_idx} no longer exists"
+            else: reason = "Bond between existing atoms not found"
+            log_message(f"  WARNING: Bond {bond_key} not found in working_mol. Reason: {reason}. Skipping this bond op (pair might still be processed).")
+            continue # Skip this specific bond, but don't fail the whole pair yet
 
-        # --- Store previous component count ---
-        prev_components = []
-        try: prev_components = Chem.GetMolFrags(working_mol, asMols=False, sanitizeFrags=False)
-        except Exception as e: log_message(f"  ERROR: GetMolFrags failed BEFORE critical removal: {e}. Skipping."); continue
+        # --- Identify Original Component ---
+        original_component_indices = None
+        prev_global_components_indices = []
+        try:
+            prev_global_components_indices = Chem.GetMolFrags(working_mol, asMols=False, sanitizeFrags=False)
+            for comp in prev_global_components_indices:
+                 if kept_atom_idx in comp:
+                      original_component_indices = set(comp)
+                      log_message(f"  Bond is within original component of size {len(original_component_indices)}")
+                      break
+        except Exception as e:
+            log_message(f"  ERROR: GetMolFrags failed BEFORE critical removal: {e}. Skipping analysis for this transformation pair.")
+            return None # FATAL for pair
+
+        if original_component_indices is None:
+             log_message(f"  ERROR: Could not find original component containing atom {kept_atom_idx}. Skipping analysis for this transformation pair.")
+             return None # FATAL for pair
         # ---
 
+        # --- Simulate removal ---
         rwmol = Chem.RWMol(working_mol)
         rwmol.RemoveBond(atom1_idx, atom2_idx)
         modified_mol = None
-        try: Chem.SanitizeMol(rwmol); modified_mol = Chem.Mol(rwmol)
-        except Exception as e: log_message(f"  WARNING: Sanitization failed: {e}. Proceeding unsanitized."); modified_mol = rwmol.GetMol()
-        if modified_mol is None: log_message(f"  ERROR: Mol creation failed. Skipping."); continue
+        try:
+            # kekulize rwmol:
+            Chem.Kekulize(rwmol, clearAromaticFlags=True) # Clear aromatic flags to avoid issues
+            Chem.SanitizeMol(rwmol) # Attempt sanitization
+            modified_mol = Chem.Mol(rwmol) # Convert if sanitization succeeded
+        except Exception as e:
+            # --- STRICT CHANGE HERE (Critical Bonds) ---
+            log_message(f"  FATAL: Sanitization failed after critical bond {bond_key} removal: {e}. Skipping analysis for this transformation pair.")
+            return None # Indicate failure for this pair
+            # --- END STRICT CHANGE ---
 
-        new_components = []
-        try: new_components = Chem.GetMolFrags(modified_mol, asMols=False, sanitizeFrags=False)
-        except Exception as e: log_message(f"  ERROR: GetMolFrags failed AFTER critical removal: {e}. Skipping analysis."); working_mol = modified_mol; processed_bond_keys.add(bond_key); continue
-        log_message(f"  After removal, molecule has {len(new_components)} components (previously {len(prev_components)}).")
+        if modified_mol is None:
+             # This case might be reached if SanitizeMol raises error but doesn't return None explicitly? Unlikely but safe check.
+             log_message(f"  ERROR: Mol creation failed unexpectedly after removal (bond {bond_key}). Skipping analysis for this transformation pair.")
+             return None # FATAL for pair
+        # --- End Simulate removal ---
 
-        doomed_frag_num, identified_doomed_indices = -1, set()
-        for frag_idx, frag_comp in enumerate(new_components):
-            if frag_comp and hasattr(frag_comp, '__iter__') and original_doomed_atom in frag_comp:
-                doomed_frag_num, identified_doomed_indices = frag_idx, set(frag_comp)
-                log_message(f"  Identified Component {frag_idx} (Size: {len(frag_comp)}) contains doomed atom {original_doomed_atom}.")
-                break
 
-        analysis_added = False
-        if doomed_frag_num != -1:
-            frag_analysis = analyze_fragment(identified_doomed_indices, atom_fate)
-            if frag_analysis['should_discard']: # SUCCESS - Attempt to map to env actions 0 or 1
-                env_level3_action = -1 # Default invalid action
-                # --- Check if exactly two fragments resulted ---
-                if len(new_components) == len(prev_components) + 1 and len(new_components) == 2:
-                    if doomed_frag_num == 0:
-                        env_level3_action = 1 # Keep fragment 1
-                        log_message(f"  Verified fragment {doomed_frag_num} is purely doomed. Level 3 Env Action: {env_level3_action} (Keep Fragment 1)")
-                    elif doomed_frag_num == 1:
-                        env_level3_action = 0 # Keep fragment 0
-                        log_message(f"  Verified fragment {doomed_frag_num} is purely doomed. Level 3 Env Action: {env_level3_action} (Keep Fragment 0)")
-                    else: # Should not happen if doomed_frag_num is 0 or 1 and len is 2
-                         log_message(f"  ERROR: doomed_frag_num ({doomed_frag_num}) out of range for 2 fragments. Defaulting to keep both (Action 2).")
-                         env_level3_action = 2
+        # --- Analyze fragments AFTER removal ---
+        new_global_components_indices = []
+        try:
+            new_global_components_indices = Chem.GetMolFrags(modified_mol, asMols=False, sanitizeFrags=False)
+            log_message(f"  After removal, molecule has {len(new_global_components_indices)} global components (previously {len(prev_global_components_indices)}).")
+        except Exception as e:
+            log_message(f"  ERROR: GetMolFrags failed AFTER critical removal: {e}. Skipping analysis for this transformation pair.")
+            return None # FATAL for pair
+        # ---
+
+        # --- Identify Derived Fragments and the Doomed One ---
+        derived_components = []
+        derived_doomed_component_indices = None
+        derived_doomed_component_global_idx = -1
+
+        for global_idx, new_comp_indices_tuple in enumerate(new_global_components_indices):
+            new_comp_set = set(new_comp_indices_tuple)
+            if new_comp_set.issubset(original_component_indices):
+                derived_components.append({'global_idx': global_idx, 'indices': new_comp_set})
+                if original_doomed_atom in new_comp_set:
+                    derived_doomed_component_indices = new_comp_set
+                    derived_doomed_component_global_idx = global_idx
+                    log_message(f"  Found derived component {global_idx} (size {len(new_comp_set)}) containing doomed atom {original_doomed_atom}.")
+
+        log_message(f"  Identified {len(derived_components)} components derived from the original split component.")
+        # ---
+
+        # --- Determine Level 3 Action Based on Derived Components ---
+        env_level3_action = 2
+        analysis_type = 'internal_kept_core'
+        creates_fragments_flag = len(new_global_components_indices) > len(prev_global_components_indices)
+
+        if derived_doomed_component_indices is not None:
+            frag_analysis = analyze_fragment(derived_doomed_component_indices, atom_fate)
+            if len(derived_components) == 2 and frag_analysis['should_discard']:
+                analysis_type = 'critical_disconnection'
+                creates_fragments_flag = True
+                other_derived_comp_info = next((dc for dc in derived_components if dc['global_idx'] != derived_doomed_component_global_idx), None)
+
+                if other_derived_comp_info is not None:
+                    other_derived_comp_global_idx = other_derived_comp_info['global_idx']
+                    if derived_doomed_component_global_idx < other_derived_comp_global_idx:
+                         env_level3_action = 1
+                         log_message(f"  Clean split & discard verified. Doomed global index ({derived_doomed_component_global_idx}) < Other ({other_derived_comp_global_idx}). Level 3 Env Action: 1 (Keep Other)")
+                    else:
+                         env_level3_action = 0
+                         log_message(f"  Clean split & discard verified. Doomed global index ({derived_doomed_component_global_idx}) > Other ({other_derived_comp_global_idx}). Level 3 Env Action: 0 (Keep Other)")
                 else:
-                    log_message(f"  WARNING: Critical bond removal resulted in {len(new_components)} fragments (expected 2). Cannot map to specific discard action. Defaulting to keep both (Action 2).")
-                    env_level3_action = 2 # Fallback action
+                    log_message("  ERROR: Could not find the 'other' derived component despite clean split. Defaulting Level 3: Keep Both (Action 2).")
+                    env_level3_action = 2
+            else:
+                if len(derived_components) != 2:
+                     log_message(f"  Split was not clean (1 -> {len(derived_components)} derived components). Defaulting Level 3: Keep Both (Action 2).")
+                if not frag_analysis['should_discard']:
+                     log_message(f"  Doomed component {derived_doomed_component_global_idx} contains kept atoms ({frag_analysis['kept_count']}). Defaulting Level 3: Keep Both (Action 2).")
+                env_level3_action = 2
+        else:
+             log_message(f"  ERROR: Could not find derived component containing doomed atom {original_doomed_atom}. Defaulting Level 3: Keep Both (Action 2).")
+             env_level3_action = 2
+        # ---
 
-                if env_level3_action != -1: # Only proceed if we determined a valid action (0, 1, or 2)
-                    bond_analyses.append({
-                        'bond': bond_key,
-                        'type': 'critical_disconnection',
-                        'creates_fragments': True, # It created fragments, even if > 2
-                        'level3_action': env_level3_action, # STORE THE CORRECT ENV ACTION (0, 1, or 2)
-                        'original_op': op,
-                        'kept_atom': cb_info.get('kept_atom'),
-                        'doomed_atom': original_doomed_atom
-                    })
-                    analysis_added = True
-            else: # FAILED VERIFICATION (fragment contained kept atoms)
-                log_message(f"  ERROR: Component {doomed_frag_num} also has {frag_analysis['kept_count']} kept atoms. Treating as internal (keep both).")
-                # Treat as internal, level 3 action is 2
-                bond_analyses.append({'bond': bond_key, 'type': 'internal_kept_core', 'creates_fragments': True, 'level3_action': 2, 'original_op': op })
-                analysis_added = True
-        else: # Doomed atom not found in any fragment after removal
-             log_message(f"  ERROR: Could not find component containing doomed atom {original_doomed_atom}. Treating as internal (keep both).")
-             # Also treat as internal failure case, assume it didn't disconnect if we can't find the doomed atom fragment
-             bond_analyses.append({'bond': bond_key, 'type': 'internal_kept_core', 'creates_fragments': False, 'original_op': op })
-             analysis_added = True # Mark as processed anyway
+        # --- Append analysis and update state ---
+        bond_analyses.append({
+            'bond': bond_key, 'type': analysis_type, 'creates_fragments': creates_fragments_flag,
+            'level3_action': env_level3_action, 'original_op': op,
+            'kept_atom': kept_atom_idx, 'doomed_atom': original_doomed_atom
+        })
+        processed_bond_keys.add(bond_key)
+        working_mol = modified_mol # Update working mol for next iteration
+        # ---
 
-        if analysis_added: processed_bond_keys.add(bond_key)
-        working_mol = modified_mol
-
+    # --- Processing Internal Kept Core Bonds ---
     log_message(f"\n--- Processing {len(internal_kept_deletions)} initially classified Internal Kept Core Bonds ---")
-    # ... (rest of the function remains the same) ...
     for i, op in enumerate(internal_kept_deletions):
         atom1_idx, atom2_idx = op.get('atom1_idx'), op.get('atom2_idx')
         if atom1_idx is None or atom2_idx is None: continue
@@ -350,73 +454,97 @@ def analyze_bond_removals_efficient(graph_analysis, source_mol, fate_info, opera
         log_message(f"\nInternal Bond {i + 1}: atoms {atom1_idx}-{atom2_idx}")
 
         bond = working_mol.GetBondBetweenAtoms(atom1_idx, atom2_idx)
-        if bond is None: log_message(f"  WARNING: Bond {bond_key} not found. Skipping."); continue
+        if bond is None:
+            atom1_exists = working_mol.GetAtomWithIdx(atom1_idx) is not None
+            atom2_exists = working_mol.GetAtomWithIdx(atom2_idx) is not None
+            reason = "Unknown"
+            if not atom1_exists: reason = f"Atom {atom1_idx} no longer exists"
+            elif not atom2_exists: reason = f"Atom {atom2_idx} no longer exists"
+            else: reason = "Bond between existing atoms not found"
+            log_message(f"  WARNING: Bond {bond_key} not found in working_mol. Reason: {reason}. Skipping this bond op (pair might still be processed).")
+            continue # Skip this specific bond
 
-        prev_components = []
-        try: prev_components = Chem.GetMolFrags(working_mol, asMols=False, sanitizeFrags=False)
-        except Exception as e: log_message(f"  ERROR: GetMolFrags failed BEFORE internal removal: {e}. Skipping."); continue
+        # --- Identify Original Component ---
+        original_component_indices_internal = None
+        prev_global_components_indices_internal = []
+        try:
+            prev_global_components_indices_internal = Chem.GetMolFrags(working_mol, asMols=False, sanitizeFrags=False)
+            for comp in prev_global_components_indices_internal:
+                 if atom1_idx in comp:
+                      original_component_indices_internal = set(comp)
+                      break
+        except Exception as e:
+            log_message(f"  ERROR: GetMolFrags failed BEFORE internal removal: {e}. Skipping analysis for this transformation pair.")
+            return None # FATAL for pair
+        if original_component_indices_internal is None:
+            log_message(f"  ERROR: Could not find original component for internal bond {bond_key}. Skipping analysis for this transformation pair.")
+            return None # FATAL for pair
+        # ---
 
-        rwmol = Chem.RWMol(working_mol)
-        rwmol.RemoveBond(atom1_idx, atom2_idx)
-        modified_mol = None
-        try: Chem.SanitizeMol(rwmol); modified_mol = Chem.Mol(rwmol)
-        except Exception as e: log_message(f"  WARNING: Sanitization failed: {e}. Proceeding unsanitized."); modified_mol = rwmol.GetMol()
-        if modified_mol is None: log_message(f"  ERROR: Mol creation failed. Skipping."); continue
+        # --- Simulate removal ---
+        rwmol_internal = Chem.RWMol(working_mol)
+        rwmol_internal.RemoveBond(atom1_idx, atom2_idx)
+        modified_mol_internal = None
+        try:
+            Chem.SanitizeMol(rwmol_internal)
+            modified_mol_internal = Chem.Mol(rwmol_internal)
+        except Exception as e:
+            # --- STRICT CHANGE HERE (Internal Bonds) ---
+            log_message(f"  FATAL: Sanitization failed after internal bond {bond_key} removal: {e}. Skipping analysis for this transformation pair.")
+            return None # Indicate failure for this pair
+            # --- END STRICT CHANGE ---
+        if modified_mol_internal is None:
+             log_message(f"  ERROR: Mol creation failed unexpectedly after internal removal (bond {bond_key}). Skipping analysis for this transformation pair.")
+             return None # FATAL for pair
+        # ---
 
-        new_components = []
-        try: new_components = Chem.GetMolFrags(modified_mol, asMols=False, sanitizeFrags=False)
-        except Exception as e: log_message(f"  ERROR: GetMolFrags failed AFTER internal removal: {e}. Skipping analysis."); working_mol = modified_mol; processed_bond_keys.add(bond_key); continue
+        # --- Analyze fragments AFTER internal removal ---
+        new_global_components_indices_internal = []
+        try:
+            new_global_components_indices_internal = Chem.GetMolFrags(modified_mol_internal, asMols=False, sanitizeFrags=False)
+        except Exception as e:
+            log_message(f"  ERROR: GetMolFrags failed AFTER internal removal: {e}. Skipping analysis for this transformation pair.")
+            return None # FATAL for pair
+        # ---
 
-        analysis = {'bond': bond_key, 'type': 'internal_kept_core', 'creates_fragments': False, 'original_op': op}
-        if len(new_components) > len(prev_components):
-            analysis['creates_fragments'] = True
-            log_message("  Internal bond removal created fragments.")
-            level3_action = 2 # Default keep both for internal removals unless proven otherwise (though GED shouldn't specify discard here)
+        # --- Check if THIS component split cleanly ---
+        derived_components_internal = []
+        for global_idx, new_comp_indices_tuple in enumerate(new_global_components_indices_internal):
+            new_comp_set = set(new_comp_indices_tuple)
+            if new_comp_set.issubset(original_component_indices_internal):
+                derived_components_internal.append({'global_idx': global_idx, 'indices': new_comp_set})
 
-            # --- Refined check for internal fragment analysis (optional but safer) ---
-            # Generally, for 'internal_kept_core' based on GED, we expect to keep both parts
-            # unless the GED somehow implied a discard which would be unusual.
-            # Sticking with default action 2 for internal removals seems safest.
-            # The complex fragment analysis logic here might be unnecessary if we trust the initial classification.
-            # Keeping it for now, but simplifying to always use action 2 might be valid.
-            if len(new_components) == len(prev_components) + 1 and len(new_components) == 2:
-                 frag1_indices, frag2_indices = set(), set()
-                 found_frags = 0
-                 for frag_comp in new_components:
-                     if frag_comp and hasattr(frag_comp, '__iter__'):
-                         frag_set = set(frag_comp)
-                         if atom1_idx in frag_set or atom2_idx in frag_set:
-                             if found_frags == 0: frag1_indices = frag_set
-                             elif found_frags == 1: frag2_indices = frag_set
-                             found_frags += 1
+        analysis = {'bond': bond_key, 'type': 'internal_kept_core', 'creates_fragments': False, 'level3_action': -1, 'original_op': op}
+        if len(derived_components_internal) == 2:
+             analysis['creates_fragments'] = True
+             analysis['level3_action'] = 2
+             log_message(f"  Internal bond removal caused clean split (1 -> 2 derived). Level 3: Keep Both (Action 2).")
+        elif len(new_global_components_indices_internal) > len(prev_global_components_indices_internal):
+             analysis['creates_fragments'] = True
+             analysis['level3_action'] = 2
+             log_message(f"  Internal bond removal caused complex fragmentation ({len(prev_global_components_indices_internal)}->{len(new_global_components_indices_internal)} global). Level 3: Keep Both (Action 2).")
+        else:
+             log_message("  Internal bond removal did not create fragments.")
+        # ---
 
-                 if frag1_indices and frag2_indices:
-                     frag1_analysis = analyze_fragment(frag1_indices, atom_fate)
-                     frag2_analysis = analyze_fragment(frag2_indices, atom_fate)
-                     # Even if one fragment is purely doomed (which shouldn't happen for internal_kept_core),
-                     # the safest action based on 'internal' classification is likely 'keep both'.
-                     level3_action = 2 # Override based on 'internal' classification
-                     log_message(f"  Internal split into 2 fragments. Defaulting Level 3: keep both (Action {level3_action}).")
-                 else:
-                     log_message("  WARNING: Internal removal created 2 fragments, but couldn't identify them reliably. Defaulting Level 3: keep both (Action 2).")
-                     level3_action = 2
-            elif len(new_components) > len(prev_components): # More complex fragmentation
-                 log_message(f"  WARNING: Internal removal caused complex fragmentation ({len(prev_components)}->{len(new_components)}). Defaulting Level 3: keep both (Action 2).")
-                 level3_action = 2
-            # --- End refined check ---
-
-            analysis['level3_action'] = level3_action
-        else: log_message("  Internal bond removal did not create fragments.")
-
+        # --- Append analysis and update state ---
         bond_analyses.append(analysis)
         processed_bond_keys.add(bond_key)
-        working_mol = modified_mol
+        working_mol = modified_mol_internal # Update working mol
+        # ---
 
-    all_delete_ops = [tuple(sorted((op.get('atom1_idx'), op.get('atom2_idx')))) for op in operations.get('edge_operations', []) if op.get('operation') == 'delete_edge' and op.get('atom1_idx') is not None and op.get('atom2_idx') is not None]
+    # --- Check for unprocessed deletions ---
+    all_delete_ops = [tuple(sorted((op.get('atom1_idx'), op.get('atom2_idx'))))
+                      for op in operations.get('edge_operations', [])
+                      if op.get('operation') == 'delete_edge' and op.get('atom1_idx') is not None and op.get('atom2_idx') is not None]
     unprocessed_deletions = set(all_delete_ops) - processed_bond_keys
-    if unprocessed_deletions: log_message(f"\nWARNING: {len(unprocessed_deletions)} delete_edge operations were not processed.")
+    if unprocessed_deletions:
+        log_message(f"\nWARNING: {len(unprocessed_deletions)} delete_edge operations were not processed (likely missing in intermediate states): {unprocessed_deletions}")
 
-    return bond_analyses
+    return bond_analyses # Return the list if all removals succeeded
+# ==============================================================================
+# END OF MODIFIED analyze_bond_removals_efficient
+# ==============================================================================
 
 
 def map_operations_to_action_sequence_efficient(operations, source_mol, graph_analysis, bond_analyses, fate_info):
@@ -428,33 +556,38 @@ def map_operations_to_action_sequence_efficient(operations, source_mol, graph_an
     num_atoms_source = source_mol.GetNumAtoms()
 
     global VOCAB_SIZE, BOND_REMOVE_ACTION
+    # Calculate ACTION_REPLACE_ATOM relative to the *initial* number of atoms
+    # This assumes the environment action indices for selecting atoms stay fixed
+    # relative to the initial state + additions.
     ACTION_REPLACE_ATOM = VOCAB_SIZE + num_atoms_source
 
     action_sequence = []
 
     def get_bond_action(rdkit_bond_type_or_val):
         if isinstance(rdkit_bond_type_or_val, (int, float)):
+             # Convert numeric bond type (e.g., 1.0, 2.0) to RDKit type
              bond_type_map = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE, 1.5: Chem.BondType.AROMATIC}
-             rdkit_bond_type = bond_type_map.get(rdkit_bond_type_or_val, Chem.BondType.SINGLE)
+             rdkit_bond_type = bond_type_map.get(float(rdkit_bond_type_or_val), Chem.BondType.SINGLE) # Use float for 1.5
         else:
-             rdkit_bond_type = rdkit_bond_type_or_val
+             rdkit_bond_type = rdkit_bond_type_or_val # Assume it's already an RDKit type
         action = RDKIT_BOND_TYPE_TO_ACTION.get(rdkit_bond_type)
         if action is None:
-             log_message(f"  WARNING: RDKit bond type {rdkit_bond_type} not in action map. Defaulting to SINGLE bond action.")
+             log_message(f"  WARNING: RDKit bond type {rdkit_bond_type} (from value {rdkit_bond_type_or_val}) not in action map. Defaulting to SINGLE bond action.")
              action = RDKIT_BOND_TYPE_TO_ACTION.get(Chem.BondType.SINGLE)
         return int(action)
 
     def get_vocab_index(element_atomic_num):
         element_atomic_num_str = str(element_atomic_num)
-        fallback_index = ELEMENT_TO_VOCAB.get('?')
+        fallback_index = ELEMENT_TO_VOCAB.get('?') # Should be 0 for Carbon
         index = ELEMENT_TO_VOCAB.get(element_atomic_num_str, fallback_index)
         if index == fallback_index and element_atomic_num_str not in ELEMENT_TO_VOCAB:
-             log_message(f"  WARNING: Atomic number '{element_atomic_num_str}' not in vocab mapping. Using fallback.")
+             log_message(f"  WARNING: Atomic number '{element_atomic_num_str}' not in vocab mapping. Using fallback index {fallback_index}.")
         return int(index)
 
     def generate_add_bond_actions(atom_env_idx1, atom_env_idx2, bond_type_val):
-        level0_action = atom_env_idx1 + 1
-        level1_action = VOCAB_SIZE + atom_env_idx2
+        # Ensure indices are 0-based for action calculation
+        level0_action = int(atom_env_idx1) + 1 # Action is 1-based index
+        level1_action = VOCAB_SIZE + int(atom_env_idx2) # Action uses 0-based index
         level2_action = get_bond_action(bond_type_val)
         action_tuple = (level0_action, level1_action, level2_action)
         log_message(f"    Add/Set Bond Action Tuple: {action_tuple} (env_idx {atom_env_idx1} - env_idx {atom_env_idx2}, Type {bond_type_val})")
@@ -465,63 +598,67 @@ def map_operations_to_action_sequence_efficient(operations, source_mol, graph_an
     critical_bond_actions = [ba for ba in bond_analyses if ba.get('type') == 'critical_disconnection']
     for ba in critical_bond_actions:
         bond = ba.get('bond')
-        # Use the corrected env_level3_action (0, 1, or 2) stored in bond_analyses
-        env_level3_action = ba.get('level3_action', -1)
+        env_level3_action = ba.get('level3_action', -1) # Should be 0 or 1
         kept_atom_idx, doomed_atom_idx = ba.get('kept_atom'), ba.get('doomed_atom')
 
-        if bond is None or env_level3_action == -1 or kept_atom_idx is None or doomed_atom_idx is None: continue
+        if bond is None or env_level3_action not in [0, 1] or kept_atom_idx is None or doomed_atom_idx is None: continue
 
         log_message(f"Remove Doomed Fragment via bond {kept_atom_idx}-{doomed_atom_idx}:")
         level0_action = kept_atom_idx + 1
         level1_action = VOCAB_SIZE + doomed_atom_idx
         level2_action = BOND_REMOVE_ACTION
-        level3_action = int(env_level3_action) # Already 0, 1, or 2
+        level3_action = int(env_level3_action)
         action_tuple = (level0_action, level1_action, level2_action, level3_action)
         log_message(f"  Action Tuple: {action_tuple}")
-        # Store original level3 value if needed for context, but tuple uses corrected one
-        action_sequence.append({'type': 'remove_doomed_fragment', 'bond': bond, 'level3': env_level3_action, 'action_tuple': action_tuple})
+        action_sequence.append({'type': 'remove_doomed_fragment', 'bond': bond, 'level3': level3_action, 'action_tuple': action_tuple})
 
-    # --- 2. Internal Kept Core Bond Edits (incl. Failed Discards) ---
-    log_message("\n-- Step 2: Internal Kept Core Bond Edits (incl. Failed Discards) --")
+    # --- 2. Internal Kept Core Bond Edits (incl. Failed Discards treated as Keep Both) ---
+    log_message("\n-- Step 2: Internal Kept Core Bond Edits --")
     internal_bond_actions = [ba for ba in bond_analyses if ba.get('type') == 'internal_kept_core']
     for ba in internal_bond_actions:
         bond = ba.get('bond')
         if bond is None: continue
         atom1_idx, atom2_idx = bond
         creates_fragments = ba.get('creates_fragments', False)
-        # Use the level3_action stored (should be 2 if fragments created, or None/-1 otherwise)
-        level3_action_val = ba.get('level3_action', -1)
+        level3_action_val = ba.get('level3_action', -1) # Should be 2 if fragments created
+
         log_message(f"Internal Bond removal {atom1_idx}-{atom2_idx}:")
         level0_action = atom1_idx + 1
         level1_action = VOCAB_SIZE + atom2_idx
         level2_action = BOND_REMOVE_ACTION
         action_tuple = None
         if creates_fragments:
-            level3_action = int(level3_action_val) # Should be 2
+            if level3_action_val != 2:
+                 log_message(f"  WARNING: Internal bond removal created fragments but L3 action is not 2 (got {level3_action_val}). Forcing L3=2.")
+            level3_action = 2 # Force Keep Both for internal splits
             action_tuple = (level0_action, level1_action, level2_action, level3_action)
-            level3_text = {0: "Discard fragment 0", 1: "Discard fragment 1", 2: "Keep both fragments"}.get(level3_action, "Keep both fragments")
-            log_message(f"  Action Tuple (with L3={level3_text}): {action_tuple}")
+            log_message(f"  Action Tuple (with L3=Keep Both): {action_tuple}")
         else:
             action_tuple = (level0_action, level1_action, level2_action)
             log_message(f"  Action Tuple: {action_tuple}")
-        action_sequence.append({'type': 'internal_bond_removal', 'bond': bond, 'level3': level3_action_val if creates_fragments else None, 'action_tuple': action_tuple})
+        action_sequence.append({'type': 'internal_bond_removal', 'bond': bond, 'level3': 2 if creates_fragments else None, 'action_tuple': action_tuple})
 
     # --- 3. Atom Substitutions ---
     log_message("\n-- Step 3: Atom Substitutions --")
     substitutions_ops = operations.get('substitutions', [])
+    # Use source_to_target map generated earlier if available
+    source_to_target = fate_info.get('source_to_target', {})
     for op in substitutions_ops:
         source_idx = op.get('source_idx')
-        if source_idx is not None and source_idx in all_kept_atoms:
+        # Check if the atom is meant to be kept
+        if source_idx is not None and atom_fate.get(source_idx) == "kept":
             to_element_num = op.get('to_element', '?')
             from_element_num = op.get('from_element', '?')
             log_message(f"Substitute Atom {source_idx} ({from_element_num} -> {to_element_num}):")
             level0_action = source_idx + 1
-            level1_action = ACTION_REPLACE_ATOM
+            level1_action = ACTION_REPLACE_ATOM # Use the fixed replace action index
             level2_action = get_vocab_index(to_element_num)
             action_tuple = (level0_action, level1_action, level2_action)
             log_message(f"  Action Tuple: {action_tuple}")
             action_sequence.append({'type': 'substitute_atom', 'source_idx': source_idx, 'to_element': str(to_element_num), 'action_tuple': action_tuple})
-        elif source_idx is not None: log_message(f"Skipping substitution for doomed atom {source_idx}.")
+        elif source_idx is not None:
+            log_message(f"Skipping substitution for doomed atom {source_idx}.")
+
 
     # --- 4. Atom Insertions (Multi-Pass) ---
     log_message("\n-- Step 4: Atom Insertions (Multi-Pass) --")
@@ -529,9 +666,10 @@ def map_operations_to_action_sequence_efficient(operations, source_mol, graph_an
     edge_insertions = [op for op in operations.get('edge_operations', []) if op.get('operation') == 'insert_edge']
 
     insertions_grouped = defaultdict(lambda: {'op': None, 'connections_to_kept': [], 'connections_to_new': []})
+    # Use target indices from insertion ops
     new_atom_target_indices = {op.get('target_idx') for op in insertions_ops if op.get('target_idx') is not None}
 
-    log_message(f"Found {len(new_atom_target_indices)} new atom target indices: {new_atom_target_indices}")
+    log_message(f"Found {len(new_atom_target_indices)} new atom target indices from insert_node ops: {new_atom_target_indices}")
 
     for op in insertions_ops:
          target_idx = op.get('target_idx')
@@ -539,110 +677,142 @@ def map_operations_to_action_sequence_efficient(operations, source_mol, graph_an
 
     log_message(f"Processing {len(edge_insertions)} insert_edge ops for connections...")
     for edge_op in edge_insertions:
-         a1, a2 = edge_op.get('atom1_idx'), edge_op.get('atom2_idx')
+         # Indices in insert_edge ops refer to the TARGET graph's indices
+         a1_target, a2_target = edge_op.get('atom1_idx'), edge_op.get('atom2_idx')
          bond_type = edge_op.get('bond_type', 1)
-         if a1 is None or a2 is None: continue
+         if a1_target is None or a2_target is None: continue
 
          conn_info = {'bond_type': bond_type}
-         if a1 in new_atom_target_indices and a2 in new_atom_target_indices:
-              insertions_grouped[a1]['connections_to_new'].append({'to_atom': a2, **conn_info})
-              insertions_grouped[a2]['connections_to_new'].append({'to_atom': a1, **conn_info})
-         elif a1 in new_atom_target_indices and a2 not in new_atom_target_indices:
-              if a2 in all_kept_atoms:
-                   insertions_grouped[a1]['connections_to_kept'].append({'to_atom': a2, **conn_info})
-              else: log_message(f"  Warning: New atom {a1} connects to non-kept existing atom {a2}. Ignoring.")
-         elif a2 in new_atom_target_indices and a1 not in new_atom_target_indices:
-              if a1 in all_kept_atoms:
-                   insertions_grouped[a2]['connections_to_kept'].append({'to_atom': a1, **conn_info})
-              else: log_message(f"  Warning: New atom {a2} connects to non-kept existing atom {a1}. Ignoring.")
 
-    mapped_new_atom_ids = {}
-    current_atom_count = num_atoms_source
+         # Check if atoms belong to new atoms or map back to kept source atoms
+         a1_is_new = a1_target in new_atom_target_indices
+         a2_is_new = a2_target in new_atom_target_indices
+
+         # Map target indices back to source indices for kept atoms
+         target_to_source = {v: k for k, v in source_to_target.items()}
+         a1_source = target_to_source.get(a1_target) if not a1_is_new else None
+         a2_source = target_to_source.get(a2_target) if not a2_is_new else None
+
+         # Case 1: New <-> New
+         if a1_is_new and a2_is_new:
+              insertions_grouped[a1_target]['connections_to_new'].append({'to_new_target_idx': a2_target, **conn_info})
+              insertions_grouped[a2_target]['connections_to_new'].append({'to_new_target_idx': a1_target, **conn_info})
+         # Case 2: New <-> Kept
+         elif a1_is_new and not a2_is_new:
+              if a2_source is not None and atom_fate.get(a2_source) == "kept":
+                   insertions_grouped[a1_target]['connections_to_kept'].append({'to_kept_source_idx': a2_source, **conn_info})
+              else: log_message(f"  Warning: New atom (target {a1_target}) connects to non-kept/unmapped target atom {a2_target}. Ignoring edge.")
+         elif a2_is_new and not a1_is_new:
+              if a1_source is not None and atom_fate.get(a1_source) == "kept":
+                   insertions_grouped[a2_target]['connections_to_kept'].append({'to_kept_source_idx': a1_source, **conn_info})
+              else: log_message(f"  Warning: New atom (target {a2_target}) connects to non-kept/unmapped target atom {a1_target}. Ignoring edge.")
+         # Case 3: Kept <-> Kept (This is an edge insertion between existing atoms - handle separately?)
+         # For now, assuming insert_edge only involves at least one new atom based on GED common practice.
+         # If Kept<->Kept insertions are possible, they need separate handling after atom insertions.
+
+    # --- Multi-Pass Mapping ---
+    # env_idx_map maps NEW atom TARGET indices to their assigned ENV index
     env_idx_map = {}
+    # current_atom_count tracks the next available index in the environment state
+    current_atom_count = num_atoms_source # Starts after the initial source atoms
 
     unmapped_insertions = set(new_atom_target_indices)
     pass_num = 0
-    while True:
+    max_passes = len(new_atom_target_indices) + 2 # Safety break
+
+    while unmapped_insertions and pass_num < max_passes:
         pass_num += 1
         log_message(f"\n--- Insertion Pass {pass_num} ---")
         newly_mapped_in_pass = set()
-
-        sorted_unmapped = sorted(list(unmapped_insertions))
+        sorted_unmapped = sorted(list(unmapped_insertions)) # Process deterministically
 
         for target_idx in sorted_unmapped:
             data = insertions_grouped[target_idx]
             op = data['op']
+            if op is None: # Should not happen if logic is correct
+                 log_message(f"  ERROR: No insert_node op found for target_idx {target_idx}. Skipping.")
+                 continue
             element_num = op.get('element', '?')
             conns_kept = data['connections_to_kept']
             conns_new = data['connections_to_new']
 
             anchor_info = None
 
+            # Prioritize anchoring to already existing ('kept') atoms
             if conns_kept:
                 first_conn = conns_kept[0]
-                anchor_info = ('kept', first_conn['to_atom'], first_conn['bond_type'])
-                log_message(f"  Trying to map {target_idx} ({element_num}) via kept anchor {anchor_info[1]}")
+                # Anchor is the SOURCE index of the kept atom
+                anchor_kept_source_idx = first_conn['to_kept_source_idx']
+                anchor_info = ('kept', anchor_kept_source_idx, first_conn['bond_type'])
+                log_message(f"  Trying to map new atom (target {target_idx}, {element_num}) via kept anchor (source {anchor_info[1]})")
             else:
+                # If no connection to kept, try anchoring to already mapped NEW atoms
                 for conn_new in conns_new:
-                    anchor_new_target_idx = conn_new['to_atom']
-                    if anchor_new_target_idx in mapped_new_atom_ids:
-                        anchor_info = ('new', anchor_new_target_idx, conn_new['bond_type'])
-                        log_message(f"  Trying to map {target_idx} ({element_num}) via new anchor (target_idx={anchor_new_target_idx})")
+                    anchor_new_target_idx = conn_new['to_new_target_idx']
+                    # Check if the anchor NEW atom has been mapped in a previous pass
+                    if anchor_new_target_idx in env_idx_map:
+                         # Anchor is the ENV index of the already mapped new atom
+                        anchor_new_env_idx = env_idx_map[anchor_new_target_idx]
+                        anchor_info = ('new', anchor_new_env_idx, conn_new['bond_type'])
+                        log_message(f"  Trying to map new atom (target {target_idx}, {element_num}) via new anchor (target {anchor_new_target_idx}, env {anchor_info[1]})")
                         break
 
+            # If an anchor was found, generate the add_atom action
             if anchor_info:
-                anchor_type, anchor_original_or_target_idx, bond_type_val = anchor_info
+                anchor_type, anchor_env_or_source_idx, bond_type_val = anchor_info
 
-                if anchor_type == 'kept':
-                    anchor_env_idx = anchor_original_or_target_idx
-                else:
-                    anchor_env_idx = env_idx_map.get(anchor_original_or_target_idx)
-                    if anchor_env_idx is None:
-                         log_message(f"  ERROR: Anchor new atom {anchor_original_or_target_idx} not found in env_idx_map. Skipping {target_idx}.")
-                         continue
+                # The Level 0 action is always the ENV index of the anchor + 1
+                anchor_env_idx = int(anchor_env_or_source_idx) # Already the correct env index for both 'kept' and 'new'
 
-                log_message(f"  Mapping Add Atom {target_idx} ({element_num}) anchored to {anchor_type} atom (env_idx={anchor_env_idx})")
+                log_message(f"  Mapping Add Atom (target {target_idx}, {element_num}) anchored to {anchor_type} atom (env_idx={anchor_env_idx})")
 
                 level0_action = anchor_env_idx + 1
                 level1_action = get_vocab_index(element_num)
                 level2_action = get_bond_action(bond_type_val)
                 add_atom_tuple = (level0_action, level1_action, level2_action)
-                log_message(f"    Action Tuple: {add_atom_tuple}")
+                log_message(f"    Action Tuple (Add Atom): {add_atom_tuple}")
                 action_sequence.append({'type': 'add_atom', 'target_idx': target_idx, 'element': str(element_num), 'anchor_env_idx': anchor_env_idx, 'action_tuple': add_atom_tuple})
 
-                placeholder_id = f"newly_added_{target_idx}"
-                mapped_new_atom_ids[target_idx] = placeholder_id
+                # Assign the new atom its environment index and update count
                 new_atom_env_idx = current_atom_count
                 env_idx_map[target_idx] = new_atom_env_idx
                 current_atom_count += 1
-
                 newly_mapped_in_pass.add(target_idx)
 
-                for conn_kept in conns_kept[1:] if anchor_type == 'kept' else conns_kept:
-                    other_kept_env_idx = conn_kept['to_atom']
-                    add_bond_tuple = generate_add_bond_actions(new_atom_env_idx, other_kept_env_idx, conn_kept['bond_type'])
-                    action_sequence.append({'type': 'add_bond', 'from_env_idx': new_atom_env_idx, 'to_env_idx': other_kept_env_idx, 'action_tuple': add_bond_tuple})
+                # --- Generate subsequent add_bond actions for this new atom ---
+                # Connections to other KEPT atoms (use their source indices)
+                # Skip the first one if it was used as the anchor
+                other_conns_kept = conns_kept[1:] if anchor_type == 'kept' else conns_kept
+                for conn_kept in other_conns_kept:
+                    other_kept_source_idx = conn_kept['to_kept_source_idx']
+                    add_bond_tuple = generate_add_bond_actions(new_atom_env_idx, other_kept_source_idx, conn_kept['bond_type'])
+                    action_sequence.append({'type': 'add_bond', 'from_new_target_idx': target_idx, 'to_kept_source_idx': other_kept_source_idx, 'action_tuple': add_bond_tuple})
 
+                # Connections to other NEW atoms (use their ENV indices if already mapped)
                 for conn_new in conns_new:
-                    other_new_target_idx = conn_new['to_atom']
-                    if other_new_target_idx in env_idx_map and other_new_target_idx != anchor_original_or_target_idx :
+                    other_new_target_idx = conn_new['to_new_target_idx']
+                    # Check if the other new atom is already mapped AND wasn't the anchor
+                    if other_new_target_idx in env_idx_map and (anchor_type != 'new' or env_idx_map[other_new_target_idx] != anchor_env_idx):
                        other_new_env_idx = env_idx_map[other_new_target_idx]
                        add_bond_tuple = generate_add_bond_actions(new_atom_env_idx, other_new_env_idx, conn_new['bond_type'])
-                       action_sequence.append({'type': 'add_bond', 'from_env_idx': new_atom_env_idx, 'to_env_idx': other_new_env_idx, 'action_tuple': add_bond_tuple})
+                       action_sequence.append({'type': 'add_bond', 'from_new_target_idx': target_idx, 'to_new_target_idx': other_new_target_idx, 'action_tuple': add_bond_tuple})
+                # --- End generating add_bond actions ---
 
             else:
+                # Check if it only connects to unmapped new atoms
                 connects_only_to_unmapped_new = False
                 if not conns_kept and conns_new:
                     all_connected_new_are_unmapped = True
                     for conn_new in conns_new:
-                        if conn_new['to_atom'] in mapped_new_atom_ids:
+                        if conn_new['to_new_target_idx'] in env_idx_map:
                             all_connected_new_are_unmapped = False; break
                     if all_connected_new_are_unmapped: connects_only_to_unmapped_new = True
 
                 if connects_only_to_unmapped_new:
-                     log_message(f"  Atom {target_idx} ({element_num}) only connects to other UNMAPPED new atoms in pass {pass_num}. Deferring.")
+                     log_message(f"  Atom (target {target_idx}, {element_num}) only connects to other UNMAPPED new atoms in pass {pass_num}. Deferring.")
                 else:
-                     log_message(f"  Could not find anchor for {target_idx} ({element_num}) in pass {pass_num}")
+                     log_message(f"  Could not find suitable anchor for new atom (target {target_idx}, {element_num}) in pass {pass_num}. Connections: Kept={len(conns_kept)}, New={len(conns_new)}")
+
 
         if not newly_mapped_in_pass:
             log_message(f"--- No insertions mapped in pass {pass_num}. Exiting loop. ---")
@@ -654,65 +824,186 @@ def map_operations_to_action_sequence_efficient(operations, source_mol, graph_an
              log_message("--- All insertions mapped. ---")
              break
 
+    if pass_num == max_passes and unmapped_insertions:
+         log_message(f"\nWARNING: Exceeded max insertion passes ({max_passes}).")
+
     if unmapped_insertions:
-        log_message(f"\nWARNING: {len(unmapped_insertions)} insert_node operations could not be mapped after {pass_num} passes:")
-        for idx in sorted(list(unmapped_insertions)): log_message(f"  - Target Index {idx} ({insertions_grouped[idx]['op'].get('element', '?')})")
+        log_message(f"\nWARNING: {len(unmapped_insertions)} insert_node operations could not be mapped:")
+        for idx in sorted(list(unmapped_insertions)):
+             op = insertions_grouped[idx]['op']
+             element = op.get('element', '?') if op else '?'
+             log_message(f"  - Target Index {idx} ({element})")
+
+    # --- 5. Add Bond Insertions between EXISTING Kept Atoms ---
+    # Placeholder: If GED allows inserting edges between atoms that both exist in the source
+    # and are kept, these operations need to be mapped here after all atom modifications.
+    log_message("\n-- Step 5: Add Bonds Between Existing Kept Atoms (Placeholder) --")
+    kept_kept_insertions = []
+    for edge_op in edge_insertions:
+        a1_target, a2_target = edge_op.get('atom1_idx'), edge_op.get('atom2_idx')
+        bond_type = edge_op.get('bond_type', 1)
+        if a1_target is None or a2_target is None: continue
+        a1_is_new = a1_target in new_atom_target_indices
+        a2_is_new = a2_target in new_atom_target_indices
+        if not a1_is_new and not a2_is_new:
+            # Map target indices back to source indices
+            target_to_source = {v: k for k, v in source_to_target.items()}
+            a1_source = target_to_source.get(a1_target)
+            a2_source = target_to_source.get(a2_target)
+            if a1_source is not None and a2_source is not None and atom_fate.get(a1_source) == "kept" and atom_fate.get(a2_source) == "kept":
+                 # Ensure this bond doesn't already exist from source_mol processing
+                 # This check might be complex; assume for now GED only adds necessary bonds
+                 add_bond_tuple = generate_add_bond_actions(a1_source, a2_source, bond_type)
+                 action_sequence.append({'type': 'add_bond_kept', 'source_idx1': a1_source, 'source_idx2': a2_source, 'action_tuple': add_bond_tuple})
+                 kept_kept_insertions.append(edge_op)
+    if kept_kept_insertions:
+         log_message(f"Mapped {len(kept_kept_insertions)} add_edge operations between existing kept atoms.")
+
 
     return action_sequence
 
 
+# ==============================================================================
+# START OF MODIFIED main
+# ==============================================================================
 def main():
     """Main function to analyze and map GED operations."""
     log_message(f"Starting analysis run by {CURRENT_USER} at {datetime.datetime.utcnow().isoformat()}Z")
-    transformations = load_transformation_data("train")
-    if not transformations: return
+    # Load raw transformation data (SMILES pairs + edit path)
+    # Assuming load_transformation_data now returns list of dicts like:
+    # {'source_smiles': '...', 'target_smiles': '...', 'edit_path': [...]}
+    transformations_raw = load_transformation_data("train")
+    if not transformations_raw:
+        log_message("No raw transformation data loaded. Exiting.")
+        return
 
     results = []
+    skipped_count = 0 # Counter for skipped pairs
 
-    for i in range(min(len(transformations), MAX_TRANSFORMATIONS)):
-        transformation = transformations[i]
-        source_smiles, target_smiles = transformation.get('source_smiles'), transformation.get('target_smiles')
-        edit_path = transformation.get('edit_path')
+    output_dir = "./data/chembl/action_results" # Define output dir
+    os.makedirs(output_dir, exist_ok=True) # Ensure output dir exists
+    final_output_path = os.path.join(output_dir, f"action_tuples_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pkl")
+
+
+    log_message(f"Processing {min(len(transformations_raw), MAX_TRANSFORMATIONS)} transformations...")
+
+    # Use tqdm for progress bar
+    for i, transformation in enumerate(tqdm(transformations_raw[:MAX_TRANSFORMATIONS], desc="Mapping GED to Actions")):
+        source_smiles = transformation.get('source_smiles')
+        target_smiles = transformation.get('target_smiles')
+        edit_path = transformation.get('edit_path') # Get the raw edit path
 
         if not source_smiles or not target_smiles or edit_path is None:
-             log_message(f"Skipping transformation {i+1} due to missing data."); continue
+             log_message(f"\nSkipping transformation {i+1} due to missing SMILES or edit_path.")
+             skipped_count += 1
+             continue
 
         log_message(f"\n\n==================================================")
-        log_message(f"Analyzing transformation {i+1}/{min(len(transformations), MAX_TRANSFORMATIONS)}")
+        log_message(f"Analyzing transformation {i+1}/{min(len(transformations_raw), MAX_TRANSFORMATIONS)}")
         log_message(f"Source: {source_smiles}")
         log_message(f"Target: {target_smiles}")
         log_message(f"==================================================\n")
 
         source_mol, target_mol = None, None
+
         try:
+            # --- Prepare Molecules Consistently ---
             source_mol = Chem.MolFromSmiles(source_smiles)
-            if source_mol: source_mol = rdmolops.RenumberAtoms(source_mol, list(rdmolfiles.CanonicalRankAtoms(source_mol)))
             target_mol = Chem.MolFromSmiles(target_smiles)
-            if target_mol: target_mol = rdmolops.RenumberAtoms(target_mol, list(rdmolfiles.CanonicalRankAtoms(target_mol)))
-        except Exception as e: log_message(f"ERROR creating/renumbering RDKit molecules: {e}"); continue
-        if not source_mol or not target_mol: log_message("Error creating RDKit molecules from SMILES"); continue
 
-        operations = categorize_operations(list(edit_path))
-        fate_info = build_atom_fate_map(operations, source_mol, target_mol)
-        graph_analysis = analyze_graph_structure(source_mol, fate_info['atom_fate'], operations)
-        bond_analyses = analyze_bond_removals_efficient(graph_analysis, source_mol, fate_info, operations) # Corrected version
-        action_sequence = map_operations_to_action_sequence_efficient(operations, source_mol, graph_analysis, bond_analyses, fate_info)
+            if not source_mol or not target_mol:
+                raise ValueError("MolFromSmiles failed")
 
-        log_message(f"\n--- Generated Action Sequence ({len(action_sequence)} items) ---")
+            # Sanitize first
+            Chem.SanitizeMol(source_mol)
+            Chem.SanitizeMol(target_mol)
 
-        results.append({
-            'transformation_index': i,
-            'source_smiles': source_smiles,
-            'target_smiles': target_smiles,
-            'action_sequence': action_sequence
-        })
+            # Kekulize consistently
+            Chem.Kekulize(source_mol, clearAromaticFlags=True)
+            Chem.Kekulize(target_mol, clearAromaticFlags=True)
+
+            # Canonicalize consistently
+            source_mol = rdmolops.RenumberAtoms(source_mol, list(rdmolfiles.CanonicalRankAtoms(source_mol)))
+            target_mol = rdmolops.RenumberAtoms(target_mol, list(rdmolfiles.CanonicalRankAtoms(target_mol)))
+            # --- End Prepare Molecules ---
+
+        except Exception as e:
+            log_message(f"ERROR preparing RDKit molecules for pair ({source_smiles}, {target_smiles}): {e}")
+            skipped_count += 1
+            continue # Skip this pair if molecule preparation fails
+
+        try:
+            # --- Perform Analysis ---
+            operations = categorize_operations(list(edit_path)) # Pass a copy of edit_path
+            fate_info = build_atom_fate_map(operations, source_mol, target_mol)
+            graph_analysis = analyze_graph_structure(source_mol, fate_info['atom_fate'], operations)
+
+            # --- Call bond analysis (Strict Check) ---
+            bond_analyses = analyze_bond_removals_efficient(graph_analysis, source_mol, fate_info, operations)
+
+            if bond_analyses is None:
+                # The reason for skipping is already logged inside analyze_bond_removals_efficient
+                log_message(f"Skipping pair ({source_smiles}, {target_smiles}) due to fatal error during bond removal analysis (e.g., sanitization failure).")
+                skipped_count += 1
+                continue # Skip to the next pair
+            # --- End Bond Analysis Check ---
+
+            # --- Map to actions (only if bond analysis succeeded) ---
+            action_sequence = map_operations_to_action_sequence_efficient(operations, source_mol, graph_analysis, bond_analyses, fate_info)
+            # --- End Map to Actions ---
+
+            log_message(f"\n--- Generated Action Sequence ({len(action_sequence)} items) ---")
+
+            # Store results
+            results.append({
+                'transformation_index': i,
+                'source_smiles': source_smiles,
+                'target_smiles': target_smiles,
+                # Store only the action tuples for the final dataset
+                'action_tuples': [item['action_tuple'] for item in action_sequence if 'action_tuple' in item]
+                # Optionally store the raw edit path if needed for debugging
+                # 'raw_edit_path': edit_path
+            })
+
+        except Exception as analysis_err:
+             log_message(f"\nERROR during analysis/mapping for pair ({source_smiles}, {target_smiles}): {analysis_err}")
+             skipped_count += 1
+             # Optionally add more detailed error traceback here if needed
+             import traceback
+             log_message(traceback.format_exc())
+             continue # Skip pair on general analysis errors
+
+
+        # --- Checkpoint Saving ---
+        # Save checkpoint periodically based on the number of SUCCESSFULLY processed results
+        if results and (len(results) % CHECKPOINT_FREQUENCY == 0):
+            checkpoint_timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            # Save to the dedicated output directory
+            current_checkpoint_path = os.path.join(output_dir, f"action_tuples_checkpoint_{checkpoint_timestamp}.pkl")
+            try:
+                with open(current_checkpoint_path, "wb") as f:
+                    pickle.dump(results, f)
+                log_message(f"\nCheckpoint saved: {current_checkpoint_path} ({len(results)} successfully processed transformations)")
+            except Exception as cp_err:
+                log_message(f"\nERROR saving checkpoint {current_checkpoint_path}: {cp_err}")
+        # --- End Checkpoint Saving ---
+
 
     log_message("\n=== Analysis Complete ===")
+    log_message(f"Successfully processed {len(results)} transformations.")
+    log_message(f"Skipped {skipped_count} transformations due to errors or sanitization failures.")
 
-    # output_filename = f"ged_to_action_tuples_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pkl"
-    # with open(output_filename, "wb") as f:
-    #      pickle.dump(results, f)
-    # log_message(f"Saved action sequence results to {output_filename}")
+    # Save the final results
+    try:
+        with open(final_output_path, "wb") as f:
+             pickle.dump(results, f)
+        log_message(f"Saved final action sequence results ({len(results)} items) to {final_output_path}")
+    except Exception as final_save_err:
+        log_message(f"ERROR saving final results to {final_output_path}: {final_save_err}")
+
+# ==============================================================================
+# END OF MODIFIED main
+# ==============================================================================
 
 
 if __name__ == "__main__":

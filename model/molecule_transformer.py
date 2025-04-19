@@ -96,8 +96,8 @@ class MoleculeTransformer(nn.Module):
 
 
 
-        # Add fragment decision logits (Level 3)
-        level_three_logits = self.fragment_decision_linear(virtual_atom)  # (B, 3)
+        # # Add fragment decision logits (Level 3)
+        # level_three_logits = self.fragment_decision_linear(virtual_atom)  # (B, 3)
 
 
 
@@ -105,9 +105,9 @@ class MoleculeTransformer(nn.Module):
         atom_level_zero_and_one_logits = self.bond_atom_linear(atom_sequence[:, 1:, :])  # (B, num_atoms - 1, 2)
         level_zero_logits = torch.concatenate((virtual_level_zero_logits, atom_level_zero_and_one_logits[:, :, 0]), dim=1)
         level_one_logits = atom_level_zero_and_one_logits[:, :, 1]
-        # return level_zero_logits, level_one_logits, level_two_logits
-        # Return level_three_logits as fourth output
-        return level_zero_logits, level_one_logits, level_two_logits, level_three_logits
+        return level_zero_logits, level_one_logits, level_two_logits
+        # # Return level_three_logits as fourth output
+        # return level_zero_logits, level_one_logits, level_two_logits, level_three_logits
 
     def get_weights(self):
         return dict_to_cpu(self.state_dict())

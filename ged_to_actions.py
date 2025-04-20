@@ -95,48 +95,56 @@ class GedToRlConverter:
         }
         self.vocab_idx1_to_idx0 = {i+1: i for i in range(self.vocab_size)}
 
-    def _initialize_mappings(self, design: MoleculeDesign, edit_path: List[Dict]) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
-        """Initialize index mappings based on source molecule and GED node path."""
+    def _initialize_mappings(self, design: MoleculeDesign, edit_path: List[Dict]) -> Tuple[
+        Dict[int, int], Dict[int, int], Dict[int, int]]:
+        """Initialize index mappings based on source molecule's internal state and GED node path."""
         source_idx_to_internal_idx: Dict[int, int] = {}
         internal_idx_to_source_idx: Dict[int, int] = {}
         target_idx_to_internal_idx: Dict[int, int] = {}
 
-        num_source_atoms = design.rdkit_mol.GetNumAtoms()
+        # --- MODIFIED LINE ---
+        # Get atom count from the internal state (excluding virtual atom 0)
+        num_source_atoms = len(design.atoms) - 1
+        # --- END MODIFICATION ---
+
+        # RDKit indices in the original source SMILES are implicitly 0 to num_source_atoms - 1
+        # Internal indices are 1 to num_source_atoms
         for i in range(num_source_atoms):
             internal_idx = i + 1
+            # Map original RDKit index 'i' to internal index 'internal_idx'
             source_idx_to_internal_idx[i] = internal_idx
+            # Map internal index 'internal_idx' back to original RDKit index 'i'
             internal_idx_to_source_idx[internal_idx] = i
 
+        # --- Rest of the method remains the same ---
         node_mappings = []
         present_source_indices_in_ops = set()
-        source_indices_in_substitute = set() # Track source atoms involved in substitution explicitly
+        source_indices_in_substitute = set()
 
         for op in edit_path:
-             op_type = op['operation']
-             if op_type == 'substitute_node':
-                  node_mappings.append((op['source_idx'], op['target_idx']))
-                  present_source_indices_in_ops.add(op['source_idx'])
-                  source_indices_in_substitute.add(op['source_idx'])
-             elif op_type == 'delete_node':
-                  present_source_indices_in_ops.add(op['source_idx'])
-             elif op_type == 'insert_node':
-                  pass # No source index involved
+            op_type = op['operation']
+            if op_type == 'substitute_node':
+                # op['source_idx'] refers to the original RDKit index
+                node_mappings.append((op['source_idx'], op['target_idx']))
+                present_source_indices_in_ops.add(op['source_idx'])
+                source_indices_in_substitute.add(op['source_idx'])
+            elif op_type == 'delete_node':
+                present_source_indices_in_ops.add(op['source_idx'])
+            elif op_type == 'insert_node':
+                pass
 
-        # Add identity mappings for nodes that are not substituted or deleted
         for source_idx in range(num_source_atoms):
-             if source_idx not in present_source_indices_in_ops:
-                  # Check if it's involved in any edge op (implies existence)
-                  is_in_edge = any(op.get('atom1_idx') == source_idx or op.get('atom2_idx') == source_idx or
-                                   op.get('source_atom1') == source_idx or op.get('source_atom2') == source_idx
-                                   for op in edit_path if 'atom1_idx' in op or 'source_atom1' in op)
-                  if is_in_edge:
-                       # Assume target index is same as source if not explicitly mapped elsewhere
-                       if not any(u == source_idx for u, v in node_mappings): # Check if not already mapped
-                           node_mappings.append((source_idx, source_idx))
+            if source_idx not in present_source_indices_in_ops:
+                is_in_edge = any(op.get('atom1_idx') == source_idx or op.get('atom2_idx') == source_idx or
+                                 op.get('source_atom1') == source_idx or op.get('source_atom2') == source_idx
+                                 for op in edit_path if 'atom1_idx' in op or 'source_atom1' in op)
+                if is_in_edge:
+                    if not any(u == source_idx for u, v in node_mappings):
+                        node_mappings.append((source_idx, source_idx))
 
-        # Create the target_idx -> internal_idx map
         for u, v in node_mappings:
             if u is not None and v is not None:
+                # Use the source_idx_to_internal_idx map we created
                 if u in source_idx_to_internal_idx:
                     target_idx_to_internal_idx[v] = source_idx_to_internal_idx[u]
 
@@ -189,7 +197,7 @@ class GedToRlConverter:
     def _update_mappings_after_removal(self, removed_internal_idx: int, maps: Tuple[Dict, Dict, Dict]):
         """Update index mappings after an atom is removed."""
         source_map, internal_to_source_map, target_map = maps
-        print(f"Updating maps after removing internal index: {removed_internal_idx}")
+        # print(f"Updating maps after removing internal index: {removed_internal_idx}")
         removed_source_idx = internal_to_source_map.get(removed_internal_idx, None)
         removed_target_idx = None
         for t_idx, i_idx in list(target_map.items()):
@@ -214,17 +222,17 @@ class GedToRlConverter:
               target_indices_to_update = [t_idx for t_idx, i_idx in target_map.items() if i_idx == i]
               for t_idx in target_indices_to_update:
                   target_map[t_idx] = i - 1
-        print(f"  Updated source_map: {source_map}")
-        print(f"  Updated internal_to_source_map: {internal_to_source_map}")
-        print(f"  Updated target_map: {target_map}")
+        # print(f"  Updated source_map: {source_map}")
+        # print(f"  Updated internal_to_source_map: {internal_to_source_map}")
+        # print(f"  Updated target_map: {target_map}")
 
     def _update_mappings_after_addition(self, new_internal_idx: int, target_idx: Optional[int], maps: Tuple[Dict, Dict, Dict]):
         """Update index mappings after an atom is added."""
         source_map, internal_to_source_map, target_map = maps
-        print(f"Updating maps after adding internal index: {new_internal_idx}, target_idx: {target_idx}")
+        # print(f"Updating maps after adding internal index: {new_internal_idx}, target_idx: {target_idx}")
         if target_idx is not None:
             target_map[target_idx] = new_internal_idx
-        print(f"  Updated target_map: {target_map}")
+        # print(f"  Updated target_map: {target_map}")
 
     # _find_rl_sequence_for_ged_op remains the same (including debug prints)
     def _find_rl_sequence_for_ged_op(self, design: MoleculeDesign, op_type: str, op_data: Any, maps: Tuple[Dict, Dict, Dict]) -> Optional[List[int]]:
@@ -358,22 +366,22 @@ class GedToRlConverter:
         current_level = design.current_action_level
 
         # <<< DEBUGGING >>>
-        print(f"    DEBUG Check: Trying Op={op_type}, Data={op_data}")
-        print(f"    DEBUG Check: Design State: Level={current_level}, Connected={design.is_currently_connected}")
+        # print(f"    DEBUG Check: Trying Op={op_type}, Data={op_data}")
+        # print(f"    DEBUG Check: Design State: Level={current_level}, Connected={design.is_currently_connected}")
         if current_mask is None:
-             print(f"    DEBUG ERROR: current_mask is None!")
+             # print(f"    DEBUG ERROR: current_mask is None!")
              return None
-        print(f"    DEBUG Check: Mask Length={len(current_mask)}")
-        print(f"    DEBUG Check: Potential RL Seq={potential_sequence}")
-        print(f"    DEBUG Check: First Action={first_action}")
+        # print(f"    DEBUG Check: Mask Length={len(current_mask)}")
+        # print(f"    DEBUG Check: Potential RL Seq={potential_sequence}")
+        # print(f"    DEBUG Check: First Action={first_action}")
         if current_level != 0:
-             print(f"    DEBUG ERROR: Attempting to start new op sequence but current_level is {current_level}!")
+             # print(f"    DEBUG ERROR: Attempting to start new op sequence but current_level is {current_level}!")
              return None # Should only start new op at L0
         if not (0 <= first_action < len(current_mask)):
-             print(f"    DEBUG ERROR: first_action {first_action} is out of bounds for mask (len {len(current_mask)})!")
+             # print(f"    DEBUG ERROR: first_action {first_action} is out of bounds for mask (len {len(current_mask)})!")
              return None
         is_masked = current_mask[first_action]
-        print(f"    DEBUG Check: current_mask[{first_action}] = {is_masked}")
+        # print(f"    DEBUG Check: current_mask[{first_action}] = {is_masked}")
         # <<< END DEBUGGING >>>
 
         if not is_masked:
@@ -427,21 +435,23 @@ class GedToRlConverter:
             # --- A. Continue existing RL sub-sequence ---
             if current_rl_sub_sequence:
                 action_to_take = current_rl_sub_sequence.pop(0)
-                print(f"  Step {steps}: Continuing sub-sequence. Action: {action_to_take} (Level {current_level})")
+                # print(f"  Step {steps}: Continuing sub-sequence. Action: {action_to_take} (Level {current_level})")
 
                 # ---> Add Detailed Pre-Check Debugging <---
-                print(f"  DEBUG PRE-CHECK: Mask Length={len(current_mask)}, Action={action_to_take}")
+                # print(f"  DEBUG PRE-CHECK: Mask Length={len(current_mask)}, Action={action_to_take}")
                 if 0 <= action_to_take < len(current_mask):
                     is_masked_pre_check = current_mask[action_to_take]
-                    print(f"  DEBUG PRE-CHECK: Mask[{action_to_take}] = {is_masked_pre_check}")
+                    # print(f"  DEBUG PRE-CHECK: Mask[{action_to_take}] = {is_masked_pre_check}")
                 else:
                     is_masked_pre_check = True  # Treat out of bounds as masked
-                    print(
-                        f"  DEBUG PRE-CHECK: Action {action_to_take} is OUT OF BOUNDS for mask len {len(current_mask)}")
+                    # print(
+                    #     f"  DEBUG PRE-CHECK: Action {action_to_take} is OUT OF BOUNDS for mask len {len(current_mask)}")
                 # ---> End Add <---
 
                 # Use the value captured *before* the if statement
                 if action_to_take >= len(current_mask) or is_masked_pre_check:  # Check the captured value
+                    print(f"Action level is {current_level}, but action_to_take is {action_to_take} (masked: {is_masked_pre_check})")
+                    print(f"Bonds: {design.bonds}")
                     print(f"ERROR: Masked action {action_to_take} encountered in sub-sequence! Mask: {current_mask}")
                     return None
 
@@ -486,7 +496,7 @@ class GedToRlConverter:
                 # Process if found in Priority 1
                 if candidate_info:
                     seq, op_type, op_data = candidate_info
-                    print(f"  Step {steps}: Starting new op (Priority 1): {op_type} {op_data}. RL Seq: {seq}")
+                    # print(f"  Step {steps}: Starting new op (Priority 1): {op_type} {op_data}. RL Seq: {seq}")
                     current_rl_sub_sequence = seq
                     current_ged_op_info = (op_type, op_data)
                     action_to_take = current_rl_sub_sequence.pop(0)
@@ -503,7 +513,7 @@ class GedToRlConverter:
                             break
                     if candidate_info:
                         seq, op_type, op_data = candidate_info
-                        print(f"  Step {steps}: Starting new op (Priority 2): {op_type} {op_data}. RL Seq: {seq}")
+                        # print(f"  Step {steps}: Starting new op (Priority 2): {op_type} {op_data}. RL Seq: {seq}")
                         current_rl_sub_sequence = seq
                         current_ged_op_info = (op_type, op_data)
                         action_to_take = current_rl_sub_sequence.pop(0)
@@ -552,7 +562,7 @@ class GedToRlConverter:
                     # Process if found in Priority 3
                     if candidate_info:
                         seq, op_type, op_data = candidate_info
-                        print(f"  Step {steps}: Starting new op (Priority 3): {op_type} {op_data}. RL Seq: {seq}")
+                        # print(f"  Step {steps}: Starting new op (Priority 3): {op_type} {op_data}. RL Seq: {seq}")
                         current_rl_sub_sequence = seq
                         current_ged_op_info = (op_type, op_data)
                         action_to_take = current_rl_sub_sequence.pop(0)
@@ -566,7 +576,7 @@ class GedToRlConverter:
             # --- C. Execute Action and Update State ---
 
             # ---> Added this print <---
-            print(f"  DEBUG CHECK C @ step {steps}: action_to_take is '{action_to_take}', type: {type(action_to_take)}")
+            # print(f"  DEBUG CHECK C @ step {steps}: action_to_take is '{action_to_take}', type: {type(action_to_take)}")
             # ---> End Add <---
 
             if action_to_take is not None:
@@ -614,7 +624,7 @@ class GedToRlConverter:
                 # Remove completed op from required changes
                 if ged_op_completed_this_step and current_ged_op_info:
                     op_type, op_data = current_ged_op_info
-                    print(f"  Completed GED Op: {op_type} {op_data}")
+                    # print(f"  Completed GED Op: {op_type} {op_data}")
                     try:
                         if op_type == 'delete_node':
                             required_changes["nodes_to_delete"].discard(op_data)
@@ -655,7 +665,7 @@ class GedToRlConverter:
                 if not design.current_action_mask[0]:
                     design.take_action(0)
                     rl_sequence.append(0)
-                    print("  Added final terminate action.")
+                    # print("  Added final terminate action.")
                 else:
                     print(f"Warning: Final state terminable but action 0 masked for {source_smiles} -> {target_smiles}")
             except ValueError as e:

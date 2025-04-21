@@ -1,19 +1,83 @@
 import copy
-import random
+# import random
 import numpy as np
 import torch
 from torch import nn
 from rdkit import Chem, RDLogger
-import networkx as nx # Import NetworkX
+from rdkit.Chem import rdmolfiles, rdmolops
+import networkx as nx
 
+import traceback
 from config import MoleculeConfig
 from core.abstracts import BaseTrajectory
-from core.utils import softmax
+# from core.utils import softmax
 
-from typing import Optional, List, Tuple
+from typing import List, Tuple, Dict, Optional
 
-# Suppress RDKit warnings
-RDLogger.DisableLog('rdApp.*')
+# # Suppress RDKit warnings
+# RDLogger.DisableLog('rdApp.*')
+
+
+def build_reverse_atom_lookup(config: MoleculeConfig) -> Dict[Tuple[int, int, int], int]:
+    """
+    Creates a lookup dictionary mapping atom properties back to vocabulary indices.
+
+    Args:
+        config: The MoleculeConfig instance containing the atom_vocabulary.
+
+    Returns:
+        A dictionary mapping (atomic_number, formal_charge, chiral_tag) -> vocab_idx (1-based).
+    """
+    lookup = {}
+    # Ensure vocabulary_atom_names exists or derive it if needed
+    if hasattr(config, 'vocabulary_atom_names'):
+        vocab_names = config.vocabulary_atom_names
+    else:
+        # If not precomputed, derive from keys (assuming order matters and is consistent)
+        vocab_names = list(config.atom_vocabulary.keys())
+        # Consider attaching this to config instance if needed elsewhere?
+        # config.vocabulary_atom_names = vocab_names
+
+    if not vocab_names:
+        raise ValueError("Atom vocabulary in config appears empty.")
+
+    for i, name in enumerate(vocab_names):
+        try:
+            atom_config = config.atom_vocabulary[name]
+        except KeyError:
+            print(f"Warning: Atom name '{name}' found in vocab_names but not in atom_vocabulary keys.")
+            continue
+
+        try:
+            atomic_num = atom_config['atomic_number']
+            # Use .get() with default 0 for optional properties
+            charge = atom_config.get('formal_charge', 0)
+            chiral = atom_config.get('chiral_tag', 0)  # 0: unspecified, 1: CW, 2: CCW (RDKit mapping)
+        except KeyError as e:
+            print(f"Warning: Missing expected property {e} for atom '{name}' in config. Skipping.")
+            continue
+
+        key = (atomic_num, charge, chiral)
+        vocab_idx = i + 1  # 1-based index
+
+        # Store the mapping for the specific properties
+        if key in lookup:
+            print(f"Warning: Duplicate atom definition found for key {key} ('{name}'). Overwriting.")
+        lookup[key] = vocab_idx
+
+        # Add a fallback mapping for non-chiral lookup if this entry is chiral
+        # This allows finding a chiral atom even if the query is non-chiral
+        if chiral != 0:
+            key_no_chiral = (atomic_num, charge, 0)
+            if key_no_chiral not in lookup:
+                # Only add if a non-chiral version *doesn't* already exist specifically
+                lookup[key_no_chiral] = vocab_idx
+
+    if not lookup:
+        print("Warning: Reverse atom lookup is empty. Check atom_vocabulary in config.")
+
+    return lookup
+
 
 class MoleculeDesign(BaseTrajectory):
     """
@@ -176,14 +240,37 @@ class MoleculeDesign(BaseTrajectory):
                     if not self.atom_feasibility_mask[i] and self.vocabulary_valence[i+1] >= 1:
                         mask[i] = False
 
+            # for target_0_idx in range(num_real_atoms):
+            #     target_internal_idx = target_0_idx + 1
+            #     action_idx = self.vocab_size + target_0_idx
+            #     if target_internal_idx == anchor_atom_internal_idx: continue
+            #     bond_exists = self.bonds[anchor_atom_internal_idx, target_internal_idx] > 0
+            #     target_has_valence = remaining_valence[target_0_idx] > 0
+            #     if bond_exists or target_has_valence:
+            #         mask[action_idx] = False
+
+            print(
+                f"DEBUG L1 Mask Calc: Anchor={anchor_atom_internal_idx}, RemValAnchor={remaining_valence[anchor_atom_0_idx]}")
+
             for target_0_idx in range(num_real_atoms):
                 target_internal_idx = target_0_idx + 1
-                action_idx = self.vocab_size + target_0_idx
-                if target_internal_idx == anchor_atom_internal_idx: continue
+                action_idx = self.vocab_size + target_0_idx  # Action index for selecting this existing atom
+
+                if target_internal_idx == anchor_atom_internal_idx: continue  # Skip selecting self
+
                 bond_exists = self.bonds[anchor_atom_internal_idx, target_internal_idx] > 0
                 target_has_valence = remaining_valence[target_0_idx] > 0
-                if bond_exists or target_has_valence:
-                    mask[action_idx] = False
+
+                # --- Add Detailed Debug Print ---
+                should_unmask = bond_exists or target_has_valence
+                print(
+                    f"  L1 Mask Check: Target={target_internal_idx}, ActionIdx={action_idx}, BondExists={bond_exists}, TargetHasVal={target_has_valence}, ShouldUnmask={should_unmask}")
+                # --- End Debug Print ---
+
+                if should_unmask:
+                    mask[action_idx] = False  # Unmask the action
+                    print(f"    => UNMASKING Action {action_idx}")  # Confirm unmasking
+
 
             mask[self.vocab_size + num_real_atoms] = False
             self.current_action_mask = mask
@@ -311,75 +398,165 @@ class MoleculeDesign(BaseTrajectory):
         if self.l1_selected_existing_atom_idx is not None and self.l1_selected_existing_atom_idx > removed_internal_idx:
             self.l1_selected_existing_atom_idx -= 1
 
+
+    # Inside MoleculeDesign class
     def take_action(self, action: int):
         """Execute a given action, updating internal state directly."""
         if self.synthesis_done: raise RuntimeError("Cannot take action on terminated design.")
-        if self.current_action_mask is None or action >= len(self.current_action_mask) or self.current_action_mask[action]:
+
+        # --- Log Mask BEFORE the initial check ---
+        initial_mask_str = "None"
+        initial_mask_len = 0
+        if self.current_action_mask is not None:
+            initial_mask_len = len(self.current_action_mask)
+            try:
+                # Check if action is within bounds before accessing mask value
+                if action < initial_mask_len:
+                    initial_mask_str = f"Len={initial_mask_len}, ValueAtAction={self.current_action_mask[action]}"
+                else:
+                    initial_mask_str = f"Len={initial_mask_len}, Action OOB"
+            except IndexError:
+                initial_mask_str = f"Len={initial_mask_len}, IndexError accessing action {action}"  # Defensive
+        print(
+            f"  DEBUG take_action: ENTRY Action={action}, Level={self.current_action_level}. Initial Mask Check: {initial_mask_str}")
+        # --- End Log ---
+
+        if self.current_action_mask is None or action >= len(self.current_action_mask) or self.current_action_mask[
+            action]:
+            # If this exception occurs, the log above shows the mask state that caused it.
             raise ValueError(f"Action {action} masked/invalid for level {self.current_action_level}.")
 
         current_level = self.current_action_level
-        next_level = 0
+        next_level = 0  # Default next level
         self.history.append(int(action))
         num_real_atoms_before = len(self.atoms) - 1
 
         try:
             atom_removed = False
+            # --- Apply Action based on Level ---
             if current_level == 0:
-                if action == 0: self.synthesis_done = True; self.finalize(); next_level = -1  # finalize now builds local rdkit_mol
-                else:
+                if action == 0:  # Terminate
+                    self.synthesis_done = True
+                    self.finalize()  # Builds local rdkit_mol
+                    next_level = -1  # Special level for termination
+                else:  # Select Atom
                     self.l0_selected_atom_idx = action
-                    self.is_modifying_atom=False; self.atom_to_modify=None; self.l1_new_atom_type=None; self.l1_selected_existing_atom_idx=None
+                    # Reset L1/L2 state variables explicitly when starting L1
+                    self.is_modifying_atom = False;
+                    self.atom_to_modify = None;
+                    self.l1_new_atom_type = None;
+                    self.l1_selected_existing_atom_idx = None
                     next_level = 1
             elif current_level == 1:
                 modify_idx = self.vocab_size + num_real_atoms_before
-                if action < self.vocab_size: # Add Atom
+                if action < self.vocab_size:  # Add Atom
                     self.l1_new_atom_type = action + 1
                     self.atoms = np.append(self.atoms, self.l1_new_atom_type)
-                    new_size = len(self.atoms); new_idx = new_size - 1
-                    self.bonds = np.pad(self.bonds, [(0,1),(0,1)], 'constant', constant_values=0)
-                    self.bonds[0, new_idx] = self.bonds[new_idx, 0] = self.virtual_bond_idx
-                    self.is_modifying_atom = False; next_level = 2
-                elif action < modify_idx: # Select Existing
+                    new_size = len(self.atoms);
+                    new_idx = new_size - 1
+                    self.bonds = np.pad(self.bonds, [(0, 1), (0, 1)], 'constant', constant_values=0)
+                    self.bonds[0, new_idx] = self.bonds[new_idx, 0] = self.virtual_bond_idx  # Connect to virtual node
+                    self.is_modifying_atom = False  # Ensure correct path for L2
+                    next_level = 2
+                elif action < modify_idx:  # Select Existing
                     self.l1_selected_existing_atom_idx = (action - self.vocab_size) + 1
-                    self.is_modifying_atom = False; next_level = 2
-                elif action == modify_idx: # Initiate Modify
+                    self.is_modifying_atom = False  # Ensure correct path for L2
+                    next_level = 2
+                elif action == modify_idx:  # Initiate Modify
                     self.atom_to_modify = self.l0_selected_atom_idx
-                    self.is_modifying_atom = True; next_level = 2
-                else: raise ValueError("Invalid L1 action")
+                    self.is_modifying_atom = True  # Set flag for L2
+                    next_level = 2
+                else:
+                    raise ValueError(f"Invalid L1 action index: {action}")
             elif current_level == 2:
-                if self.is_modifying_atom: # Modify Path
+                if self.is_modifying_atom:  # Modify Path
                     mod_idx = self.atom_to_modify
-                    if mod_idx is None: raise ValueError("atom_to_modify not set")
-                    if action < self.vocab_size: # Replace Type
+                    if mod_idx is None: raise ValueError("L2 Modify path entered but atom_to_modify not set")
+                    if action < self.vocab_size:  # Replace Type
                         self.atoms[mod_idx] = action + 1
-                    elif action == self.REMOVE_ATOM_ACTION_L2_MODIFY: # Remove Atom
-                        self.atoms = np.delete(self.atoms, mod_idx)
-                        self.bonds = np.delete(np.delete(self.bonds, mod_idx, 0), mod_idx, 1)
-                        self._adjust_indices_after_removal(mod_idx); atom_removed = True
-                    else: raise ValueError("Invalid L2 Modify action")
-                    self.is_modifying_atom=False; self.atom_to_modify=None; next_level = 0
-                else: # Bond Path
+                    elif action == self.REMOVE_ATOM_ACTION_L2_MODIFY:  # Remove Atom
+                        # --- Ensure _adjust_indices_after_removal is called AFTER state changes ---
+                        removed_idx_for_adjust = mod_idx  # Store index before potential modification by delete
+                        self.atoms = np.delete(self.atoms, removed_idx_for_adjust)
+                        self.bonds = np.delete(np.delete(self.bonds, removed_idx_for_adjust, 0), removed_idx_for_adjust,
+                                               1)
+                        self._adjust_indices_after_removal(removed_idx_for_adjust)  # Adjust other indices
+                        atom_removed = True
+                        # --- End ---
+                    else:
+                        raise ValueError(f"Invalid L2 Modify action index: {action}")
+                    # Reset modify state after completion
+                    self.is_modifying_atom = False;
+                    self.atom_to_modify = None;
+                    next_level = 0  # Back to L0
+                else:  # Bond Path
                     idx_A = self.l0_selected_atom_idx
-                    idx_B = len(self.atoms) - 1 if self.l1_new_atom_type is not None else self.l1_selected_existing_atom_idx
-                    if idx_A is None or idx_B is None: raise ValueError("L2 Bond indices missing")
-                    if action <= 5: # Set Order
+                    # Determine B based on L1 action
+                    idx_B = -1  # Initialize
+                    if self.l1_new_atom_type is not None:
+                        idx_B = len(self.atoms) - 1  # New atom is last one
+                    elif self.l1_selected_existing_atom_idx is not None:
+                        idx_B = self.l1_selected_existing_atom_idx
+                    else:
+                        raise ValueError("L2 Bond path entered but L1 context (new/existing) missing")
+
+                    if idx_A is None or idx_B == -1: raise ValueError(f"L2 Bond indices invalid: A={idx_A}, B={idx_B}")
+
+                    if action <= 5:  # Set Order (Action 0 = Order 1, ..., Action 5 = Order 6)
                         order = action + 1
                         self.bonds[idx_A, idx_B] = self.bonds[idx_B, idx_A] = order
-                    elif action == 6: # Remove Bond
+                    elif action == 6:  # Remove Bond (Set Order 0)
                         self.bonds[idx_A, idx_B] = self.bonds[idx_B, idx_A] = 0
-                    else: raise ValueError("Invalid L2 Bond action")
-                    self.l1_new_atom_type=None; self.l1_selected_existing_atom_idx=None; next_level = 0
+                    else:
+                        raise ValueError(f"Invalid L2 Bond action index: {action}")
+                    # Reset L1 state after completion
+                    self.l1_new_atom_type = None;
+                    self.l1_selected_existing_atom_idx = None;
+                    next_level = 0  # Back to L0
 
+            # --- Update Mask and Level (if not terminated) ---
             if next_level != -1:
-                 self._check_and_update_connectivity() # Use NetworkX version
-                 # --- No topological matrix update ---
-                 self.current_action_level = next_level
-                 self.update_action_mask()
-            else: self.current_action_mask = None
+                # Log mask state BEFORE calling update_action_mask
+                mask_before_update_str = "None"
+                if self.current_action_mask is not None: mask_before_update_str = f"Len={len(self.current_action_mask)}"  # Just log length maybe
+                print(
+                    f"  DEBUG take_action: Action={action}, Level={current_level}. Mask BEFORE update_action_mask call: {mask_before_update_str}")
+
+                self._check_and_update_connectivity()  # Update connectivity based on new state
+
+                self.current_action_level = next_level  # Set level for the NEXT step
+
+                self.update_action_mask()  # Calculate mask for the NEXT step
+
+                # Log mask state IMMEDIATELY AFTER update_action_mask returns
+                mask_after_update_str = "None"
+                if self.current_action_mask is not None:
+                    mask_after_update_str = f"Len={len(self.current_action_mask)}, Vals={self.current_action_mask[:7]}..."  # Log more values
+                print(
+                    f"  DEBUG take_action: Action={action}, Level={current_level}. Mask AFTER update_action_mask call: {mask_after_update_str}")
+
+            else:  # Termination action was taken
+                # Log mask state BEFORE setting to None
+                print(
+                    f"  DEBUG take_action: Action={action}, Level={current_level}. Mask BEFORE setting to None (Termination): {'Exists' if self.current_action_mask is not None else 'None'}")
+                self.current_action_mask = None  # No further actions possible
+
+            # --- Log Mask state just before function returns ---
+            final_mask_str = "None"
+            if self.current_action_mask is not None:
+                final_mask_str = f"Len={len(self.current_action_mask)}, Vals={self.current_action_mask[:7]}..."
+            print(
+                f"  DEBUG take_action: Action={action}, Level={current_level}. Mask JUST BEFORE RETURN: {final_mask_str}")
+            # --- End Log ---
+
         except Exception as e:
-             print(f"FATAL ERROR take_action(action={action}, L{current_level}): {e}")
-             import traceback; traceback.print_exc()
-             self.infeasibility_flag = True; self.synthesis_done = True; self.current_action_mask = None
+            print(f"FATAL ERROR during take_action(action={action}, L{current_level}): {e}")
+            traceback.print_exc()
+            self.infeasibility_flag = True;
+            self.synthesis_done = True;
+            self.current_action_mask = None
+            # Log mask state after error
+            print(f"  DEBUG take_action: Action={action}, Level={current_level}. Mask AFTER EXCEPTION: None")
 
 
     def finalize(self, assert_feasible: bool = False):
@@ -671,148 +848,208 @@ class MoleculeDesign(BaseTrajectory):
                 atoms.append(i + 1)
         return MoleculeDesign.init_batch_from_instance_list(config, atoms * repeat)
 
-    # --- from_smiles / from_rdkit_mol (Keep Simulation Logic) ---
+
     @staticmethod
-    def from_smiles(config: MoleculeConfig, smiles: str, do_finish=True, compare_smiles=False, max_steps=500) -> 'MoleculeDesign':
-        """Creates a MoleculeDesign instance by simulating actions from a SMILES string."""
+    def from_smiles(config: MoleculeConfig, smiles: str, **kwargs) -> Tuple[
+        Optional['MoleculeDesign'], Optional[Dict[int, int]]]:
+        """
+        Creates a MoleculeDesign instance directly from a SMILES string.
+        Handles canonicalization and renumbering before calling from_rdkit_mol.
+
+        Returns the instance and a map from original canonical RDKit indices to internal indices,
+        or (None, None) on failure.
+        """
         mol = Chem.MolFromSmiles(smiles)
-        if mol is None: raise ValueError(f"Invalid SMILES input: {smiles}")
-        try: Chem.SanitizeMol(mol, catchErrors=True)
-        except Exception as e: print(f"Warning: Input SMILES {smiles} failed initial sanitization: {e}")
-        return MoleculeDesign.from_rdkit_mol(config, mol, smiles, do_finish, compare_smiles, max_steps)
+        if mol is None:
+            print(f"Warning: Invalid SMILES input: {smiles}. Returning None.")
+            return None, None
+
+        # --- Canonical Renumbering (Crucial for consistency with GED) ---
+        # Ensure the molecule processed by from_rdkit_mol has the same atom indices
+        # as the one used for GED generation.
+        try:
+            Chem.SanitizeMol(mol, catchErrors=True)  # Sanitize first
+            # Kekulize BEFORE canonical ranking for consistency
+            Chem.Kekulize(mol, clearAromaticFlags=True)
+            # Renumber atoms based on canonical rank
+            canonical_order = rdmolfiles.CanonicalRankAtoms(mol)
+            mol = rdmolops.RenumberAtoms(mol, canonical_order)
+            # Ensure sanitization again after potential changes? Might not be needed.
+            # Chem.SanitizeMol(mol, catchErrors=True)
+        except Exception as e:
+            print(f"Warning: Could not sanitize/kekulize/canonically renumber input SMILES {smiles}: {e}")
+            # Fail if preprocessing fails, as map consistency is critical
+            return None, None
+
+        # Call the simplified from_rdkit_mol
+        try:
+            # Pass the preprocessed mol
+            design_instance, rdkit_map = MoleculeDesign.from_rdkit_mol(
+                config, mol, smiles=smiles  # Pass smiles for logging if needed
+            )
+        except Exception as e:
+            print(f"Error during from_rdkit_mol execution for {smiles}: {e}")
+            import traceback;
+            traceback.print_exc()  # Uncomment for detailed debug
+            return None, None  # Return None for both on error
+
+        return design_instance, rdkit_map
 
     @staticmethod
-    def from_rdkit_mol(config: MoleculeConfig, rdkit_mol: Chem.Mol, smiles: Optional[str] = None,
-                       do_finish: bool = True, compare_smiles: bool = False,
-                       max_steps: int = 500) -> 'MoleculeDesign':
+    def from_rdkit_mol(config: MoleculeConfig, rdkit_mol: Chem.Mol, smiles: Optional[str] = None) -> Tuple[
+        Optional['MoleculeDesign'], Optional[Dict[int, int]]]:
         """
-        Creates a MoleculeDesign instance by simulating actions from an RDKit molecule (v2025-04-20 Sim Debug No RDKit).
-        Attempts to build the molecule step-by-step using take_action, minimizing RDKit use during simulation.
-        """
-        # print(f"\n--- DEBUG: Entering from_rdkit_mol (Simulation) for SMILES: {smiles} ---") # DEBUG
-        if not isinstance(rdkit_mol, Chem.Mol): raise TypeError("Input rdkit_mol must be an RDKit Mol object.")
+        Creates a MoleculeDesign instance directly from an RDKit molecule
+        by constructing the internal state (atoms, bonds) without simulating actions.
 
-        # Preprocessing (same)
+        Assumes input rdkit_mol has been appropriately preprocessed
+        (e.g., Kekulized, Canonically Renumbered) before calling this method.
+
+        Returns the instance and a map from the RDKit indices of the input molecule
+        to the internal indices of the created instance, or (None, None) on failure.
+        """
+        BOND_TYPE_TO_RL_ORDER = {
+            Chem.BondType.SINGLE: 1,
+            Chem.BondType.DOUBLE: 2,
+            Chem.BondType.TRIPLE: 3,
+            Chem.BondType.QUADRUPLE: 4,
+            Chem.BondType.QUINTUPLE: 5,
+            Chem.BondType.HEXTUPLE: 6,
+        }
+
+        # 1. Preprocessing (Remove Hs, assume already Kekulized/Renumbered)
         try:
-            mol_copy = Chem.RemoveHs(rdkit_mol, sanitize=False)
-            if mol_copy.GetNumAtoms() == 0: raise ValueError("Input molecule has no heavy atoms.")
-        except Exception as e: raise ValueError(f"Failed to remove hydrogens: {e}")
-        try: Chem.Kekulize(mol_copy, clearAromaticFlags=True)
-        except Exception as e: print(f"Warning: Kekulization failed: {e}")
-        target_atoms = mol_copy.GetAtoms(); num_target_atoms = len(target_atoms)
-        if num_target_atoms == 0: raise ValueError("Input molecule has no heavy atoms after processing.")
+            mol_copy = Chem.RemoveHs(rdkit_mol, sanitize=False)  # Keep H removal
+            num_heavy_atoms = mol_copy.GetNumAtoms()
+            if num_heavy_atoms == 0:
+                print(f"Warning: Input molecule {smiles or ''} has no heavy atoms. Creating empty design.")
+                # Handle empty molecule case: Create an instance with only virtual atom?
+                instance = MoleculeDesign(config, initial_atom=1)  # Need a valid initial atom
+                instance.atoms = np.array([0], dtype=np.uint8)  # Override to be empty
+                instance.bonds = np.zeros((1, 1), dtype=np.uint8)
+                instance.update_action_mask()  # Update mask for empty state
+                return instance, {}  # Return empty map
 
-        # Map Target Atoms (same)
-        prop_to_vocab_idx = {}; vocab_names = list(config.atom_vocabulary.keys())
-        for i, name in enumerate(vocab_names):
-            cfg = config.atom_vocabulary[name]; key = f"{cfg['atomic_number']}_{cfg.get('formal_charge', 0)}_{cfg.get('chiral_tag', 0)}"
-            prop_to_vocab_idx[key] = i + 1
-        target_atom_vocab_indices = []; target_rdkit_indices = [atom.GetIdx() for atom in target_atoms]
-        for atom in target_atoms:
-            key_parts = [str(atom.GetAtomicNum()), str(atom.GetFormalCharge())]; ct = atom.GetChiralTag(); chiral_tag_int = 0
-            if ct == Chem.ChiralType.CHI_TETRAHEDRAL_CW: chiral_tag_int = 1
-            elif ct == Chem.ChiralType.CHI_TETRAHEDRAL_CCW: chiral_tag_int = 2
-            key_parts.append(str(chiral_tag_int)); key = "_".join(key_parts)
-            vocab_idx = prop_to_vocab_idx.get(key)
-            if vocab_idx is None and chiral_tag_int != 0: key_no_chiral = f"{atom.GetAtomicNum()}_{atom.GetFormalCharge()}_0"; vocab_idx = prop_to_vocab_idx.get(key_no_chiral)
-            if vocab_idx is None or not config.atom_vocabulary[vocab_names[vocab_idx-1]]["allowed"]: raise ValueError(f"Target atom {atom.GetIdx()} cannot be mapped.")
-            target_atom_vocab_indices.append(vocab_idx)
+        except Exception as e:
+            print(f"Error during preprocessing in from_rdkit_mol for {smiles or ''}: {e}")
+            return None, None
 
-        # Build Target Adjacency (same)
-        bond_type_to_order = { Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, Chem.BondType.TRIPLE: 3, Chem.BondType.QUADRUPLE: 4, Chem.BondType.QUINTUPLE: 5, Chem.BondType.HEXTUPLE: 6, Chem.BondType.AROMATIC: 1 }
-        target_adjacency_orders = {}
+        # 2. Build Atom List and Index Map
+        # Get reverse lookup: (atomic_num, charge, chiral) -> vocab_idx
+        # This helper function should be defined elsewhere or passed in
+        try:
+            reverse_atom_lookup = build_reverse_atom_lookup(config)
+        except NameError:
+            print("Error: build_reverse_atom_lookup helper function not found.")
+            return None, None
+
+        internal_atoms_list = [0]  # Start with virtual atom
+        rdkit_to_internal_map = {}
+        internal_idx_counter = 1  # Internal indices start from 1
+
+        for atom in mol_copy.GetAtoms():
+            rdkit_idx = atom.GetIdx()
+            atomic_num = atom.GetAtomicNum()
+            charge = atom.GetFormalCharge()
+            chiral = int(atom.GetChiralTag())
+
+            # Find corresponding vocabulary index
+            key = (atomic_num, charge, chiral)
+            vocab_idx = reverse_atom_lookup.get(key)
+            if vocab_idx is None and chiral != 0:  # Try without chirality if specific chiral not found
+                key_no_chiral = (atomic_num, charge, 0)
+                vocab_idx = reverse_atom_lookup.get(key_no_chiral)
+
+            if vocab_idx is None:
+                print(f"Error: Atom type (Num={atomic_num}, Charge={charge}, Chiral={chiral}) "
+                      f"in molecule {smiles or ''} not found in vocabulary config.")
+                return None, None  # Cannot proceed if atom is not representable
+
+            # Check if atom type is allowed (optional, mask handles it later)
+            # atom_name = config.atom_vocabulary_names[vocab_idx - 1] # Assuming this attr exists
+            # if not config.atom_vocabulary[atom_name]["allowed"]:
+            #     print(f"Error: Atom type {atom_name} is not allowed by config.")
+            #     return None, None
+
+            internal_atoms_list.append(vocab_idx)
+            rdkit_to_internal_map[rdkit_idx] = internal_idx_counter
+            internal_idx_counter += 1
+
+        # 3. Build Bond Matrix
+        num_total_atoms = len(internal_atoms_list)  # Includes virtual atom
+        internal_bonds_matrix = np.zeros((num_total_atoms, num_total_atoms), dtype=np.uint8)
+
         for bond in mol_copy.GetBonds():
-            i_rdkit, j_rdkit = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(); order = bond_type_to_order.get(bond.GetBondType(), 0)
-            if order > 0: target_adjacency_orders[tuple(sorted((i_rdkit, j_rdkit)))] = order
+            rdkit_idx1 = bond.GetBeginAtomIdx()
+            rdkit_idx2 = bond.GetEndAtomIdx()
+            bond_type = bond.GetBondType()
 
-        # Initialize Simulation
-        initial_atom_vocab_idx = target_atom_vocab_indices[0]
-        design = MoleculeDesign(config, initial_atom_vocab_idx)
-        rdkit_idx_to_internal_idx = {target_rdkit_indices[0]: 1}
-        steps_taken = 0
-        # print(f"  DEBUG from_rdkit_mol: Initialized with atom {initial_atom_vocab_idx}. Map: {rdkit_idx_to_internal_idx}") # DEBUG
+            # Map bond type to RL order (1-6),
+            rl_order = BOND_TYPE_TO_RL_ORDER.get(bond_type)
 
-        # Simulate Building Process
-        for i in range(1, num_target_atoms):
-            if steps_taken > max_steps: print(f"Warning: Exceeded max_steps"); design.infeasibility_flag = True; break
-            if design.infeasibility_flag: break
-            current_target_rdkit_idx = target_rdkit_indices[i]
-            atom_to_add_vocab_idx = target_atom_vocab_indices[i]
-            atom_to_add_l1_action = atom_to_add_vocab_idx - 1
-            # print(f"\n  DEBUG: Processing target atom i={i} (RDKit={current_target_rdkit_idx}, Type={atom_to_add_vocab_idx})") # DEBUG
-            connection_found = False
-            for j in range(i):
-                anchor_target_rdkit_idx = target_rdkit_indices[j]
-                bond_key = tuple(sorted((current_target_rdkit_idx, anchor_target_rdkit_idx)))
-                bond_order = target_adjacency_orders.get(bond_key, 0)
-                if bond_order > 0 and anchor_target_rdkit_idx in rdkit_idx_to_internal_idx:
-                    anchor_internal_idx = rdkit_idx_to_internal_idx[anchor_target_rdkit_idx]
-                    connection_found = True
-                    # print(f"    DEBUG: Connect to anchor j={j} (Internal={anchor_internal_idx}), Order={bond_order}") # DEBUG
-                    action_seq = [anchor_internal_idx, atom_to_add_l1_action, bond_order - 1]
-                    level_seq = [0, 1, 2]
-                    # print(f"    DEBUG: Seq Add+Bond: {action_seq}") # DEBUG
-                    try:
-                        for idx, action in enumerate(action_seq):
-                             level = level_seq[idx]
-                             # print(f"      DEBUG: Try action {action} L{level} (Expect {design.current_action_level})") # DEBUG
-                             if design.current_action_level != level: raise RuntimeError(f"Level mismatch {level} vs {design.current_action_level}")
-                             mask = design.current_action_mask
-                             if mask is None or action >= len(mask) or mask[action]: raise ValueError(f"Action {action} masked L{level}")
-                             design.take_action(action); steps_taken += 1
-                             # print(f"      DEBUG: OK. New L{design.current_action_level}") # DEBUG
-                    except Exception as e: print(f"    DEBUG ERROR Add+Bond: {e}"); design.infeasibility_flag = True; break
-                    if design.infeasibility_flag: break
-                    new_atom_internal_idx = len(design.atoms) - 1
-                    rdkit_idx_to_internal_idx[current_target_rdkit_idx] = new_atom_internal_idx
-                    # print(f"    DEBUG: Added map {current_target_rdkit_idx} -> {new_atom_internal_idx}") # DEBUG
-                    for k in range(i):
-                        if k == j: continue
-                        if design.infeasibility_flag: break
-                        other_target_rdkit_idx = target_rdkit_indices[k]
-                        extra_bond_key = tuple(sorted((current_target_rdkit_idx, other_target_rdkit_idx)))
-                        extra_bond_order = target_adjacency_orders.get(extra_bond_key, 0)
-                        if extra_bond_order > 0 and other_target_rdkit_idx in rdkit_idx_to_internal_idx:
-                            other_internal_idx = rdkit_idx_to_internal_idx[other_target_rdkit_idx]
-                            # print(f"    DEBUG: Extra bond to k={k} (Internal={other_internal_idx}), Order={extra_bond_order}") # DEBUG
-                            l1_select_action = design.vocab_size + (new_atom_internal_idx - 1)
-                            extra_bond_seq = [other_internal_idx, l1_select_action, extra_bond_order - 1]
-                            level_seq_extra = [0, 1, 2]
-                            # print(f"    DEBUG: Seq ExtraBond: {extra_bond_seq}") # DEBUG
-                            try:
-                                for idx, action in enumerate(extra_bond_seq):
-                                     level = level_seq_extra[idx]
-                                     # print(f"      DEBUG: Try action {action} L{level} (Expect {design.current_action_level})") # DEBUG
-                                     if design.current_action_level != level: raise RuntimeError(f"Level mismatch {level} vs {design.current_action_level}")
-                                     mask = design.current_action_mask
-                                     if mask is None or action >= len(mask) or mask[action]: raise ValueError(f"Action {action} masked L{level}")
-                                     design.take_action(action); steps_taken += 1
-                                     # print(f"      DEBUG: OK. New L{design.current_action_level}") # DEBUG
-                            except Exception as e: print(f"    DEBUG ERROR ExtraBond: {e}"); design.infeasibility_flag = True; break
-                    break # Break j loop
-            if not connection_found and num_target_atoms > 1: print(f"ERROR: Disconnected target RDKit={current_target_rdkit_idx}."); design.infeasibility_flag = True; break
+            if rl_order is None:
+                # Handle unsupported bond types (e.g., Aromatic if not Kekulized, Other)
+                print(f"Warning: Unsupported bond type {bond_type} found in {smiles or ''}. Skipping bond.")
+                continue
 
-        # Finalization
-        # print(f"--- DEBUG: Finished simulation for {smiles}. Steps={steps_taken}, Infeasible={design.infeasibility_flag} ---") # DEBUG
-        if not design.infeasibility_flag and do_finish:
+            # Get corresponding internal indices
             try:
-                if design.is_terminable():
-                     mask0 = design.current_action_mask
-                     if mask0 is not None and not mask0[0]: design.take_action(0); steps_taken += 1
-                     else: print(f"  DEBUG WARNING: Final terminate masked.")
-                else: print("WARNING: Not terminable after construction."); design.finalize(assert_feasible=False)
-            except ValueError as e: print(f"WARNING: Error during final terminate: {e}"); design.finalize(assert_feasible=False)
-        elif design.infeasibility_flag: print("Skipping final terminate (infeasible)."); design.finalize(assert_feasible=False)
-        else: design.finalize(assert_feasible=False)
+                internal_idx1 = rdkit_to_internal_map[rdkit_idx1]
+                internal_idx2 = rdkit_to_internal_map[rdkit_idx2]
+            except KeyError:
+                # This shouldn't happen if atom mapping worked correctly
+                print(f"Error: RDKit index mapping failed for bond ({rdkit_idx1}, {rdkit_idx2}).")
+                return None, None
 
-        # SMILES Comparison (optional, keep as is)
-        if compare_smiles and smiles is not None and not design.infeasibility_flag:
-             try:
-                 final_mol_internal = design.to_rdkit_mol(sanitize=True); final_smiles_internal = Chem.MolToSmiles(final_mol_internal) if final_mol_internal else None
-                 ref_mol_orig_noH = Chem.RemoveHs(Chem.MolFromSmiles(smiles)); ref_smiles_canon = Chem.MolToSmiles(ref_mol_orig_noH) if ref_mol_orig_noH else None
-                 if final_smiles_internal and ref_smiles_canon and Chem.CanonSmiles(final_smiles_internal) != Chem.CanonSmiles(ref_smiles_canon):
-                      print(f"WARNING: SMILES mismatch"); print(f"  Constructed: {final_smiles_internal} -> {Chem.CanonSmiles(final_smiles_internal)}"); print(f"  Reference:   {smiles} -> {Chem.CanonSmiles(ref_smiles_canon)}")
-             except Exception as smi_err: print(f"Warning: Error during SMILES compare: {smi_err}")
+            # Set bond order symmetrically
+            internal_bonds_matrix[internal_idx1, internal_idx2] = rl_order
+            internal_bonds_matrix[internal_idx2, internal_idx1] = rl_order
 
-        # print(f"--- DEBUG: Exiting from_rdkit_mol for {smiles}. History Len: {len(design.history)} ---") # DEBUG
-        return design
+        # 4. Add Virtual Bonds
+        if num_total_atoms > 1:
+            virtual_bond_val = 7  # Get from config or class attribute
+            internal_bonds_matrix[0, 1:] = virtual_bond_val
+            internal_bonds_matrix[1:, 0] = virtual_bond_val
+
+        # 5. Create Instance and Set State
+        try:
+            # Create a base instance - requires a valid initial atom, even if overridden
+            # Find the first *allowed* atom in the vocab as a fallback initial atom
+            first_allowed_atom_idx = 1
+            for i, name in enumerate(config.atom_vocabulary.keys()):
+                if config.atom_vocabulary[name]["allowed"]:
+                    first_allowed_atom_idx = i + 1
+                    break
+
+            instance = MoleculeDesign(config, initial_atom=first_allowed_atom_idx)
+
+            # Directly set the constructed state
+            instance.atoms = np.array(internal_atoms_list, dtype=np.uint8)
+            instance.bonds = internal_bonds_matrix
+
+            # Initialize other relevant state attributes
+            instance.synthesis_done = False
+            instance.smiles_string = None  # Not finalized yet
+            instance.objective = None
+            instance.infeasibility_flag = False
+            instance.current_action_level = 0
+            instance.history = []  # No action history generated here
+            instance.l0_selected_atom_idx = None
+            # ... reset other action state variables ...
+            instance.is_modifying_atom = False
+            instance.atom_to_modify = None
+            instance.l1_new_atom_type = None
+            instance.l1_selected_existing_atom_idx = None
+
+            # Check connectivity and update initial mask
+            instance._check_and_update_connectivity()  # Uses NetworkX on new state
+            instance.update_action_mask()
+
+        except Exception as e:
+            print(f"Error creating/setting state for MoleculeDesign instance for {smiles or ''}: {e}")
+            import traceback;
+            traceback.print_exc()
+            return None, None
+
+        # 6. Return instance and map
+        return instance, rdkit_to_internal_map

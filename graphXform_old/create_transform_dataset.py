@@ -25,7 +25,7 @@ RDLogger.DisableLog('rdApp.*')
 MAX_ATOMS = 50
 # NUM_PAIRS is now determined by dataset size
 RANDOM_SEED = 42
-CHECKPOINT_DIR = "./data/chembl/checkpoints"
+CHECKPOINT_DIR = "../data/chembl/checkpoints"
 CHECKPOINT_FREQUENCY = 5000  # Save progress after every 5000 transformations
 DATATYPES = ["train", "valid"]
 

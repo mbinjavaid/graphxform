@@ -3,9 +3,9 @@ import pickle
 import os
 import random
 import numpy as np
-# import networkx as nx
+# import networkx as nx # No longer needed directly here
 from rdkit import Chem, RDLogger
-# from rdkit.Chem import rdmolfiles, rdmolops
+# from rdkit.Chem import rdmolfiles, rdmolops # No longer needed directly here
 from tqdm import tqdm
 from typing import List, Tuple, Dict, Optional, Set, Any
 from datetime import datetime
@@ -56,8 +56,8 @@ MAX_TOTAL_ATTEMPTS_PER_MOLECULE = TRANSFORMATIONS_PER_MOLECULE * MAX_ATTEMPTS_PE
 
 RANDOM_SEED = CONFIG.seed
 CHECKPOINT_DIR = "./data/chembl/checkpoints_transformations"
-STATS_FREQUENCY = 50
-CHECKPOINT_FREQUENCY = 500 # Use config value
+STATS_FREQUENCY = 10
+CHECKPOINT_FREQUENCY = 100 # Use config value
 RESULTS_DIR = "./data/chembl/transformation_datasets"
 
 CHEMBL_TRAIN_PATH = "./data/chembl/chembl_train_filtered.smiles"
@@ -136,31 +136,81 @@ def get_action_type_name(level: int, action: int, vocab_size: int, num_real_atom
     elif level == 2: return "Set Bond Order" if 0 <= action <= 5 else "Remove Bond" if action == 6 else "Unknown L2"
     else: return "Unknown Level"
 
-def select_equalized_random_action(mol_design: MoleculeDesign) -> Optional[int]:
-    # (Implementation remains the same)
-    mask = mol_design.current_action_mask; level = mol_design.current_action_level
-    num_real_atoms = len(mol_design.atoms) - 1; vocab_size = mol_design.vocab_size
-    if mask is None: return None
+# <<< Renamed and Modified Action Selection Function >>>
+def select_action_strategy(mol_design: MoleculeDesign, terminate_prob: float = 0.05) -> Optional[int]:
+    """
+    Selects a random valid action based on the current level.
+    Level 0: Biased sampling (terminate_prob for Terminate, 1-terminate_prob for Select Atom).
+    Level 1/2: Equal probability sampling across valid action *categories*.
+    """
+    mask = mol_design.current_action_mask
+    level = mol_design.current_action_level
+    num_real_atoms = len(mol_design.atoms) - 1
+    vocab_size = mol_design.vocab_size
+
+    if mask is None:
+        if DEBUG_MODE: print("DEBUG (Action Select): Mask is None.")
+        return None
+
     valid_action_indices = [i for i, is_masked in enumerate(mask) if not is_masked]
-    if not valid_action_indices: return None
-    action_groups: Dict[str, List[int]] = {}
+    if not valid_action_indices:
+        if DEBUG_MODE: print(f"DEBUG (Action Select): No valid actions at level {level}.")
+        return None
+
+    # --- Level 0: Biased Sampling ---
     if level == 0:
-        action_groups["Terminate"] = [i for i in valid_action_indices if i == 0]
-        action_groups["Select Atom"] = [i for i in valid_action_indices if 1 <= i <= num_real_atoms]
-    elif level == 1:
-        remove_action_idx = vocab_size + num_real_atoms
-        action_groups["Add Atom"] = [i for i in valid_action_indices if 0 <= i < vocab_size]
-        action_groups["Select Existing Atom"] = [i for i in valid_action_indices if vocab_size <= i < remove_action_idx]
-        action_groups["Remove Atom"] = [i for i in valid_action_indices if i == remove_action_idx]
-    elif level == 2:
-        action_groups["Set Bond Order"] = [i for i in valid_action_indices if 0 <= i <= 5]
-        action_groups["Remove Bond"] = [i for i in valid_action_indices if i == 6]
-    else: raise ValueError(f"Invalid action level: {level}")
-    valid_types = {name: indices for name, indices in action_groups.items() if indices}
-    if not valid_types: return None
-    selected_type_name = random.choice(list(valid_types.keys()))
-    selected_action_index = random.choice(valid_types[selected_type_name])
-    return selected_action_index
+        valid_terminate_actions = [i for i in valid_action_indices if i == 0]
+        valid_select_atom_actions = [i for i in valid_action_indices if 1 <= i <= num_real_atoms]
+
+        can_terminate = bool(valid_terminate_actions)
+        can_select_atom = bool(valid_select_atom_actions)
+
+        if not can_terminate and not can_select_atom:
+            # Should not happen if valid_action_indices is not empty
+            if DEBUG_MODE: print("DEBUG (Action Select L0): No valid Terminate or Select Atom actions found despite valid indices.")
+            return None
+        elif can_terminate and not can_select_atom:
+            # Only termination is possible (e.g., empty molecule, min actions met)
+            return valid_terminate_actions[0] # Action 0
+        elif not can_terminate and can_select_atom:
+            # Only atom selection is possible (e.g., min actions not met)
+            return random.choice(valid_select_atom_actions)
+        else: # Both are possible
+            # Sample based on probability
+            if random.random() < terminate_prob: # terminate_prob chance (e.g., 0.05)
+                if DEBUG_MODE: print(f"DEBUG (Action Select L0): Chose Terminate (Prob: {terminate_prob})")
+                return valid_terminate_actions[0] # Action 0
+            else: # 1 - terminate_prob chance (e.g., 0.95)
+                selected_atom_action = random.choice(valid_select_atom_actions)
+                if DEBUG_MODE: print(f"DEBUG (Action Select L0): Chose Select Atom {selected_atom_action} (Prob: {1.0-terminate_prob})")
+                return selected_atom_action
+
+    # --- Level 1 & 2: Equalized Category Sampling ---
+    else:
+        action_groups: Dict[str, List[int]] = {}
+        if level == 1:
+            remove_action_idx = vocab_size + num_real_atoms
+            action_groups["Add Atom"] = [i for i in valid_action_indices if 0 <= i < vocab_size]
+            action_groups["Select Existing Atom"] = [i for i in valid_action_indices if vocab_size <= i < remove_action_idx]
+            action_groups["Remove Atom"] = [i for i in valid_action_indices if i == remove_action_idx]
+        elif level == 2:
+            action_groups["Set Bond Order"] = [i for i in valid_action_indices if 0 <= i <= 5]
+            action_groups["Remove Bond"] = [i for i in valid_action_indices if i == 6]
+        else:
+            raise ValueError(f"Invalid action level for equalized sampling: {level}")
+
+        valid_categories = {name: indices for name, indices in action_groups.items() if indices}
+        if not valid_categories:
+             if DEBUG_MODE: print(f"DEBUG (Action Select L{level}): No valid action categories found.")
+             return None
+
+        # Choose a category with equal probability
+        selected_category_name = random.choice(list(valid_categories.keys()))
+        # Choose an action within that category with equal probability
+        selected_action_index = random.choice(valid_categories[selected_category_name])
+
+        if DEBUG_MODE: print(f"DEBUG (Action Select L{level}): Chose Category '{selected_category_name}', Action {selected_action_index}")
+        return selected_action_index
 
 
 # --- generate_single_transformation (Tracks max components in DEBUG mode) ---
@@ -178,8 +228,7 @@ def generate_single_transformation(
     """
     current_mol_design = copy.deepcopy(initial_mol_design)
     high_level_action_count = 0
-    # <<< Initialize max components tracking >>>
-    max_components_this_sequence = 1 # Start with 1 assuming initial is connected
+    max_components_this_sequence = 1
 
     if DEBUG_MODE and current_mol_design.synthesis_done:
          print(f"DEBUG ERROR: Copied design is already finalized!")
@@ -204,22 +253,28 @@ def generate_single_transformation(
         prev_level = current_mol_design.current_action_level
         prev_num_real = len(current_mol_design.atoms) - 1
 
-        action = select_equalized_random_action(current_mol_design)
+        # <<< Use the new selection strategy >>>
+        action = select_action_strategy(current_mol_design)
+        # <<< End change >>>
+
         if action is None:
-            debug_smiles = current_mol_design._get_smiles_for_check() if DEBUG_MODE else "(Not checked)"
-            if DEBUG_MODE: print(f"DEBUG FAIL (Action): No valid actions at low-level step {low_level_step_count}, level {prev_level} (High-level: {high_level_action_count}). SMILES: {debug_smiles}")
+            # select_action_strategy now prints debug info if needed
             return None
 
+        # --- Enforce Min High-Level Actions (Important: This overrides the 5% terminate probability if needed) ---
         if prev_level == 0 and action == 0:
             if high_level_action_count < config.min_actions:
-                if DEBUG_MODE: print(f"DEBUG INFO: Prevented Terminate at low-level step {low_level_step_count} (High-level count {high_level_action_count} < {config.min_actions}). Re-selecting.")
+                if DEBUG_MODE: print(f"DEBUG INFO: Min Action Override: Prevented Terminate at low-level step {low_level_step_count} (High-level count {high_level_action_count} < {config.min_actions}). Re-selecting.")
+                # Force selection of a 'Select Atom' action if possible
                 mask = current_mol_design.current_action_mask
                 select_atom_actions = [i for i in range(1, len(mask)) if not mask[i]]
                 if not select_atom_actions:
-                    if DEBUG_MODE: print(f"DEBUG FAIL (Min Actions): Terminate prevented, but no valid 'Select Atom' actions found.")
+                    if DEBUG_MODE: print(f"DEBUG FAIL (Min Actions Override): Terminate prevented, but no valid 'Select Atom' actions found.")
                     return None
-                action = random.choice(select_atom_actions)
-                if DEBUG_MODE: print(f"DEBUG INFO: Re-selected action: {action} (Select Atom)")
+                action = random.choice(select_atom_actions) # Override action
+                if DEBUG_MODE: print(f"DEBUG INFO: Min Action Override: Re-selected action: {action} (Select Atom)")
+        # --- End Min Action Enforcement ---
+
 
         action_type_name = get_action_type_name(prev_level, action, current_mol_design.vocab_size, prev_num_real)
         modifies_structure = action_type_name in ["Remove Atom", "Set Bond Order", "Remove Bond"]
@@ -230,13 +285,10 @@ def generate_single_transformation(
             next_mol_design = current_mol_design
             current_level = next_mol_design.current_action_level
 
-            # <<< Update max components if DEBUG_MODE is True >>>
             if DEBUG_MODE:
-                # take_action calls _check_and_update_connectivity internally, updating num_components
                 max_components_this_sequence = max(max_components_this_sequence, current_mol_design.num_components)
                 if current_mol_design.num_components > 1:
                      print(f"DEBUG INFO: Step {low_level_step_count} - Components = {current_mol_design.num_components} (Max so far: {max_components_this_sequence})")
-            # <<< End component tracking update >>>
 
             if prev_level != 0 and current_level == 0:
                 high_level_action_count += 1
@@ -313,7 +365,6 @@ def generate_single_transformation(
         print(f"  - Final SMILES (Check Attempted): {final_smiles_before_val}")
         print(f"  - Low-Level Action Seq Len: {len(action_sequence)}")
         print(f"  - Final High-Level Action Count (Local): {high_level_action_count}")
-        # <<< Log max components >>>
         print(f"  - Max Components Encountered (DEBUG): {max_components_this_sequence}\n")
 
 
@@ -346,12 +397,13 @@ def generate_single_transformation(
 
     # --- Success ---
     if DEBUG_MODE: print(f"DEBUG SUCCESS (Strict): Sequence passed all checks! Low-level Len={len(action_sequence)}, High-level Count={high_level_action_count}, Max Components={max_components_this_sequence}")
-    # <<< Return max components >>>
     return start_smiles, final_smiles, action_sequence, high_level_action_count, max_components_this_sequence
 
 
 # --- Main Function (Accumulates and prints max components in DEBUG) ---
 def main():
+    # (No changes needed in main function - it already calls the action selection function
+    #  and handles the results correctly)
     start_time = time.time()
     print(f"Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Current User's Login: {os.getenv('USER', 'unknown')}")
@@ -405,7 +457,6 @@ def main():
         datatype_molecules_processed_session = 0
         datatype_total_high_level_actions_session = 0
         initial_valid_sequences_count = 0
-        # <<< Add counter for max components >>>
         datatype_total_max_components_session = 0
 
         if os.path.exists(results_checkpoint_path):
@@ -466,7 +517,6 @@ def main():
                  datatype_molecules_processed_session += 1; molecules_processed_since_checkpoint += 1; molecules_processed_since_stats += 1; global_total_molecules_processed += 1
                  continue
 
-            # Need a pristine copy for each generation attempt
             initial_mol_design_copy = copy.deepcopy(initial_mol_design)
 
             while len(valid_transformations) < TRANSFORMATIONS_PER_MOLECULE and total_attempts_for_molecule < MAX_TOTAL_ATTEMPTS_PER_MOLECULE:
@@ -476,24 +526,22 @@ def main():
                 attempts_for_mol += 1
 
                 result = generate_single_transformation(
-                    initial_mol_design_copy, # Use the clean copy
+                    initial_mol_design_copy,
                     actual_start_smiles,
                     CONFIG,
                     MAX_LOW_LEVEL_STEPS_SAFETY
                 )
 
                 if result is not None:
-                    # <<< Unpack max components >>>
                     start_smi, end_smi, low_level_seq, high_level_count, max_components = result
                     valid_transformations.append((start_smi, end_smi, low_level_seq))
                     sequences_found_this_mol_session += 1
                     datatype_valid_sequences_generated_session += 1
                     global_total_valid_sequences_generated += 1
                     datatype_total_high_level_actions_session += high_level_count
-                    # <<< Accumulate max components if DEBUG_MODE >>>
                     if DEBUG_MODE:
                         datatype_total_max_components_session += max_components
-                    attempts_for_mol = 0 # Reset on success
+                    attempts_for_mol = 0
 
                 if attempts_for_mol >= MAX_ATTEMPTS_PER_TRANSFORMATION and len(valid_transformations) < TRANSFORMATIONS_PER_MOLECULE:
                     attempts_for_mol = 0
@@ -528,14 +576,12 @@ def main():
                 print(f"  Avg Valid Seq/Molecule (Strict, Overall {datatype}): {avg_sequences_per_mol_overall:.2f}")
                 print(f"  Avg High-Level Actions/Valid Seq (Session): {avg_high_level_actions_session:.2f}")
 
-                # <<< Calculate and print Avg Max Components if DEBUG_MODE >>>
                 if DEBUG_MODE:
                     avg_max_components_session = (datatype_total_max_components_session / datatype_valid_sequences_generated_session) if datatype_valid_sequences_generated_session > 0 else 0.0
                     print(f"  Avg Max Components/Valid Seq (DEBUG Session): {avg_max_components_session:.2f}")
-                # <<< End Avg Max Components calculation >>>
 
                 print(f"----------------------------------------------------")
-                molecules_processed_since_stats = 0 # Reset counter
+                molecules_processed_since_stats = 0
 
             if molecules_processed_since_checkpoint >= CHECKPOINT_FREQUENCY or i == total_source_molecules_in_datatype_effective - 1:
                 print(f"\nSaving results checkpoint for {datatype} at molecule index {i}...")

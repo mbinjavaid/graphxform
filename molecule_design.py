@@ -149,7 +149,6 @@ class MoleculeDesign(BaseTrajectory):
         self.sa_score: float = 0.
         self.infeasibility_flag: bool = False
         self.is_currently_connected: bool = True # Assume connected initially
-        self.num_components: int = 1
 
         # --- Action Handling State ---
         self.current_action_level = 0
@@ -162,8 +161,7 @@ class MoleculeDesign(BaseTrajectory):
         # --- Rule 2 State ---
         self.last_bond_action_details: Optional[Tuple[int, int]] = None # Stores (min_idx, max_idx) of last bond action pair
 
-        # Initialize connectivity and mask
-        self._check_and_update_connectivity()
+        # Initialize mask
         self.update_action_mask()
 
     def _get_smiles_for_check(self) -> Optional[str]:
@@ -191,34 +189,6 @@ class MoleculeDesign(BaseTrajectory):
             # Catch errors during RDKit mol creation or SMILES generation
             # print(f"DEBUG: _get_smiles_for_check - Exception during mol/SMILES gen: {e}") # Optional Debug
             return None
-
-    def _check_and_update_connectivity(self):
-        """Checks connectivity using NetworkX on the internal state and updates self.num_components."""
-        num_real_atoms = len(self.atoms) - 1
-        if num_real_atoms <= 1: # 0 or 1 real atom is always considered connected
-            self.is_currently_connected = True
-            self.num_components = num_real_atoms
-            return
-
-        G = nx.Graph()
-        G.add_nodes_from(range(1, num_real_atoms + 1)) # Use 1-based internal indices for nodes
-        # Extract adjacency for real atoms only
-        adj_matrix = self.bonds[1 : num_real_atoms + 1, 1 : num_real_atoms + 1]
-        rows, cols = np.where(adj_matrix > 0)
-        # Edges need 1-based node indices matching the graph nodes
-        edges = list(zip(rows + 1, cols + 1))
-        G.add_edges_from(edges)
-
-        try:
-            if G.number_of_nodes() > 0: # Should always be true if num_real_atoms > 1
-                self.is_currently_connected = nx.is_connected(G)
-                self.num_components = 1 if self.is_currently_connected else nx.number_connected_components(G)
-            else: # Defensive case
-                self.num_components = 0
-                self.is_currently_connected = True
-        except Exception as e:
-            print(f"ERROR during NetworkX check. Graph nodes={list(G.nodes())}, edges={list(G.edges())}") # DEBUG
-            raise RuntimeError(f"NetworkX connectivity check failed unexpectedly: {e}")
 
     def _get_current_valence_usage(self, atom_internal_idx: Optional[int] = None) -> np.array:
         """
@@ -395,13 +365,12 @@ class MoleculeDesign(BaseTrajectory):
             # --- Rule 2 Check: Prevent immediate reversal ---
             current_min_idx = min(atom_A_internal_idx, atom_B_internal_idx)
             current_max_idx = max(atom_A_internal_idx, atom_B_internal_idx)
-            if self.last_bond_action_details is not None and \
-               self.last_bond_action_details[0] == current_min_idx and \
-               self.last_bond_action_details[1] == current_max_idx:
+            if (self.last_bond_action_details is not None and self.last_bond_action_details[0] == current_min_idx and
+                    self.last_bond_action_details[1] == current_max_idx):
                 # Last action was a bond action on this same pair. Mask ALL L2 actions.
                 mask[:] = True
                 self.current_action_mask = mask
-                return # Skip normal valence checks
+                return  # Skip normal valence checks
 
             # --- Normal L2 Mask Logic (Valence Check) ---
             atom_A_0_idx = atom_A_internal_idx - 1
@@ -455,7 +424,6 @@ class MoleculeDesign(BaseTrajectory):
                 new_max = max_idx - 1 if max_idx > removed_internal_idx else max_idx
                 if new_min != min_idx or new_max != max_idx:
                      self.last_bond_action_details = (new_min, new_max) # Update adjusted indices
-
 
     def take_action(self, action: int):
         """Execute a given action, updating internal state directly."""
@@ -639,12 +607,10 @@ class MoleculeDesign(BaseTrajectory):
 
             # --- Update State After Action (if not terminated) ---
             if next_level != -1:
-                # Check connectivity *after* the state modification
-                self._check_and_update_connectivity() # Can raise RuntimeError
                 # Update current level
                 self.current_action_level = next_level
                 # Update the mask for the new level
-                self.update_action_mask() # Can raise IndexError/ValueError
+                self.update_action_mask()  # Can raise IndexError/ValueError
             else:
                 # Action was Terminate, clear mask
                 self.current_action_mask = None
@@ -671,16 +637,10 @@ class MoleculeDesign(BaseTrajectory):
             # Re-raise as RuntimeError to ensure generate_single_transformation catches it
             raise RuntimeError(f"Unexpected error during action execution: {e}") from e
 
-
     def finalize(self, assert_feasible: bool = False):
         """Finalize molecule design: build RDKit mol, sanitize, cache SMILES."""
         # Avoid re-finalizing
         if self._cached_smiles is not None or self._cached_rdkit_mol is not None: return
-
-        # Ensure connectivity is up-to-date before final checks
-        try: self._check_and_update_connectivity()
-        except Exception as e:
-             self.infeasibility_flag = True; print(f"Warning: Connectivity check failed during finalize: {e}.")
 
         # Optional feasibility assertion
         if assert_feasible:
@@ -714,7 +674,7 @@ class MoleculeDesign(BaseTrajectory):
                              print(f"Warning: Final sanitization failed with status {sanitize_status}.")
                              self._cached_smiles = None # Ensure SMILES is None if sanitize fails
                              # Keep the unsanitized mol in cache? Optional. For now, clear SMILES.
-                             # self.infeasibility_flag = True # Optionally mark sanitize failure as infeasible
+                             self.infeasibility_flag = True # Optionally mark sanitize failure as infeasible
                         else:
                              # Sanitization succeeded, update cache and get SMILES
                              self._cached_rdkit_mol = rdkit_mol # Overwrite cache with sanitized version
@@ -775,7 +735,6 @@ class MoleculeDesign(BaseTrajectory):
                   assert np.all(remaining_valence >= 0), f"Valence constraints violated (negative remaining): {remaining_valence}"
              except (IndexError, RuntimeError) as e: raise AssertionError(f"Valence check failed during assertion: {e}")
 
-
     def to_rdkit_mol(self, sanitize=True) -> Chem.RWMol:
         """Creates a *new* RDKit molecule from the internal state."""
         # (Implementation remains the same)
@@ -830,10 +789,12 @@ class MoleculeDesign(BaseTrajectory):
                         mol.AddBond(rdkit_i, rdkit_j, rdkit_bond_type)
                     else:
                         # Should not happen if bond_types dict is complete
-                        print(f"Warning: Could not find RDKit bond type for order {bond_order} between internal atoms {i},{j}.")
+                        # print(f"Warning: Could not find RDKit bond type for order {bond_order} between internal atoms {i},{j}.")
+                        raise RuntimeError(f"Missing RDKit bond type for order {bond_order} between internal atoms {i},{j}.")
                 elif bond_order > self.maximum_bond_order and bond_order != self.virtual_bond_idx:
                      # Log invalid bond orders found in matrix (excluding virtual)
-                     print(f"Warning: Invalid bond order {bond_order} found between internal atoms {i},{j} during RDKit conversion.")
+                     # print(f"Warning: Invalid bond order {bond_order} found between internal atoms {i},{j} during RDKit conversion.")
+                    raise RuntimeError(f"Invalid bond order {bond_order} found between internal atoms {i},{j}.")
 
         # Optional sanitization
         if sanitize:
@@ -1016,8 +977,9 @@ class MoleculeDesign(BaseTrajectory):
                 # Mark the anchor atom (L0 selection) with 1
                 if 0 <= anchor_idx < max_num_atoms: # Check bounds (anchor_idx is 1-based)
                     batch_picked_atom_mhe[i, anchor_idx] = 1
-                # else: # Debugging for index issues
-                #     print(f"Warning: Anchor index {anchor_idx} out of bounds for mhe (max={max_num_atoms})")
+                else: # Debugging for index issues
+                    # print(f"Warning: Anchor index {anchor_idx} out of bounds for mhe (max={max_num_atoms})")
+                    raise IndexError(f"Anchor index {anchor_idx} out of bounds for mhe (max={max_num_atoms})")
 
                 # Mark the target atom (L1 selection outcome) with 2 if applicable (only at L2)
                 if mol.current_action_level == 2:
@@ -1031,10 +993,12 @@ class MoleculeDesign(BaseTrajectory):
                         if 0 <= target_idx < max_num_atoms: # Check bounds (target_idx is 1-based)
                             if target_idx != anchor_idx:
                                 batch_picked_atom_mhe[i, target_idx] = 2
-                            # else: # Debugging: anchor and target are the same
-                            #     print(f"Warning: Target index {target_idx} is same as anchor index {anchor_idx}")
-                        # else: # Debugging for index issues
-                        #     print(f"Warning: Target index {target_idx} out of bounds for mhe (max={max_num_atoms})")
+                            else: # Debugging: anchor and target are the same
+                                # print(f"Warning: Target index {target_idx} is same as anchor index {anchor_idx}")
+                                raise ValueError(f"Target index {target_idx} is same as anchor index {anchor_idx}")
+                        else: # Debugging for index issues
+                            # print(f"Warning: Target index {target_idx} out of bounds for mhe (max={max_num_atoms})")
+                            raise IndexError(f"Target index {target_idx} out of bounds for mhe (max={max_num_atoms})")
         # --- End Picked Atom Encoding ---
 
         # --- Batch Atoms ---
@@ -1202,7 +1166,7 @@ class MoleculeDesign(BaseTrajectory):
         # Mapping from RDKit bond types to internal bond orders
         BOND_TYPE_TO_RL_ORDER = {
             Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, Chem.BondType.TRIPLE: 3,
-            Chem.BondType.AROMATIC: 0, # Should be handled by Kekulize, treat as error if seen
+            Chem.BondType.AROMATIC: -1,  # Should be handled by Kekulize, treat as error if seen
             Chem.BondType.QUADRUPLE: 4, Chem.BondType.QUINTUPLE: 5, Chem.BondType.HEXTUPLE: 6,
             # Add others if needed, e.g., DATIVE, IONIC? For now, focus on covalent.
         }
@@ -1227,7 +1191,6 @@ class MoleculeDesign(BaseTrajectory):
             instance.atoms = np.array([0], dtype=np.uint8) # Only virtual atom
             instance.bonds = np.zeros((1, 1), dtype=np.uint8)
             instance.is_original_atom = np.array([False], dtype=bool)
-            instance._check_and_update_connectivity() # Update connectivity (will be 0 components)
             instance.update_action_mask() # Update mask for empty state
             return instance, {} # Return empty instance and empty map
 
@@ -1319,8 +1282,7 @@ class MoleculeDesign(BaseTrajectory):
             instance.l1_selected_existing_atom_idx = None
             instance.last_bond_action_details = None # Reset Rule 2 tracker
 
-            # Update connectivity and initial mask based on the loaded state
-            instance._check_and_update_connectivity()
+            # Update initial mask based on the loaded state
             instance.update_action_mask()
         except Exception as e:
             # Catch errors during instance creation or state setting

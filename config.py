@@ -49,7 +49,7 @@ class MoleculeConfig:
             "I": {"allowed": True, "atomic_number": 53, "valence": 1}
         }
 
-        self.min_actions = 10
+        self.min_actions = 5
         self.max_actions = 25
 
         # self.start_from_c_chains = True

@@ -148,7 +148,7 @@ class MoleculeDesign(BaseTrajectory):
         self.objective: Optional[float] = None
         self.sa_score: float = 0.
         self.infeasibility_flag: bool = False
-        self.is_currently_connected: bool = True # Assume connected initially
+        # self.is_currently_connected: bool = True # Assume connected initially
 
         # --- Action Handling State ---
         self.current_action_level = 0
@@ -163,6 +163,73 @@ class MoleculeDesign(BaseTrajectory):
 
         # Initialize mask
         self.update_action_mask()
+
+    def _check_connectivity_after_simulated_removal(self,
+                                                    action_type: str,  # "Remove Atom" or "Remove Bond"
+                                                    atom_idx_to_remove: Optional[int] = None,
+                                                    bond_indices_to_remove: Optional[Tuple[int, int]] = None) -> bool:
+        """
+        Simulates an atom or bond removal on temporary copies of the state
+        and checks if the resulting molecule graph remains connected.
+
+        Args:
+            action_type: Either "Remove Atom" or "Remove Bond".
+            atom_idx_to_remove: The 1-based internal index for "Remove Atom".
+            bond_indices_to_remove: Tuple of (1-based idx_A, 1-based idx_B) for "Remove Bond".
+
+        Returns:
+            True if the simulated state is connected, False otherwise.
+        """
+        if action_type == "Remove Atom":
+            if atom_idx_to_remove is None or not (1 <= atom_idx_to_remove < len(self.atoms)):
+                # Invalid index provided for simulation
+                return False  # Cannot be connected if simulation is invalid
+
+            # Create temporary copies
+            temp_atoms = np.delete(self.atoms, atom_idx_to_remove)
+            temp_bonds = np.delete(np.delete(self.bonds, atom_idx_to_remove, axis=0), atom_idx_to_remove, axis=1)
+            num_real_atoms_after_removal = len(temp_atoms) - 1
+
+        elif action_type == "Remove Bond":
+            if bond_indices_to_remove is None or len(bond_indices_to_remove) != 2:
+                # Invalid indices for simulation
+                return False
+            idx_A, idx_B = bond_indices_to_remove
+            if not (1 <= idx_A < len(self.atoms) and 1 <= idx_B < len(self.atoms)):
+                # Invalid indices for simulation
+                return False
+
+            # Create temporary copy
+            temp_bonds = self.bonds.copy()
+            temp_bonds[idx_A, idx_B] = temp_bonds[idx_B, idx_A] = 0
+            num_real_atoms_after_removal = len(self.atoms) - 1  # Atom count doesn't change
+
+        else:
+            raise ValueError(f"Invalid action_type for connectivity simulation: {action_type}")
+
+        # --- Check connectivity on the temporary state ---
+        if num_real_atoms_after_removal <= 1:
+            # Single atom or no atoms is considered connected
+            return True
+
+        try:
+            G = nx.Graph()
+            nodes = range(1, num_real_atoms_after_removal + 1)
+            G.add_nodes_from(nodes)
+            # Use the appropriate bond matrix (temp_bonds)
+            rows, cols = np.where(temp_bonds[1:, 1:] > 0)
+            edges = zip(rows + 1, cols + 1)
+            G.add_edges_from(edge for edge in edges if edge[0] < edge[1])
+
+            if G.number_of_nodes() > 0:
+                return nx.is_connected(G)
+            else:
+                return True  # Should be covered by num_real_atoms check, but safe fallback
+
+        except Exception as e:
+            # print(f"WARNING: Error during simulated connectivity check ({action_type}): {e}")
+            # return False  # Assume disconnected if simulation check fails
+            raise ValueError(f"Error during simulated connectivity check ({action_type}): {e}")
 
     def _get_smiles_for_check(self) -> Optional[str]:
         """
@@ -238,102 +305,86 @@ class MoleculeDesign(BaseTrajectory):
         return remaining
 
     def update_action_mask(self):
-        """Creates the action mask based on the internal state and rules."""
+        """Creates the action mask based on the internal state and rules.
+           Includes proactive checks to mask removals that would disconnect the molecule.
+        """
         if self.synthesis_done:
             self.current_action_mask = None
             return
 
         num_real_atoms = len(self.atoms) - 1
-        remaining_valence = self._get_remaining_valence() # Get remaining valence for all atoms
+
+        if num_real_atoms == 0:
+            # This case should ideally not be reached if starting molecules are valid
+            # and removal masking works correctly.
+            raise ValueError("No real atoms present. Cannot update action mask.")
+
+        remaining_valence = self._get_remaining_valence()  # Get remaining valence for all atoms
 
         # --- Level 0 Mask ---
         if self.current_action_level == 0:
             action_space_size = 1 + num_real_atoms # Terminate + Select Atom 1..N
             mask = np.zeros(action_space_size, dtype=bool) # Start with all False (unmasked)
-
-            # Mask Terminate if:
-            # - No real atoms exist OR
-            # - More than 1 real atom exists BUT molecule is disconnected
-            if num_real_atoms == 0 or (num_real_atoms > 0 and not self.is_currently_connected):
-                mask[0] = True
-
-            # Mask Select Atom if no real atoms exist
-            if num_real_atoms == 0:
-                mask[1:] = True
-
+            # Terminate is always allowed if connected and atoms exist
             self.current_action_mask = mask
 
         # --- Level 1 Mask ---
         elif self.current_action_level == 1:
-            # Calculate action space size based on the new structure
-            # V (Add) + N (Select Existing) + V (Replace) + 1 (Remove)
             action_space_size = 2 * self.vocab_size + num_real_atoms + 1
             mask = np.ones(action_space_size, dtype=bool) # Start with all True (masked)
 
             anchor_atom_internal_idx = self.l0_selected_atom_idx
             if anchor_atom_internal_idx is None or not (1 <= anchor_atom_internal_idx <= num_real_atoms):
-                # This should not happen if L0 selection was valid
                 raise ValueError(f"L1 Mask Error: Invalid anchor atom index: {anchor_atom_internal_idx} (NumReal={num_real_atoms})")
-            anchor_atom_0_idx = anchor_atom_internal_idx - 1 # 0-based index for valence array
+            anchor_atom_0_idx = anchor_atom_internal_idx - 1
 
             # --- Unmask "Add Atom" (Indices 0 to V-1) ---
-            # Can add if atom limit not reached and anchor has remaining valence
+            # (Logic unchanged)
             if (self.upper_limit_atoms is None or num_real_atoms < self.upper_limit_atoms) and \
                remaining_valence[anchor_atom_0_idx] > 0:
                 for i in range(self.vocab_size):
                     action_idx = i
-                    atom_type_vocab_idx = i + 1 # 1-based vocab index
-                    # Check if atom type is allowed and has valence >= 1 (needs at least 1 for the new bond)
+                    atom_type_vocab_idx = i + 1
                     if not self.atom_feasibility_mask[i] and self.vocabulary_valence[atom_type_vocab_idx] >= 1:
-                        mask[action_idx] = False # Unmask
+                        mask[action_idx] = False
 
             # --- Unmask "Select Existing Atom" (Indices V to V+N-1) ---
-            for target_0_idx in range(num_real_atoms): # Iterate through potential targets (0-based)
-                target_internal_idx = target_0_idx + 1 # 1-based internal index
-                action_idx = self.vocab_size + target_0_idx # Calculate action index
-
-                # Cannot select the anchor atom itself
+            # (Logic unchanged)
+            for target_0_idx in range(num_real_atoms):
+                target_internal_idx = target_0_idx + 1
+                action_idx = self.vocab_size + target_0_idx
                 if target_internal_idx == anchor_atom_internal_idx: continue
-
-                # Check if bonding is possible:
-                # - Either a bond already exists (can change/remove) OR
-                # - Both atoms have remaining valence to form a new bond
                 bond_exists = self.bonds[anchor_atom_internal_idx, target_internal_idx] > 0
                 can_form_new = (remaining_valence[anchor_atom_0_idx] > 0 and remaining_valence[target_0_idx] > 0)
-
                 if bond_exists or can_form_new:
-                    mask[action_idx] = False # Unmask
+                    mask[action_idx] = False
 
             # --- Unmask "Replace Atom" (Indices V+N to V+N+V-1) ---
+            # (Logic unchanged)
             replace_start_idx = self.vocab_size + num_real_atoms
             current_atom_vocab_idx = self.atoms[anchor_atom_internal_idx]
-            # Calculate current valence usage of the anchor atom
             current_anchor_usage = self._get_current_valence_usage(anchor_atom_internal_idx)[0]
-
-            for i in range(self.vocab_size): # Iterate through possible replacement types
+            for i in range(self.vocab_size):
                 action_idx = replace_start_idx + i
-                replacement_vocab_idx = i + 1 # 1-based vocab index
-
-                # Condition 1: Replacement type must be different from current type
+                replacement_vocab_idx = i + 1
                 if replacement_vocab_idx == current_atom_vocab_idx: continue
-
-                # Condition 2: Replacement type must be allowed
-                if self.atom_feasibility_mask[i]: continue # Skip if masked (disallowed)
-
-                # Condition 3: Valence check
+                if self.atom_feasibility_mask[i]: continue
                 replacement_max_valence = self.vocabulary_valence[replacement_vocab_idx]
                 if current_anchor_usage <= replacement_max_valence:
-                    mask[action_idx] = False # Unmask if valence allows
+                    mask[action_idx] = False
 
             # --- Unmask "Remove Selected Atom" (Index V+N+V) ---
             remove_action_idx = 2 * self.vocab_size + num_real_atoms
             # Check index bounds before accessing is_original_atom
             if anchor_atom_internal_idx < len(self.is_original_atom):
-                 # Can remove if more than 1 atom exists and the anchor is an original atom (Rule 1)
+                # Condition 1: More than 1 atom exists
+                # Condition 2: Anchor is an original atom (Rule 1)
                 if num_real_atoms > 1 and self.is_original_atom[anchor_atom_internal_idx]:
-                    mask[remove_action_idx] = False # Unmask
+                    # Condition 3: Removing this atom would NOT disconnect the molecule
+                    if self._check_connectivity_after_simulated_removal(action_type="Remove Atom",
+                                                                        atom_idx_to_remove=anchor_atom_internal_idx):
+                        mask[remove_action_idx] = False
             else:
-                # This indicates a state inconsistency
                 raise IndexError(f"L1 Mask Error: anchor_atom_internal_idx {anchor_atom_internal_idx} OOB for is_original_atom (len {len(self.is_original_atom)})")
 
             self.current_action_mask = mask
@@ -343,62 +394,55 @@ class MoleculeDesign(BaseTrajectory):
             action_space_size = 7 # Set Bond 1-6, Remove Bond
             mask = np.ones(action_space_size, dtype=bool) # Start masked
 
-            # Determine the two atoms involved in the potential bond action
             atom_A_internal_idx = self.l0_selected_atom_idx
-            atom_B_internal_idx = -1
-            # Check which L1 action led here
+            # atom_B_internal_idx = -1
             if self.l1_action_type == ActionType.ADD_ATOM:
-                # B is the newly added atom (last in the array)
                 atom_B_internal_idx = len(self.atoms) - 1
             elif self.l1_action_type == ActionType.SELECT_EXISTING_ATOM:
-                # B is the atom selected at L1
                 atom_B_internal_idx = self.l1_selected_existing_atom_idx
             else:
-                # Should not reach L2 after Remove or Replace
-                raise RuntimeError(f"L2 Mask Error: Invalid L1 action type context ({self.l1_action_type}).")
+                raise ValueError(f"L2 Mask Error: Invalid L1 action type context ({self.l1_action_type}).")
 
-            # Validate indices
-            num_real_atoms = len(self.atoms) - 1 # Get current number of real atoms
             if not (1 <= atom_A_internal_idx <= num_real_atoms and 1 <= atom_B_internal_idx <= num_real_atoms):
                 raise ValueError(f"L2 Bond Mask Error: Invalid indices A={atom_A_internal_idx}, B={atom_B_internal_idx} (NumReal={num_real_atoms})")
 
             # --- Rule 2 Check: Prevent immediate reversal ---
+            # (Logic unchanged)
             current_min_idx = min(atom_A_internal_idx, atom_B_internal_idx)
             current_max_idx = max(atom_A_internal_idx, atom_B_internal_idx)
             if (self.last_bond_action_details is not None and self.last_bond_action_details[0] == current_min_idx and
                     self.last_bond_action_details[1] == current_max_idx):
-                # Last action was a bond action on this same pair. Mask ALL L2 actions.
                 mask[:] = True
                 self.current_action_mask = mask
-                return  # Skip normal valence checks
+                return
 
-            # --- Normal L2 Mask Logic (Valence Check) ---
+            # --- Normal L2 Mask Logic (Valence Check for Set Bond) ---
+            # (Logic unchanged)
             atom_A_0_idx = atom_A_internal_idx - 1
             atom_B_0_idx = atom_B_internal_idx - 1
-            # Check bounds for remaining_valence array
             if atom_A_0_idx >= len(remaining_valence) or atom_B_0_idx >= len(remaining_valence):
                 raise IndexError(f"L2 Bond Mask Error: Indices {atom_A_0_idx} or {atom_B_0_idx} OOB for rem_val (len {len(remaining_valence)}).")
 
             current_bond_order = self.bonds[atom_A_internal_idx, atom_B_internal_idx]
             valence_A_rem = remaining_valence[atom_A_0_idx]
             valence_B_rem = remaining_valence[atom_B_0_idx]
-
-            # Max increase possible based on remaining valence of *both* atoms
             max_increase = min(valence_A_rem, valence_B_rem)
             effective_current_order = int(current_bond_order) if current_bond_order > 0 else 0
-
-            # Max final bond order allowed = current + max_increase, capped by global max
             max_allowed_final_order = min(effective_current_order + max_increase, self.maximum_bond_order)
 
-            # Unmask "Set Bond Order" actions (Indices 0 to 5) up to max_allowed_final_order
             for order in range(1, self.maximum_bond_order + 1):
                 action_idx = order - 1
                 if order <= max_allowed_final_order:
-                    mask[action_idx] = False # Unmask
+                    mask[action_idx] = False
 
-            # Unmask "Remove Bond" action (Index 6) if a bond currently exists
+            # --- Unmask "Remove Bond" action (Index 6) ---
+            # Condition 1: A bond currently exists
             if current_bond_order > 0:
-                mask[6] = False # Unmask
+                # Condition 2: Removing this bond would NOT disconnect the molecule
+                # (Only relevant if there's more than 1 real atom)
+                if num_real_atoms <= 1 or self._check_connectivity_after_simulated_removal(action_type="Remove Bond",
+                                                                                           bond_indices_to_remove=(atom_A_internal_idx, atom_B_internal_idx)):
+                    mask[6] = False
 
             self.current_action_mask = mask
         else:
@@ -428,7 +472,8 @@ class MoleculeDesign(BaseTrajectory):
     def take_action(self, action: int):
         """Execute a given action, updating internal state directly."""
         if self.synthesis_done:
-            raise RuntimeError("Cannot take action on terminated design.")
+            # Changed to ValueError to match user preference in other exceptions
+            raise ValueError("Cannot take action on terminated design.")
 
         # Validate action against mask
         if self.current_action_mask is None or not (0 <= action < len(self.current_action_mask)) or self.current_action_mask[action]:
@@ -449,7 +494,8 @@ class MoleculeDesign(BaseTrajectory):
                 if action == 0:  # Terminate
                     # External check (is_terminable) should happen before calling take_action(0)
                     self.synthesis_done = True
-                    self.finalize(assert_feasible=False) # Finalize state
+                    # User change kept: assert_feasible=True
+                    self.finalize(assert_feasible=True)
                     next_level = -1 # Special level indicating termination
                 else:  # Select Atom (action = 1 to N)
                     selected_internal_idx = action
@@ -466,7 +512,8 @@ class MoleculeDesign(BaseTrajectory):
             elif current_level == 1:
                 anchor_idx = self.l0_selected_atom_idx
                 if anchor_idx is None: # Should be set from L0
-                    raise RuntimeError("L1 take_action: l0_selected_atom_idx (anchor) is None.")
+                    # User change kept: ValueError
+                    raise ValueError("L1 take_action: l0_selected_atom_idx (anchor) is None.")
 
                 # Define index boundaries based on the new structure
                 add_atom_end_idx = self.vocab_size
@@ -477,7 +524,7 @@ class MoleculeDesign(BaseTrajectory):
                 # 1. Add Atom (0 <= action < V)
                 if action < add_atom_end_idx:
                     self.l1_action_type = ActionType.ADD_ATOM
-                    self.l1_new_atom_type = action + 1 # 1-based vocab index
+                    self.l1_new_atom_type = action + 1  # 1-based vocab index
                     # Append new atom
                     self.atoms = np.append(self.atoms, self.l1_new_atom_type)
                     new_atom_internal_idx = len(self.atoms) - 1
@@ -487,7 +534,7 @@ class MoleculeDesign(BaseTrajectory):
                     self.bonds[0, new_atom_internal_idx] = self.bonds[new_atom_internal_idx, 0] = self.virtual_bond_idx
                     # Expand and update original atom tracker
                     self.is_original_atom = np.append(self.is_original_atom, False)
-                    next_level = 2 # Transition to Level 2 for bond setting
+                    next_level = 2  # Transition to Level 2 for bond setting
 
                 # 2. Select Existing Atom (V <= action < V+N)
                 elif action < select_existing_end_idx:
@@ -509,7 +556,7 @@ class MoleculeDesign(BaseTrajectory):
                     # Calculate replacement atom type (1-based vocab index)
                     replacement_vocab_idx = (action - select_existing_end_idx) + 1
 
-                    # Basic validation (should be guaranteed by mask, but good practice)
+                    # Basic validation (should be guaranteed by mask, but good to double-check)
                     current_atom_vocab_idx = self.atoms[anchor_idx]
                     if replacement_vocab_idx == current_atom_vocab_idx:
                          raise ValueError("L1 Replace Atom: Attempted to replace with the same type.")
@@ -519,9 +566,7 @@ class MoleculeDesign(BaseTrajectory):
 
                     # --- Execute Replacement ---
                     self.atoms[anchor_idx] = replacement_vocab_idx
-                    # Mark as no longer original
-                    self.is_original_atom[anchor_idx] = False
-                    # Store action type
+                    self.is_original_atom[anchor_idx] = False # Mark as no longer original
                     self.l1_action_type = ActionType.REPLACE_ATOM
 
                     # --- Post-Replacement Sanitization Check ---
@@ -540,20 +585,27 @@ class MoleculeDesign(BaseTrajectory):
                 elif action == remove_atom_idx:
                     # Validation (should be guaranteed by mask)
                     if num_real_atoms_before <= 1:
-                        raise RuntimeError("L1 Remove Atom: Attempted to remove last real atom.")
+                        # User change kept: ValueError
+                        raise ValueError("L1 Remove Atom: Attempted to remove last real atom.")
                     if not self.is_original_atom[anchor_idx]:
-                        raise RuntimeError("L1 Remove Atom: Attempted to remove non-original atom (Rule 1 violation).")
+                        # User change kept: ValueError
+                        raise ValueError("L1 Remove Atom: Attempted to remove non-original atom (Rule 1 violation).")
 
                     self.l1_action_type = ActionType.REMOVE_SELECTED_ATOM
                     removed_idx_for_adjust = anchor_idx # Store index before deletion
 
-                    # Delete atom and corresponding bonds rows/columns
+                    # --- Execute Removal ---
                     self.atoms = np.delete(self.atoms, removed_idx_for_adjust)
                     self.bonds = np.delete(np.delete(self.bonds, removed_idx_for_adjust, axis=0), removed_idx_for_adjust, axis=1)
                     self.is_original_atom = np.delete(self.is_original_atom, removed_idx_for_adjust)
+                    self._adjust_indices_after_removal(removed_idx_for_adjust) # Adjust stored indices
 
-                    # Adjust stored indices that might have shifted
-                    self._adjust_indices_after_removal(removed_idx_for_adjust)
+                    # <<< --- NEW: Post-Atom-Removal Sanitization Check --- >>>
+                    smiles_check = self._get_smiles_for_check()
+                    if smiles_check is None:
+                        self.infeasibility_flag = True # Mark state as infeasible
+                        raise RuntimeError("Post-atom-removal sanitization failed.") # Raise error to stop sequence
+                    # <<< --- END NEW CHECK --- >>>
 
                     # Reset L1/L2 context
                     self.l0_selected_atom_idx = None
@@ -575,7 +627,8 @@ class MoleculeDesign(BaseTrajectory):
                 elif self.l1_action_type == ActionType.SELECT_EXISTING_ATOM:
                     idx_B = self.l1_selected_existing_atom_idx
                 else: # Should not happen
-                    raise RuntimeError(f"L2 take_action: Invalid L1 action type context ({self.l1_action_type}).")
+                    # User change kept: ValueError
+                    raise ValueError(f"L2 take_action: Invalid L1 action type context ({self.l1_action_type}).")
 
                 # Validate indices A and B
                 current_num_real_atoms = len(self.atoms) - 1
@@ -586,12 +639,22 @@ class MoleculeDesign(BaseTrajectory):
                 if 0 <= action <= 5: # Set Bond Order (action 0 -> order 1, ..., action 5 -> order 6)
                     order = action + 1
                     self.bonds[idx_A, idx_B] = self.bonds[idx_B, idx_A] = order
+                    # NO sanitization check here
+
                 elif action == 6: # Remove Bond
                     self.bonds[idx_A, idx_B] = self.bonds[idx_B, idx_A] = 0
+
+                    # <<< --- NEW: Post-Bond-Removal Sanitization Check --- >>>
+                    smiles_check = self._get_smiles_for_check()
+                    if smiles_check is None:
+                        self.infeasibility_flag = True # Mark state as infeasible
+                        raise RuntimeError("Post-bond-removal sanitization failed.") # Raise error to stop sequence
+                    # <<< --- END NEW CHECK --- >>>
+
                 else: # Should not be reachable
                     raise ValueError(f"Invalid L2 Bond action index: {action}")
 
-                # Update Rule 2 tracker
+                # Update Rule 2 tracker (applies to both Set and Remove bond actions)
                 self.last_bond_action_details = (min(idx_A, idx_B), max(idx_A, idx_B))
 
                 # Reset L1/L2 context
@@ -607,7 +670,7 @@ class MoleculeDesign(BaseTrajectory):
 
             # --- Update State After Action (if not terminated) ---
             if next_level != -1:
-                # Update current level
+                # Update current level BEFORE updating mask
                 self.current_action_level = next_level
                 # Update the mask for the new level
                 self.update_action_mask()  # Can raise IndexError/ValueError
@@ -620,22 +683,22 @@ class MoleculeDesign(BaseTrajectory):
             # Errors related to invalid action indices, masking logic, array bounds
             self.infeasibility_flag = True # Mark state as infeasible
             self.current_action_mask = None # Prevent further actions
-            # Re-raise as RuntimeError to signal sequence failure
-            raise RuntimeError(f"Masking/Action logic error at L{current_level}, action {action}: {e}") from e
+            # Re-raise to signal sequence failure (User change kept: ValueError)
+            raise ValueError(f"Masking/Action logic error at L{current_level}, action {action}: {e}") from e
         except RuntimeError as e:
-            # Catch specific RuntimeErrors (e.g., from connectivity check, sanitization check, or raised above)
-            # Infeasibility flag should already be set if raised internally
+            # Catch specific RuntimeErrors (e.g., from OUR sanitization checks)
+            # Infeasibility flag should already be set if raised internally by us
             if not self.infeasibility_flag: self.infeasibility_flag = True
             self.current_action_mask = None
             # Re-raise the original RuntimeError
             raise e
         except Exception as e:
             # Catch any other unexpected errors during action execution
-            print(f"CRITICAL: Unexpected error in take_action(action={action}, L{current_level}): {e}")
+            # print(f"CRITICAL: Unexpected error in take_action(action={action}, L{current_level}): {e}") # Optional Debug
             self.infeasibility_flag = True
             self.current_action_mask = None
-            # Re-raise as RuntimeError to ensure generate_single_transformation catches it
-            raise RuntimeError(f"Unexpected error during action execution: {e}") from e
+            # Re-raise as ValueError to ensure generate_single_transformation catches it (User change kept: ValueError)
+            raise ValueError(f"Unexpected error during action execution: {e}") from e
 
     def finalize(self, assert_feasible: bool = False):
         """Finalize molecule design: build RDKit mol, sanitize, cache SMILES."""
@@ -647,12 +710,14 @@ class MoleculeDesign(BaseTrajectory):
             try: self.assert_feasible()
             except AssertionError as e:
                 print(f"Warning: Feasibility assertion failed during finalize: {e}"); self.infeasibility_flag = True
+                raise RuntimeError("Feasibility assertion failed during finalize.") from e
 
         num_real_atoms = len(self.atoms) - 1
-        # Mark disconnected molecules (>1 atom) as infeasible during finalize
-        if num_real_atoms > 1 and not self.is_currently_connected:
-            # print("Warning: Final molecule is disconnected.") # Optional
-            self.infeasibility_flag = True
+        # # Mark disconnected molecules (>1 atom) as infeasible during finalize
+        # if num_real_atoms > 1 and not self.is_currently_connected:
+        #     # print("Warning: Final molecule is disconnected.") # Optional
+        #     self.infeasibility_flag = True
+        #     raise ValueError("Final molecule is disconnected.")  # indicate disconnectedness, should not happen
 
         # Attempt to generate RDKit Mol and SMILES only if not already flagged infeasible
         rdkit_mol = None
@@ -686,8 +751,9 @@ class MoleculeDesign(BaseTrajectory):
                         # If SMILES failed, likely infeasible
                         if self._cached_rdkit_mol is None: self.infeasibility_flag = True
                 else: # 0 real atoms resulted in 0 RDKit atoms
-                    self._cached_smiles = "" # Empty SMILES for empty molecule
-                    self._cached_rdkit_mol = rdkit_mol # Cache the empty mol
+                    # self._cached_smiles = "" # Empty SMILES for empty molecule
+                    # self._cached_rdkit_mol = rdkit_mol # Cache the empty mol
+                    raise ValueError("Empty RDKit mol with >0 real atoms.") # Raise to indicate failure
             except Exception as e:
                  # Catch errors during to_rdkit_mol itself
                  print(f"Warning: Error during RDKit mol generation in finalize: {e}")
@@ -811,9 +877,10 @@ class MoleculeDesign(BaseTrajectory):
         # Can terminate if:
         # - Currently at Level 0 AND
         # - Not already terminated AND
-        # - (Either 0 real atoms OR (>0 real atoms AND connected))
+        # - >0 real atoms AND connected
         can_terminate = self.current_action_level == 0 and not self.synthesis_done
-        structure_ok = (num_real_atoms == 0) or (num_real_atoms > 0 and self.is_currently_connected)
+        # structure_ok =  (num_real_atoms == 0) or (num_real_atoms > 0 and self.is_currently_connected)
+        structure_ok = num_real_atoms > 0
         return can_terminate and structure_ok
 
     def to_smiles(self, canonical: bool = True) -> Optional[str]:
@@ -922,7 +989,7 @@ class MoleculeDesign(BaseTrajectory):
             # Re-raise these immediately as they shouldn't occur if caller uses mask correctly
             raise e
         except RuntimeError as e:
-            # Catch RuntimeErrors from within take_action (e.g., sanitization failure, connectivity check failure)
+            # Catch RuntimeErrors from within take_action (e.g., sanitization failure)
             # The take_action method should have set infeasibility_flag
             # Ensure synthesis_done is True only if Terminate action was the cause
             if not copied_molecule.synthesis_done: # If error wasn't Terminate action
@@ -943,7 +1010,6 @@ class MoleculeDesign(BaseTrajectory):
 
     def num_actions(self) -> int:
         """Returns the number of valid (unmasked) actions at the current level."""
-        # (Implementation remains the same)
         if self.current_action_mask is None: return 0
         # Count False entries in the boolean mask
         return int(np.sum(~self.current_action_mask))
@@ -995,7 +1061,7 @@ class MoleculeDesign(BaseTrajectory):
                                 batch_picked_atom_mhe[i, target_idx] = 2
                             else: # Debugging: anchor and target are the same
                                 # print(f"Warning: Target index {target_idx} is same as anchor index {anchor_idx}")
-                                raise ValueError(f"Target index {target_idx} is same as anchor index {anchor_idx}")
+                                raise IndexError(f"Target index {target_idx} is same as anchor index {anchor_idx}")
                         else: # Debugging for index issues
                             # print(f"Warning: Target index {target_idx} out of bounds for mhe (max={max_num_atoms})")
                             raise IndexError(f"Target index {target_idx} out of bounds for mhe (max={max_num_atoms})")
@@ -1136,17 +1202,17 @@ class MoleculeDesign(BaseTrajectory):
     @staticmethod
     def from_smiles(config: MoleculeConfig, smiles: str, **kwargs) -> Tuple['MoleculeDesign', Dict[int, int]]:
         """Creates a MoleculeDesign instance from a SMILES string."""
-        # (Implementation remains the same)
+        if '.' in smiles:
+            raise ValueError(f"SMILES input {smiles} indicates a fragmented molecule.")
         mol = Chem.MolFromSmiles(smiles)
         if mol is None: raise ValueError(f"Invalid SMILES input: {smiles}")
         try:
             # Preprocess: Sanitize, Kekulize, Canonical Rank + Renumber
-            # Note: CatchErrors allows SanitizeMol to return status instead of raising exception directly
             sanitize_status = Chem.SanitizeMol(mol, catchErrors=True)
             if sanitize_status != Chem.SanitizeFlags.SANITIZE_NONE:
                  raise ValueError(f"RDKit Sanitization failed for SMILES {smiles} with status {sanitize_status}")
             Chem.Kekulize(mol, clearAromaticFlags=True) # Ensure Kekule form
-            canonical_order = list(rdmolfiles.CanonicalRankAtoms(mol)) # Get canonical atom order
+            canonical_order = rdmolfiles.CanonicalRankAtoms(mol) # Get canonical atom order
             mol = rdmolops.RenumberAtoms(mol, canonical_order) # Renumber atoms based on canonical rank
         except Exception as e:
             # Catch errors during preprocessing
@@ -1168,7 +1234,6 @@ class MoleculeDesign(BaseTrajectory):
             Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, Chem.BondType.TRIPLE: 3,
             Chem.BondType.AROMATIC: -1,  # Should be handled by Kekulize, treat as error if seen
             Chem.BondType.QUADRUPLE: 4, Chem.BondType.QUINTUPLE: 5, Chem.BondType.HEXTUPLE: 6,
-            # Add others if needed, e.g., DATIVE, IONIC? For now, focus on covalent.
         }
         num_heavy_atoms = rdkit_mol.GetNumAtoms()
 
@@ -1242,7 +1307,7 @@ class MoleculeDesign(BaseTrajectory):
             rl_order = BOND_TYPE_TO_RL_ORDER.get(bond_type)
             if rl_order is None: # Unsupported bond type
                  raise ValueError(f"Unsupported RDKit bond type '{bond_type}' found in input SMILES '{smiles or ''}'. Ensure molecule is Kekulized and only contains supported bond types.")
-            if rl_order == 0: # Aromatic bond type should not be present after Kekulization
+            if rl_order == -1: # Aromatic bond type should not be present after Kekulization
                  raise ValueError(f"Aromatic bond type found in input SMILES '{smiles or ''}' after preprocessing. Kekulization might have failed.")
 
             # Get corresponding internal indices

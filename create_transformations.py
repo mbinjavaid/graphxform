@@ -51,7 +51,7 @@ MAX_HIGH_LEVEL_ACTIONS = CONFIG.max_actions
 MAX_LOW_LEVEL_STEPS_SAFETY = MAX_HIGH_LEVEL_ACTIONS * 4
 
 # TRANSFORMATIONS_PER_MOLECULE = 10
-TRANSFORMATIONS_PER_MOLECULE = 2
+TRANSFORMATIONS_PER_MOLECULE = 1
 MAX_ATTEMPTS_PER_TRANSFORMATION = 50
 MAX_TOTAL_ATTEMPTS_PER_MOLECULE = TRANSFORMATIONS_PER_MOLECULE * MAX_ATTEMPTS_PER_TRANSFORMATION * 2 # Keep this calculation based on potentially updated values
 
@@ -299,14 +299,15 @@ def get_action_type_name(level: int, action: int, vocab_size: int, num_real_atom
 # <<< Modified Action Selection Function >>>
 def select_action_strategy(
     mol_design: MoleculeDesign,
-    atom_probabilities: Dict[str, float], # Passed in for weighted Add Atom
-    atom_vocab_list: List[str],          # Passed in for weighted Add Atom
+    atom_probabilities: Dict[str, float], # Passed in for weighted Add Atom & Replace Atom
+    atom_vocab_list: List[str],          # Passed in for weighted Add Atom & Replace Atom
     terminate_prob: float = 0.05
 ) -> Optional[int]:
     """
     Selects a random valid action based on the current level.
     Level 0: Biased sampling (terminate_prob for Terminate, 1-terminate_prob for Select Atom).
     Level 1 (Add Atom): Weighted sampling based on atom_probabilities.
+    Level 1 (Replace Atom): Weighted sampling based on atom_probabilities. # <-- NEW
     Level 1 (Other Cats) / Level 2: Equal probability sampling across valid action *categories*,
                                      and uniform sampling *within* those categories.
     """
@@ -378,43 +379,84 @@ def select_action_strategy(
         selected_category_name = random.choice(list(valid_categories.keys()))
 
         # --- Choose an action WITHIN the selected category ---
+
+        # 1. Add Atom (Weighted)
         if selected_category_name == "Add Atom":
-            # Use WEIGHTED sampling based on dataset probabilities
             valid_add_atom_indices = valid_categories["Add Atom"]
             if not valid_add_atom_indices:
                  if DEBUG_MODE: print("DEBUG ERROR: 'Add Atom' category chosen but no valid indices found.")
-                 return None # Should not happen
+                 return None
 
             candidate_indices = []
             candidate_weights = []
             for index in valid_add_atom_indices:
-                if 0 <= index < len(atom_vocab_list): # atom_vocab_list has allowed names
-                    atom_type_str = atom_vocab_list[index]
+                # Index for Add Atom corresponds directly to vocab_list index
+                vocab_list_idx = index
+                if 0 <= vocab_list_idx < len(atom_vocab_list):
+                    atom_type_str = atom_vocab_list[vocab_list_idx]
                     prob = atom_probabilities.get(atom_type_str, 0.0)
-                    candidate_indices.append(index)
+                    candidate_indices.append(index) # Store the original action index
                     candidate_weights.append(prob)
                 else:
                      if DEBUG_MODE: print(f"DEBUG WARNING: Invalid 'Add Atom' index {index} encountered (allowed list size {len(atom_vocab_list)}).")
 
             if not candidate_indices or sum(candidate_weights) <= 0:
-                 if DEBUG_MODE: print(f"DEBUG WARNING: No valid 'Add Atom' actions with positive probability found. Falling back to uniform choice among valid add actions.")
+                 if DEBUG_MODE: print(f"DEBUG WARNING: No valid 'Add Atom' actions with positive probability found. Falling back to uniform choice.")
                  if not valid_add_atom_indices: return None
                  selected_action_index = random.choice(valid_add_atom_indices) # Fallback to uniform
             else:
                  selected_action_index = random.choices(candidate_indices, weights=candidate_weights, k=1)[0] # Weighted choice
                  if DEBUG_MODE:
-                     selected_atom_type = atom_vocab_list[selected_action_index]
+                     selected_atom_type = atom_vocab_list[selected_action_index] # Index matches vocab_list index
                      selected_prob = atom_probabilities.get(selected_atom_type, 0.0)
                      print(f"DEBUG (Action Select L1 Add): Weighted Sample Chose Action {selected_action_index} ('{selected_atom_type}', Prob={selected_prob:.4f})")
 
             return selected_action_index
 
+        # 2. Replace Atom (Weighted) <-- NEW BLOCK
+        elif selected_category_name == "Replace Atom":
+            valid_replace_atom_indices = valid_categories["Replace Atom"]
+            if not valid_replace_atom_indices:
+                 if DEBUG_MODE: print("DEBUG ERROR: 'Replace Atom' category chosen but no valid indices found.")
+                 return None
+
+            candidate_indices = []
+            candidate_weights = []
+            replace_start_offset = vocab_size + num_real_atoms # Calculate offset for this category
+
+            for index in valid_replace_atom_indices:
+                # Map action index back to the 0-based index in atom_vocab_list
+                vocab_list_idx = index - replace_start_offset
+                if 0 <= vocab_list_idx < len(atom_vocab_list):
+                    atom_type_str = atom_vocab_list[vocab_list_idx]
+                    prob = atom_probabilities.get(atom_type_str, 0.0)
+                    candidate_indices.append(index) # Store the original action index
+                    candidate_weights.append(prob)
+                else:
+                     if DEBUG_MODE: print(f"DEBUG WARNING: Invalid 'Replace Atom' index {index} or derived vocab index {vocab_list_idx} encountered (allowed list size {len(atom_vocab_list)}).")
+
+            if not candidate_indices or sum(candidate_weights) <= 0:
+                 if DEBUG_MODE: print(f"DEBUG WARNING: No valid 'Replace Atom' actions with positive probability found. Falling back to uniform choice.")
+                 if not valid_replace_atom_indices: return None
+                 selected_action_index = random.choice(valid_replace_atom_indices) # Fallback to uniform
+            else:
+                 selected_action_index = random.choices(candidate_indices, weights=candidate_weights, k=1)[0] # Weighted choice
+                 if DEBUG_MODE:
+                     selected_vocab_list_idx = selected_action_index - replace_start_offset
+                     selected_atom_type = atom_vocab_list[selected_vocab_list_idx]
+                     selected_prob = atom_probabilities.get(selected_atom_type, 0.0)
+                     print(f"DEBUG (Action Select L1 Replace): Weighted Sample Chose Action {selected_action_index} ('{selected_atom_type}', Prob={selected_prob:.4f})")
+
+            return selected_action_index
+
+        # 3. Other Categories (Uniform within category)
         else:
-            # For "Select Existing", "Replace Atom", "Remove Atom" (L1)
-            # AND "Set Bond Order", "Remove Bond" (L2)
+            # Handles:
+            # - L1: "Select Existing Atom", "Remove Atom"
+            # - L2: "Set Bond Order", "Remove Bond"
             # Choose an action UNIFORMLY from the valid actions within the chosen category
             selected_action_index = random.choice(valid_categories[selected_category_name])
-            if DEBUG_MODE: print(f"DEBUG (Action Select L{level}): Chose Category '{selected_category_name}' (Uniform), Action {selected_action_index}")
+            if DEBUG_MODE: print(f"DEBUG (Action Select L{level}): Chose Category '{selected_category_name}' (Uniform), Action {selected_action_index} (Uniform within cat)")
             return selected_action_index
 
 
@@ -512,11 +554,15 @@ def generate_single_transformation(
                 if DEBUG_MODE: print(f"DEBUG INFO: High-level action count incremented to {high_level_action_count} at low-level step {low_level_step_count}.")
 
         # Catch specific errors that indicate sequence failure
-        except (ValueError, IndexError, RuntimeError) as e:
-             if DEBUG_MODE: print(f"DEBUG FAIL (Take Action Error): Error during take_action(action={action}, L{prev_level}) at low-level step {low_level_step_count}: {e}")
-             # traceback.print_exc() # Optional: Full traceback in debug
-             return None
-        # Do not catch generic Exception here, let it propagate if truly unexpected
+        except RuntimeError as e:
+            # indicates a sanitization failure
+            if DEBUG_MODE: print(f"DEBUG FAIL (Runtime Error): Error during take_action(action={action}, L{prev_level}) at low-level step {low_level_step_count}: {e}")
+            return None
+        except (ValueError, IndexError) as e:
+            if DEBUG_MODE: print(f"DEBUG FAIL (Take Action Error): Error during take_action(action={action}, L{prev_level}) at low-level step {low_level_step_count}: {e}")
+            # traceback.print_exc() # Optional: Full traceback in debug
+            raise RuntimeError(f"Value/Index error during take_action: {e}")
+        # Do not catch generic Exception here; do not let it propagate if truly unexpected
 
         next_smiles = None
         perform_cycle_check = modifies_structure
@@ -595,9 +641,9 @@ def generate_single_transformation(
 
     # 3. Check connectivity (only relevant if >1 atom)
     num_final_real_atoms = len(current_mol_design.atoms) - 1
-    if num_final_real_atoms > 1 and not current_mol_design.is_currently_connected:
-         if DEBUG_MODE: print(f"DEBUG FAIL (Final Connectivity): Molecule disconnected ({current_mol_design.num_components} components).")
-         return None
+    # if num_final_real_atoms > 1 and not current_mol_design.is_currently_connected:
+    #      if DEBUG_MODE: print(f"DEBUG FAIL (Final Connectivity): Molecule disconnected ({current_mol_design.num_components} components).")
+    #      return None
 
     # 4. Get final SMILES (includes sanitization check via finalize/to_smiles)
     final_smiles = None

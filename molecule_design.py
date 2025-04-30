@@ -30,10 +30,7 @@ def build_reverse_atom_lookup(config: MoleculeConfig) -> Dict[Tuple[int, int, in
     (Implementation remains the same)
     """
     lookup = {}
-    if hasattr(config, 'vocabulary_atom_names'):
-        vocab_names = config.vocabulary_atom_names
-    else:
-        vocab_names = list(config.atom_vocabulary.keys())
+    vocab_names = list(config.atom_vocabulary.keys())
 
     if not vocab_names:
         raise ValueError("Atom vocabulary in config appears empty.")
@@ -58,18 +55,22 @@ def build_reverse_atom_lookup(config: MoleculeConfig) -> Dict[Tuple[int, int, in
         if key in lookup:
             # Allow overwriting, assumes config is consistent if duplicates exist
             # Could add a warning here if needed
+            print("WARNING: Duplicate key found in atom vocabulary. Overwriting existing entry.")
             pass
+
         lookup[key] = vocab_idx
 
-        # Add fallback for non-chiral lookup if a chiral version exists
-        if chiral != 0:
-            key_no_chiral = (atomic_num, charge, 0)
-            if key_no_chiral not in lookup:
-                lookup[key_no_chiral] = vocab_idx
+        # # Add fallback for non-chiral lookup if a chiral version exists
+        # if chiral != 0:
+        #     key_no_chiral = (atomic_num, charge, 0)
+        #     if key_no_chiral not in lookup:
+        #         lookup[key_no_chiral] = vocab_idx
+        #     # raise ValueError(f"Chiral atom '{name}' with key {key} already exists in lookup. Check config for duplicates.")
 
     if not lookup:
         raise ValueError("Reverse atom lookup is empty. Check atom_vocabulary in config.")
 
+    # print(lookup)
     return lookup
 
 
@@ -1175,7 +1176,7 @@ class MoleculeDesign(BaseTrajectory):
             return_dict["feasibility_mask_level_zero"] = torch.from_numpy(np.stack(masks_l0)).bool().to(device)
             return_dict["feasibility_mask_level_one"] = torch.from_numpy(np.stack(masks_l1)).bool().to(device)
             return_dict["feasibility_mask_level_two"] = torch.from_numpy(np.stack(masks_l2)).bool().to(device)
-
+        # print(">>> DEBUG: list_to_batch is returning keys:", list(return_dict.keys()))
         return return_dict
 
     @staticmethod
@@ -1287,6 +1288,7 @@ class MoleculeDesign(BaseTrajectory):
             if vocab_idx is None and chiral_key_val != 0:
                 key_no_chiral = (atomic_num, charge, 0)
                 vocab_idx = reverse_atom_lookup.get(key_no_chiral)
+                raise ValueError(f"Chiral atom type ({atomic_num}, charge={charge}, chiral={chiral_key_val}) from input SMILES '{smiles or ''}' not found in configured atom vocabulary. Fallback to non-chiral version failed.")
 
             if vocab_idx is None:
                 # Atom type in input molecule not found in vocabulary

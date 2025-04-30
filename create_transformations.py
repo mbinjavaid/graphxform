@@ -12,38 +12,20 @@ from datetime import datetime
 import copy
 from collections import Counter # Added for probability calculation
 
+from config import MoleculeConfig
+from molecule_design import MoleculeDesign, ActionType, build_reverse_atom_lookup
+
 # --- Global Debug Flag ---
 # Set to True to enable max component tracking and extra logging
 DEBUG_MODE = False
-# --- End Global Debug Flag ---
 
 # turn off RDKit warnings
 RDLogger.DisableLog('rdApp.*')
 
-# --- Import Custom Modules ---
-try:
-    from config import MoleculeConfig
-    from molecule_design import MoleculeDesign, ActionType, build_reverse_atom_lookup
-except ImportError as e:
-    print(f"Error importing custom modules: {e}")
-    print("Please ensure config.py and molecule_design.py are in the correct path.")
-    exit(1)
-
-# --- Configuration ---
-try:
-    CONFIG = MoleculeConfig()
-    if not hasattr(CONFIG, 'min_actions'):
-        print("Warning: 'min_actions' not found in MoleculeConfig, using default: 5")
-        CONFIG.min_actions = 5
-    if not hasattr(CONFIG, 'max_actions'):
-        print("Warning: 'max_actions' not found in MoleculeConfig, using default: 50")
-        CONFIG.max_actions = 50
-except Exception as e:
-    print(f"Error loading MoleculeConfig: {e}")
-    exit(1)
+CONFIG = MoleculeConfig()
 
 # Use DEBUG_MOLECULE_LIMIT from config if exists, otherwise default
-DEBUG_MOLECULE_LIMIT = 5
+DEBUG_MOLECULE_LIMIT = 50
 
 MAX_ATOMS = CONFIG.max_num_atoms
 MIN_HIGH_LEVEL_ACTIONS = CONFIG.min_actions
@@ -57,8 +39,8 @@ MAX_TOTAL_ATTEMPTS_PER_MOLECULE = TRANSFORMATIONS_PER_MOLECULE * MAX_ATTEMPTS_PE
 
 RANDOM_SEED = CONFIG.seed
 CHECKPOINT_DIR = "./data/chembl/checkpoints_transformations"
-STATS_FREQUENCY = 10
-CHECKPOINT_FREQUENCY = 100 # Use config value
+STATS_FREQUENCY = 5000
+CHECKPOINT_FREQUENCY = 5000 # Use config value
 RESULTS_DIR = "./data/chembl/transformation_datasets"
 
 CHEMBL_TRAIN_PATH = "./data/chembl/chembl_train_filtered.smiles"
@@ -76,6 +58,7 @@ np.random.seed(RANDOM_SEED)
 # Ensure directories exist
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
 
 # --- Molecule Loading and Filtering ---
 def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS, datatype: str = "unknown") -> List[str]:
@@ -108,28 +91,22 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS, datatype: s
             try:
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is None: continue
-                # Optional: Pre-sanitize here if needed, though MolFromSmiles handles some issues
-                # Chem.SanitizeMol(mol)
-                # Chem.Kekulize(mol)
-                num_heavy = mol.GetNumHeavyAtoms() # Check before canonicalization if faster
-                if num_heavy == 0 or num_heavy > max_atoms: continue
+                num_heavy = mol.GetNumHeavyAtoms()
+                if num_heavy == 0 or num_heavy > max_atoms:
+                    continue
 
-                # Get canonical SMILES *after* initial checks
+                # Get canonical SMILES
                 canonical_smiles = Chem.MolToSmiles(mol, canonical=True)
-                if not canonical_smiles: continue # Skip if canonicalization fails
-                if canonical_smiles in processed_smiles: continue
-
-                # Final check on canonical SMILES (redundant if MolFromSmiles worked, but safe)
-                mol_check = Chem.MolFromSmiles(canonical_smiles)
-                if mol_check is None: continue
-                # Re-check num heavy atoms on canonical mol (should be same, but safest)
-                num_heavy_check = mol_check.GetNumHeavyAtoms()
-                if num_heavy_check == 0 or num_heavy_check > max_atoms: continue
+                if not canonical_smiles:
+                    continue
+                if canonical_smiles in processed_smiles:
+                    continue
 
                 filtered_smiles_list.append(canonical_smiles)
                 processed_smiles.add(canonical_smiles)
             except Exception as e:
-                 # print(f"Skipping SMILES '{smiles}' due to error: {e}") # Optional debug
+                 if DEBUG_MODE:
+                     print(f"DEBUG WARNING: Error processing SMILES '{smiles}': {e}")
                  continue # Skip malformed SMILES
     try:
         with open(checkpoint_path, "wb") as f:
@@ -140,8 +117,6 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS, datatype: s
     return filtered_smiles_list
 
 
-# --- Atom Probability Calculation ---
-# --- Atom Probability Calculation (Revised to use Train+Valid) ---
 def calculate_atom_probabilities_from_lists( # Renamed again
     train_smiles_list: List[str], # <-- Accept train list
     valid_smiles_list: List[str], # <-- Accept valid list
@@ -162,10 +137,7 @@ def calculate_atom_probabilities_from_lists( # Renamed again
 
     # --- Get ordered list of allowed atom names from config (Unchanged) ---
     try:
-        if hasattr(config, 'vocabulary_atom_names'):
-             ordered_vocab_names = config.vocabulary_atom_names
-        else:
-             ordered_vocab_names = list(config.atom_vocabulary.keys())
+        ordered_vocab_names = list(config.atom_vocabulary.keys())
         allowed_atom_names_ordered = [
             name for i, name in enumerate(ordered_vocab_names)
             if config.atom_vocabulary[name].get("allowed", False)
@@ -236,18 +208,21 @@ def calculate_atom_probabilities_from_lists( # Renamed again
                  elif rdkit_chiral == Chem.ChiralType.CHI_TETRAHEDRAL_CCW: chiral_key_val = 2
                  key = (atomic_num, charge, chiral_key_val)
                  vocab_idx = reverse_atom_lookup.get(key)
-                 if vocab_idx is None and chiral_key_val != 0:
-                      key_no_chiral = (atomic_num, charge, 0)
-                      vocab_idx = reverse_atom_lookup.get(key_no_chiral)
+
+                 # if vocab_idx is None and chiral_key_val != 0:
+                 #    # key_no_chiral = (atomic_num, charge, 0)
+                 #    # vocab_idx = reverse_atom_lookup.get(key_no_chiral)
+
                  if vocab_idx is not None:
                      if 1 <= vocab_idx <= len(ordered_vocab_names):
                           atom_name = ordered_vocab_names[vocab_idx - 1]
                           if atom_name in allowed_atom_keys_set:
                               atom_counts[atom_name] += 1
                               total_atoms += 1
+                     else:
+                          raise ValueError(f"Vocab index {vocab_idx} out of range for atom name '{atom_name}'.")
          except Exception as e:
              continue # Skip molecule on error
-
 
     # ... (keep existing probability calculation, zero handling, and saving logic) ...
     if total_atoms == 0:
@@ -285,15 +260,29 @@ def calculate_atom_probabilities_from_lists( # Renamed again
 # --- Random Walk Generation Logic ---
 def get_action_type_name(level: int, action: int, vocab_size: int, num_real_atoms: int) -> str:
     # (Implementation remains the same)
-    if level == 0: return "Terminate" if action == 0 else "Select Atom"
+    if level == 0:
+        if action == 0:
+            return "Terminate"
+        elif 1 <= action <= num_real_atoms:
+            return "Select Atom"
+        else:
+            raise ValueError(f"Invalid action index for Level 0: {action}")
     elif level == 1:
-        remove_action_idx = vocab_size + num_real_atoms
+        remove_action_idx = vocab_size + vocab_size + num_real_atoms
         if 0 <= action < vocab_size: return "Add Atom"
-        elif vocab_size <= action < remove_action_idx: return "Select Existing Atom"
+        elif vocab_size <= action < vocab_size + num_real_atoms: return "Select Existing Atom"
+        elif vocab_size + num_real_atoms <= action < remove_action_idx: return "Replace Atom"
         elif action == remove_action_idx: return "Remove Atom"
-        else: return "Unknown L1"
-    elif level == 2: return "Set Bond Order" if 0 <= action <= 5 else "Remove Bond" if action == 6 else "Unknown L2"
-    else: return "Unknown Level"
+        else: raise ValueError(f"Invalid action index for Level 1: {action}")
+    elif level == 2:
+        if 0 <= action <= 5:
+            return "Set Bond Order"
+        elif action == 6:
+            return "Remove Bond"
+        else:
+            raise ValueError(f"Invalid action index for Level 2: {action}")
+    else:
+        raise ValueError(f"Invalid action level: {level}")
 
 
 # <<< Modified Action Selection Function >>>
@@ -301,7 +290,7 @@ def select_action_strategy(
     mol_design: MoleculeDesign,
     atom_probabilities: Dict[str, float], # Passed in for weighted Add Atom & Replace Atom
     atom_vocab_list: List[str],          # Passed in for weighted Add Atom & Replace Atom
-    terminate_prob: float = 0.05
+    terminate_prob: float = 0.1
 ) -> Optional[int]:
     """
     Selects a random valid action based on the current level.
@@ -535,7 +524,7 @@ def generate_single_transformation(
 
 
         action_type_name = get_action_type_name(prev_level, action, current_mol_design.vocab_size, prev_num_real)
-        modifies_structure = action_type_name in ["Remove Atom", "Set Bond Order", "Remove Bond"]
+        modifies_structure = action_type_name in ["Remove Atom", "Replace Atom", "Set Bond Order", "Remove Bond"]
         if DEBUG_MODE: print(f"DEBUG STEP {low_level_step_count}: HighLvl={high_level_action_count}, LowLvl={prev_level}, Action={action} ({action_type_name}), ModStruct={modifies_structure}")
 
         try:
@@ -543,11 +532,11 @@ def generate_single_transformation(
             # next_mol_design = current_mol_design # No longer needed, take_action modifies in place
             current_level = current_mol_design.current_action_level # Get updated level
 
-            if DEBUG_MODE:
-                max_components_this_sequence = max(max_components_this_sequence, current_mol_design.num_components)
-                # Reduce verbosity: Only print if components > 1
-                # if current_mol_design.num_components > 1:
-                #      print(f"DEBUG INFO: Step {low_level_step_count} - Components = {current_mol_design.num_components} (Max so far: {max_components_this_sequence})")
+            # if DEBUG_MODE:
+            #     max_components_this_sequence = max(max_components_this_sequence, current_mol_design.num_components)
+            #     # Reduce verbosity: Only print if components > 1
+            #     # if current_mol_design.num_components > 1:
+            #     #      print(f"DEBUG INFO: Step {low_level_step_count} - Components = {current_mol_design.num_components} (Max so far: {max_components_this_sequence})")
 
             if prev_level != 0 and current_level == 0:
                 high_level_action_count += 1
@@ -751,7 +740,6 @@ def main():
          return
     # <<< --- End Loading Data --- >>>
 
-
     # <<< --- Calculate or Load Atom Probabilities (using pre-loaded lists) --- >>>
     print("\n--- Calculating Atom Probabilities (Train+Valid) ---")
     try:
@@ -786,7 +774,7 @@ def main():
 
     for datatype, filepath in DATATYPES.items():
         datatype_start_time = time.time()
-        print(f"\n--- Processing {datatype} data ---") # Removed 'from filepath' as we use preloaded
+        print(f"\n--- Processing {datatype} data ---")  # Removed 'from filepath' as we use preloaded
 
         # <<< --- Use the pre-loaded list for the current datatype --- >>>
         initial_smiles_list = preloaded_data.get(datatype)
@@ -811,7 +799,7 @@ def main():
             effective_molecule_list = initial_smiles_list
             total_source_molecules_in_datatype_effective = total_source_molecules_in_datatype_full
 
-        results_checkpoint_path = os.path.join(CHECKPOINT_DIR, f"transformation_results_{datatype}.pkl")
+        results_checkpoint_path = os.path.join(CHECKPOINT_DIR, f"transformations_checkpoint_{datatype}.pkl")
         all_results: Dict[str, List[Tuple[str, str, List[int]]]] = {}
         start_index = 0
         datatype_sequences_attempted_session = 0
@@ -850,6 +838,7 @@ def main():
                 initial_valid_sequences_count = 0
         else:
             print(f"No results checkpoint found for {datatype}. Starting from scratch.")
+            processed_smiles_count_ckpt = 0
             initial_valid_sequences_count = 0
 
         molecules_processed_since_checkpoint = 0
@@ -878,15 +867,6 @@ def main():
                 # Double check it's not finalized (shouldn't be from from_smiles)
                 if initial_mol_design.synthesis_done:
                     raise RuntimeError("MoleculeDesign.from_smiles returned a finalized instance!")
-                # Get canonical SMILES from the *initialized* design for consistency checks
-                actual_start_smiles = initial_mol_design._get_smiles_for_check()
-                if actual_start_smiles is None:
-                    # This indicates an issue even creating the initial state representation
-                    raise ValueError("Initial molecule failed internal SMILES check after MoleculeDesign init.")
-                # Ensure the SMILES used matches the one from the list if canonicalization changed it
-                if actual_start_smiles != smiles_for_mol_design:
-                     if DEBUG_MODE: print(f"DEBUG INFO: Canonical SMILES '{actual_start_smiles}' differs from input list '{smiles_for_mol_design}'. Using canonical.")
-                     smiles_for_mol_design = actual_start_smiles # Use the canonical version going forward
 
             except (ValueError, RuntimeError, KeyError, IndexError) as e:
                 if DEBUG_MODE: print(f"\nDEBUG FAIL (Init/SMILES): Failed initial MoleculeDesign for {smiles_for_mol_design}: {e}.")
@@ -897,7 +877,7 @@ def main():
                 continue # Skip to the next molecule
 
             # Check for empty SMILES after init (should only happen if input was truly empty)
-            if not actual_start_smiles and initial_mol_design.GetNumAtoms() > 0:
+            if not smiles_for_mol_design and initial_mol_design.GetNumAtoms() > 0:
                  if DEBUG_MODE: print(f"\nDEBUG FAIL (Init/SMILES Empty): Initial molecule check yielded empty SMILES despite atoms for {smiles_for_mol_design}.")
                  if smiles_for_mol_design not in all_results: all_results[smiles_for_mol_design] = []
                  datatype_molecules_processed_session += 1; molecules_processed_since_checkpoint += 1; molecules_processed_since_stats += 1; global_total_molecules_processed += 1
@@ -916,7 +896,7 @@ def main():
                 # Call the generation function
                 result = generate_single_transformation(
                     initial_mol_design_copy,
-                    actual_start_smiles, # Use the verified canonical start SMILES
+                    smiles_for_mol_design, # Use the verified canonical start SMILES
                     CONFIG,
                     atom_probabilities,        # Pass calculated probabilities
                     allowed_atom_vocab_list,   # Pass allowed vocab list
@@ -927,8 +907,8 @@ def main():
                 if result is not None:
                     start_smi, end_smi, low_level_seq, high_level_count, max_components = result
                     # Optional: Extra check for start SMILES consistency
-                    if start_smi != actual_start_smiles:
-                         if DEBUG_MODE: print(f"DEBUG WARNING: Start SMILES mismatch! Expected '{actual_start_smiles}', got '{start_smi}'.")
+                    if start_smi != smiles_for_mol_design:
+                         if DEBUG_MODE: print(f"DEBUG WARNING: Start SMILES mismatch! Expected '{smiles_for_mol_design}', got '{start_smi}'.")
                          # Continue using the result's start_smi for the tuple stored
                     valid_transformations.append((start_smi, end_smi, low_level_seq))
                     sequences_found_this_mol_session += 1
@@ -957,8 +937,10 @@ def main():
                 # Calculate overall valid sequences including those loaded from checkpoint
                 total_valid_sequences_overall = initial_valid_sequences_count + datatype_valid_sequences_generated_session
                 # Calculate overall processed molecules including those skipped due to checkpoint
-                processed_mol_count_overall = start_index + datatype_molecules_processed_session
-                avg_sequences_per_mol_overall = total_valid_sequences_overall / processed_mol_count_overall if processed_mol_count_overall > 0 else 0
+
+                true_total_molecules_processed_overall = processed_smiles_count_ckpt + datatype_molecules_processed_session
+                avg_sequences_per_mol_overall = total_valid_sequences_overall / true_total_molecules_processed_overall if true_total_molecules_processed_overall > 0 else 0
+
                 # Session success rate based on attempts *in this run*
                 success_rate_session = (datatype_valid_sequences_generated_session / datatype_sequences_attempted_session * 100) if datatype_sequences_attempted_session > 0 else 0
                 # Session average actions based on valid sequences found *in this run*
@@ -1029,6 +1011,6 @@ def main():
     completion_message = "Transformation dataset generation complete" + (" (DEBUG MODE)." if DEBUG_MODE else ".")
     print(completion_message)
 
-# --- Need this for the script to run ---
+
 if __name__ == "__main__":
     main()

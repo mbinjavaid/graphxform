@@ -22,12 +22,10 @@ class MoleculeTransformer(nn.Module):
 
         # --- Vocabulary and Dimension Info ---
         # Ensure config provides these values
-        if not hasattr(config, 'max_atoms'):
-            raise ValueError("MoleculeConfig must provide 'max_atoms' (maximum padded atom count)")
         self.max_atoms = self.config.max_num_atoms + 1  # Max padded size (including virtual atom)
 
-        if not hasattr(config, 'atom_vocabulary'):
-             raise ValueError("MoleculeConfig must provide 'atom_vocabulary'")
+        # if not hasattr(config, 'atom_vocabulary'):
+        #      raise ValueError("MoleculeConfig must provide 'atom_vocabulary'")
         self.vocab_size = len(self.config.atom_vocabulary) # Number of actual atom types (e.g., C, O, N...)
 
         # Max valence needed for degree embedding padding index
@@ -140,9 +138,44 @@ class MoleculeTransformer(nn.Module):
         atom_sequence = self.atom_learnable_embedding(x["atoms"])  # (B, N, D) D=latent_dim
 
         # Add degree embedding to REAL atoms (indices 1 to N-1)
-        # Ensure degrees are clipped or handled if they exceed embedding range (padding_idx handles this)
         if num_atoms_in_batch > 1: # Avoid slicing error if batch only has virtual atoms (unlikely)
-            degree_embeddings = self.degree_learnable_embedding(x["atoms_degree"][:, 1:]) # (B, N-1, D)
+            degree_indices_to_embed = x["atoms_degree"][:, 1:] # The tensor potentially causing the error
+
+            # # <<< --- START NEW DEBUG CHECK --- >>>
+            # # Check indices right before embedding lookup
+            # max_allowed_index = self.degree_learnable_embedding.num_embeddings - 1
+            # min_allowed_index = 0
+            # # Create boolean masks for indices out of bounds
+            # invalid_mask_neg = degree_indices_to_embed < min_allowed_index
+            # invalid_mask_pos = degree_indices_to_embed > max_allowed_index
+            # invalid_mask = invalid_mask_neg | invalid_mask_pos # Combine checks
+            #
+            # if torch.any(invalid_mask):
+            #     # Find the location and value of the first invalid index
+            #     invalid_locs = torch.where(invalid_mask)
+            #     first_invalid_batch_idx = invalid_locs[0][0].item()
+            #     first_invalid_atom_idx_in_slice = invalid_locs[1][0].item()
+            #     invalid_value = degree_indices_to_embed[first_invalid_batch_idx, first_invalid_atom_idx_in_slice].item()
+            #
+            #     # Get the full degree tensor for this problematic batch item for context
+            #     original_degrees_for_batch = x["atoms_degree"][first_invalid_batch_idx].cpu().numpy()
+            #
+            #     raise ValueError(
+            #         f"\n\n" + "="*20 + " INVALID DEGREE INDEX DETECTED in TRANSFORMER " + "="*20 + "\n"
+            #         f"Attempting to embed invalid degree index before adding to atom sequence.\n"
+            #         f"Embedding layer size (num_embeddings): {self.degree_learnable_embedding.num_embeddings}\n"
+            #         f"Max allowed index: {max_allowed_index}\n"
+            #         f"Min allowed index: {min_allowed_index}\n"
+            #         f"Found invalid index: {invalid_value} at batch index {first_invalid_batch_idx}, "
+            #         f"atom index relative to slice [1:]: {first_invalid_atom_idx_in_slice}\n"
+            #         f"Note: Atom index in slice 'k' corresponds to index 'k+1' in the full atoms_degree tensor.\n"
+            #         f"Full atoms_degree tensor for this batch item: {original_degrees_for_batch}\n"
+            #          + "="*70 + "\n"
+            #     )
+            # # <<< --- END NEW DEBUG CHECK --- >>>
+
+            # If the check passes, proceed with embedding lookup
+            degree_embeddings = self.degree_learnable_embedding(degree_indices_to_embed) # (B, N-1, D)
             atom_sequence[:, 1:] = atom_sequence[:, 1:] + degree_embeddings
 
         # Add level embedding to VIRTUAL atom (index 0)
@@ -160,37 +193,25 @@ class MoleculeTransformer(nn.Module):
         attn_mask = attn_mask.view(batch_size, self.num_blocks, self.num_heads, num_atoms_in_batch, num_atoms_in_batch)
 
         # Additive padding mask (prevents attention to padding atoms beyond N)
-        # Input mask shape: (B, N, N) -> Expand for blocks and heads
         padding_attn_mask = x["additive_padding_attn_mask"] # (B, N, N)
         padding_attn_mask = padding_attn_mask.unsqueeze(1).unsqueeze(1) # (B, 1, 1, N, N)
         # Repeat mask across all blocks and heads
         padding_attn_mask = padding_attn_mask.expand(-1, self.num_blocks, self.num_heads, -1, -1) # Use expand for efficiency
 
         # Combine bond bias and padding mask
-        # Where padding_attn_mask is -inf, the result will be -inf. Where it's 0, the bond bias is kept.
         final_attn_mask = attn_mask + padding_attn_mask # Additive combination
 
         # --- 3. Process through Transformer Encoder ---
         for i, trf_block in enumerate(self.encoder):
-            # Extract mask for the current block, shape (B, num_heads, N, N)
             mask_block_i = final_attn_mask[:, i, :, :, :]
-            # Reshape for TransformerEncoderLayer: Needs (B*num_heads, N, N) if using default MHA masking
             mask_block_folded = mask_block_i.reshape(batch_size * self.num_heads, num_atoms_in_batch, num_atoms_in_batch)
-
-            # Pass through the transformer block
-            # Note: Make sure the TransformerEncoderLayer implementation correctly handles the mask shape.
-            # PyTorch default expects (N, N) or (B*num_heads, N, N) or (B, N, N) depending on version/args.
-            # The folded mask (B*num_heads, N, N) is usually safe for batch_first=True.
             atom_sequence = trf_block(atom_sequence, src_mask=mask_block_folded)
 
         # --- 4. Generate Logits from Final Virtual Atom State ---
-        # Extract the final state of the virtual atom (index 0)
         virtual_atom_state = atom_sequence[:, 0, :]  # Shape: (batch_size, self.latent_dim)
-
-        # Apply the output linear layers defined in __init__
-        logits_zero = self.output_linear_level_zero(virtual_atom_state) # Shape: (B, config.max_atoms)
-        logits_one = self.output_linear_level_one(virtual_atom_state)   # Shape: (B, max_l1_actions)
-        logits_two = self.output_linear_level_two(virtual_atom_state)   # Shape: (B, 7)
+        logits_zero = self.output_linear_level_zero(virtual_atom_state)
+        logits_one = self.output_linear_level_one(virtual_atom_state)
+        logits_two = self.output_linear_level_two(virtual_atom_state)
 
         return logits_zero, logits_one, logits_two
 

@@ -78,11 +78,16 @@ class MoleculeConfig:
         # Training
         self.num_dataloader_workers = 3  # Number of workers for creating batches for training
         self.CUDA_VISIBLE_DEVICES = "0,1"  # Must be set, as ray can have problems detecting multiple GPUs
-        self.training_device = "cpu"  # Device on which to perform the supervised training
+        # self.training_device = "cpu"  # Device on which to perform the supervised training
+        # set training device as GPU:
+        self.training_device = "cuda:0"  # Device on which to perform the supervised training
         self.num_epochs = 1000  # Number of epochs (i.e., passes through training set) to train
         self.scale_factor_level_one = 1.
         self.scale_factor_level_two = 1.
+
         self.batch_size_training = 64
+        self.batch_size_validation = 512
+
         self.num_batches_per_epoch = 20  # Can be None, then we just do one pass through generated dataset
 
         # Optimizer

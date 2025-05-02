@@ -12,7 +12,7 @@ from scipy.sparse import csr_matrix
 
 # import traceback
 from config import MoleculeConfig
-from core.abstracts import BaseTrajectory # Assuming this import exists and is correct
+from core.abstracts import BaseTrajectory  # Assuming this import exists and is correct
 
 from typing import List, Tuple, Dict, Optional
 
@@ -303,7 +303,7 @@ class MoleculeDesign(BaseTrajectory):
             raise IndexError(f"Invalid atom vocab index found in self.atoms[1:]: {self.atoms[1:]}. Error: {e}")
 
         if len(total_valence) != len(current_usage):
-             raise RuntimeError(f"Valence calculation mismatch: total_valence ({len(total_valence)}) vs current_usage ({len(current_usage)})")
+             raise ValueError(f"Valence calculation mismatch: total_valence ({len(total_valence)}) vs current_usage ({len(current_usage)})")
 
         remaining = total_valence - current_usage
         remaining = np.maximum(0, remaining) # Valence cannot be negative
@@ -827,7 +827,7 @@ class MoleculeDesign(BaseTrajectory):
                 atom_name = self.vocabulary_atom_names[atom_vocab_idx - 1]
                 atom_config = self.atom_vocabulary[atom_name]
             except (IndexError, KeyError) as e:
-                raise RuntimeError(f"Cannot get config for vocab index {atom_vocab_idx} (name: {atom_name}): {e}")
+                raise ValueError(f"Cannot get config for vocab index {atom_vocab_idx} (name: {atom_name}): {e}")
 
             # Create RDKit atom
             a = Chem.Atom(atom_config["atomic_number"])
@@ -852,7 +852,7 @@ class MoleculeDesign(BaseTrajectory):
                     # Get corresponding RDKit indices
                     if i not in rdkit_idx_map or j not in rdkit_idx_map:
                         # This should not happen if loop is correct
-                        raise RuntimeError(f"Missing RDKit map entry for internal index {i} or {j}.")
+                        raise ValueError(f"Missing RDKit map entry for internal index {i} or {j}.")
                     rdkit_i, rdkit_j = rdkit_idx_map[i], rdkit_idx_map[j]
 
                     # Get RDKit bond type from order
@@ -862,11 +862,11 @@ class MoleculeDesign(BaseTrajectory):
                     else:
                         # Should not happen if bond_types dict is complete
                         # print(f"Warning: Could not find RDKit bond type for order {bond_order} between internal atoms {i},{j}.")
-                        raise RuntimeError(f"Missing RDKit bond type for order {bond_order} between internal atoms {i},{j}.")
+                        raise ValueError(f"Missing RDKit bond type for order {bond_order} between internal atoms {i},{j}.")
                 elif bond_order > self.maximum_bond_order and bond_order != self.virtual_bond_idx:
                      # Log invalid bond orders found in matrix (excluding virtual)
                      # print(f"Warning: Invalid bond order {bond_order} found between internal atoms {i},{j} during RDKit conversion.")
-                    raise RuntimeError(f"Invalid bond order {bond_order} found between internal atoms {i},{j}.")
+                    raise ValueError(f"Invalid bond order {bond_order} found between internal atoms {i},{j}.")
 
         # Optional sanitization
         if sanitize:
@@ -930,54 +930,102 @@ class MoleculeDesign(BaseTrajectory):
 
     @staticmethod
     def log_probability_fn(trajectories: List['MoleculeDesign'], network: nn.Module) -> List[np.array]:
-        """Calculates masked log probabilities for the current action level using a network."""
-        # (Implementation remains the same - relies on correct mask generation)
+        """
+        Calculates masked log probabilities for the current action level using a network.
+
+        MODIFIED: Uses batched feasibility masks from list_to_batch for consistency
+                  with the training loop masking logic.
+        """
         log_probs_to_return: List[np.array] = []
-        network.eval() # Set network to evaluation mode
-        with torch.no_grad(): # Disable gradient calculation
-            # Convert list of molecules to a batch dictionary for the network
-            batch = MoleculeDesign.list_to_batch(molecules=trajectories, device=network.device) # Assuming network has a device attribute
-            # Get logits from the network for all levels
+        if not trajectories:  # Handles empty input list
+            return log_probs_to_return
+
+        network.eval()  # Set network to evaluation mode
+        with torch.no_grad():  # Disable gradient calculation
+            # 1. Convert list of molecules to a batch dictionary (includes batched masks)
+            batch = MoleculeDesign.list_to_batch(list_of_samples=[{'molecule': m} for m in trajectories],
+                                                 device=network.device)
+
+            # 2. Get logits from the network
             batch_logits_l0, batch_logits_l1, batch_logits_l2 = network(batch)
-            # Move logits to CPU and convert to NumPy for easier handling
+
+            # 3. Retrieve Batched Masks from the batch dictionary
+            try:
+                batch_mask_l0_t = batch["feasibility_mask_level_zero"]
+                batch_mask_l1_t = batch["feasibility_mask_level_one"]
+                batch_mask_l2_t = batch["feasibility_mask_level_two"]
+            except KeyError as e:
+                raise ValueError(f"Batch dictionary from list_to_batch missing required feasibility mask key: {e}")
+
+            # 4. Move Logits and Masks to CPU/NumPy
             batch_logits_l0 = batch_logits_l0.cpu().numpy()
             batch_logits_l1 = batch_logits_l1.cpu().numpy()
             batch_logits_l2 = batch_logits_l2.cpu().numpy()
 
-            # Process each trajectory in the batch
+            batch_mask_l0 = batch_mask_l0_t.cpu().numpy().astype(bool)
+            batch_mask_l1 = batch_mask_l1_t.cpu().numpy().astype(bool)
+            batch_mask_l2 = batch_mask_l2_t.cpu().numpy().astype(bool)
+
+            # 5. Apply Batched Masks (Mirroring Training Logic) - BEFORE the loop
+            # Apply Mask L0 (Direct)
+            if batch_logits_l0.shape != batch_mask_l0.shape:
+                if not (batch_logits_l0.shape[0] == 0 and batch_mask_l0.shape[0] == 0):  # Allow empty batch
+                    raise ValueError(
+                        f"Batch L0 shape mismatch: Logits {batch_logits_l0.shape}, Mask {batch_mask_l0.shape}")
+            batch_logits_l0[batch_mask_l0] = -np.inf  # Apply mask
+
+            # Apply Mask L1 (Slice Logits First)
+            batch_max_actions_l1_mask = batch_mask_l1.shape[1]  # Dynamic size from mask
+            if batch_logits_l1.shape[0] > 0:  # Check if batch is not empty
+                if batch_logits_l1.shape[1] < batch_max_actions_l1_mask:  # Check if fixed logits dim is sufficient
+                    raise ValueError(
+                        f"Batch L1 shape mismatch: Fixed Logits ({batch_logits_l1.shape[1]}) < Dynamic Mask ({batch_max_actions_l1_mask})")
+                # Slice the fixed logits batch, apply the dynamic mask batch
+                batch_logits_l1[:, :batch_max_actions_l1_mask][batch_mask_l1] = -np.inf
+                # Set the rest of the fixed dimension logits to -inf (unreachable)
+                batch_logits_l1[:, batch_max_actions_l1_mask:] = -np.inf
+
+            # Apply Mask L2 (Direct)
+            if batch_logits_l2.shape != batch_mask_l2.shape:
+                if not (batch_logits_l2.shape[0] == 0 and batch_mask_l2.shape[0] == 0):  # Allow empty batch
+                    raise ValueError(
+                        f"Batch L2 shape mismatch: Logits {batch_logits_l2.shape}, Mask {batch_mask_l2.shape}")
+            batch_logits_l2[batch_mask_l2] = -np.inf  # Apply mask
+
+            # 6. Process each trajectory using the PRE-MASKED logits - INSIDE the loop
             for i, mol in enumerate(trajectories):
-                mask = mol.current_action_mask
-                # If mask is None (e.g., terminated), return empty array
-                if mask is None:
-                    log_probs_to_return.append(np.array([])); continue
 
-                # Select the appropriate logits based on the current level
-                logits = None
-                if mol.current_action_level == 0: logits = batch_logits_l0[i]
-                elif mol.current_action_level == 1: logits = batch_logits_l1[i]
-                elif mol.current_action_level == 2: logits = batch_logits_l2[i]
-                else: # Invalid level
-                    log_probs_to_return.append(np.array([])); continue
+                # Handle terminated molecules
+                if mol.synthesis_done:
+                    log_probs_to_return.append(np.array([]));
+                    continue
 
-                # Ensure logits match mask length (handle potential padding differences)
-                mask_len = len(mask)
-                if len(logits) > mask_len:
-                    logits = logits[:mask_len] # Truncate logits if longer
-                elif len(logits) < mask_len:
-                    # This indicates a mismatch between network output size and expected action space size
-                    raise ValueError(f"Logits/Mask length mismatch L{mol.current_action_level}: {len(logits)} vs {mask_len}")
+                # Select the appropriate PRE-MASKED logits based on the current level
+                masked_logits = None
+                if mol.current_action_level == 0:
+                    masked_logits = batch_logits_l0[i]
+                elif mol.current_action_level == 1:
+                    masked_logits = batch_logits_l1[i]
+                elif mol.current_action_level == 2:
+                    masked_logits = batch_logits_l2[i]
+                else:  # Invalid level
+                    print(
+                        f"Warning: Molecule {i} has invalid action level {mol.current_action_level}. Returning empty probs.")
+                    log_probs_to_return.append(np.array([]));
+                    continue
 
-                # Apply mask (set masked actions to -infinity)
-                logits[mask] = -np.inf
-                # Calculate log probabilities using log-softmax trick for numerical stability
-                max_logit = np.max(logits)
-                if np.isneginf(max_logit): # If all actions are masked
-                    log_probs = logits # Keep as -inf
+                # 7. REMOVED Old Logic (per-molecule mask retrieval, truncation, application)
+
+                # 8. Calculate log probabilities using log-softmax trick on PRE-MASKED logits
+                max_logit = np.max(masked_logits)
+                if np.isneginf(max_logit):  # If all actions were masked
+                    log_probs = masked_logits  # Keep all as -inf
                 else:
-                    exp_logits = np.exp(logits - max_logit)
-                    log_sum_exp = np.log(np.sum(exp_logits))
-                    log_probs = logits - (max_logit + log_sum_exp)
-                    log_probs[mask] = -np.inf # Ensure masked actions remain -inf
+                    exp_logits = np.exp(masked_logits - max_logit)
+                    log_sum_exp = np.log(np.sum(exp_logits))  # Sum is only over non -inf values
+                    log_probs = masked_logits - (max_logit + log_sum_exp)
+                    # Safety check: Ensure actions that were originally -inf remain -inf
+                    log_probs[np.isneginf(masked_logits)] = -np.inf
 
                 log_probs_to_return.append(log_probs)
         return log_probs_to_return
@@ -1008,11 +1056,10 @@ class MoleculeDesign(BaseTrajectory):
         return copied_molecule, copied_molecule.synthesis_done
 
     def to_max_evaluation_fn(self) -> float:
-        """Returns the objective value, penalizing infeasible states."""
-        # (Implementation remains the same)
-        if self.objective is None: return float("-inf")
-        # Return negative infinity if the state is flagged as infeasible
-        return float("-inf") if self.infeasibility_flag else self.objective
+        if self.objective is None:
+            raise ValueError("Objective is `None`. Evaluate molecule with `MoleculeObjectiveEvaluator` first.")
+
+        return self.objective
 
     def num_actions(self) -> int:
         """Returns the number of valid (unmasked) actions at the current level."""
@@ -1023,47 +1070,41 @@ class MoleculeDesign(BaseTrajectory):
     @staticmethod
     def list_to_batch(list_of_samples: List[Dict], device: torch.device = None) -> dict:
         """
-        Converts a list of sample dictionaries [{'molecule': MoleculeDesign, 'target_action': int}, ...]
-        to a batch dictionary suitable for network input.
+        Converts a list of sample dictionaries [{'molecule': MoleculeDesign}, ...]
+        to a batch dictionary containing only network inputs and feasibility masks.
 
-        Handles padding of atoms, bonds, attention masks, feasibility masks, and target tensors.
-        Feasibility masks are padded to global maximum sizes derived from config.max_num_atoms
-        (max REAL atoms) + virtual atom.
-        Target tensors are created with -1 for inactive levels.
+        MODIFIED: Uses DYNAMIC batch padding for feasibility masks.
+        MODIFIED: REMOVED target tensor creation, aligning with old structure.
         """
         if not list_of_samples: return {}
 
         # --- Extract molecules and config ---
-        molecules = [sample['molecule'] for sample in list_of_samples]
-        first_mol = molecules[0]
-        config = first_mol.config  # Get config from the first molecule
-        vocab_size = first_mol.vocab_size
+        # Adjusted to handle the input format from the reverted Dataset.__getitem__
+        try:
+            molecules = [sample['molecule'] for sample in list_of_samples]
+            if not molecules: return {}  # Handle case where list_of_samples is not empty but contains no molecules
+            first_mol = molecules[0]
+            config = first_mol.config
+            vocab_size = first_mol.vocab_size
+        except (KeyError, IndexError, AttributeError) as e:
+            raise ValueError(
+                f"Input list_of_samples is malformed or empty. Expected List[Dict['molecule': MoleculeDesign]]. Error: {e}")
 
-        # # --- Get Global Max Sizes and Padding Indices ---
-        # if not hasattr(config, 'max_num_atoms') or config.max_num_atoms is None:
-        #     raise ValueError("MoleculeConfig must provide 'max_num_atoms' (max REAL atoms) for list_to_batch padding.")
-
-        # config.max_num_atoms = max number of REAL atoms allowed
-        max_real_atoms_allowed = config.max_num_atoms
-
-        # CORRECT Global Size for L0 indices: 0 (virtual/terminate) to max_real_atoms_allowed
-        global_total_indices_l0 = max_real_atoms_allowed + 1
-
-        # CORRECT Global Size for L1 actions: Select Existing (max_real) + Add (V) + Replace (V) + Remove (1)
-        global_max_l1_actions = max_real_atoms_allowed + vocab_size + vocab_size + 1
-
-        # Padding indices calculation (remains the same)
+        # --- Padding Indices (Same as before) ---
         atoms_padding_idx = vocab_size + 1
-        max_valence = max([0] + [v for v in first_mol.vocabulary_valence if v is not None and v >= 0])
+        # Ensure vocabulary_valence exists and handle potential None/negative values
+        valid_valences = [v for v in getattr(first_mol, 'vocabulary_valence', []) if v is not None and v >= 0]
+        max_valence = max([0] + valid_valences)
         degree_padding_idx = max_valence + 1
         bond_padding_idx = MoleculeDesign.virtual_bond_idx + 1
 
         device = torch.device("cpu") if device is None else device
-        num_atoms_per_mol = [len(mol.atoms) for mol in molecules]  # List of actual atom counts per mol (incl. virtual)
-        batch_max_atoms = max(num_atoms_per_mol) if num_atoms_per_mol else 0  # Max atoms *in this specific batch*
+        # num_atoms_per_mol includes the virtual atom
+        num_atoms_per_mol = [len(mol.atoms) for mol in molecules]
+        batch_max_atoms = max(num_atoms_per_mol) if num_atoms_per_mol else 0
 
-        # --- Multi-Hot Encoding for Picked Atoms (Padded to batch_max_atoms) ---
-        # (Logic remains the same, using batch_max_atoms for padding this specific input)
+        # --- Multi-Hot Encoding, Atoms, Degrees, Bonds, Attn Mask (Padded to batch_max_atoms) ---
+        # --- Logic remains the same ---
         batch_picked_atom_mhe = np.zeros((len(molecules), batch_max_atoms), dtype=int)
         for i, mol in enumerate(molecules):
             anchor_idx = mol.l0_selected_atom_idx
@@ -1085,13 +1126,11 @@ class MoleculeDesign(BaseTrajectory):
                             if target_idx != anchor_idx:
                                 batch_picked_atom_mhe[i, target_idx] = 2
                             else:
-                                raise IndexError(f"Target index {target_idx} is same as anchor index {anchor_idx}")
+                                raise ValueError(f"Target index {target_idx} is same as anchor index {anchor_idx}")
                         else:
                             raise IndexError(
                                 f"Target index {target_idx} out of bounds for mhe (batch max={batch_max_atoms})")
 
-        # --- Batch Atoms, Degrees, Bonds, Attention Mask (Padded to batch_max_atoms) ---
-        # (Logic remains the same, using batch_max_atoms for padding these inputs)
         batch_atoms = np.stack([
             np.pad(mol.atoms, (0, batch_max_atoms - n), mode='constant', constant_values=atoms_padding_idx) if n > 0
             else np.full(batch_max_atoms, fill_value=atoms_padding_idx, dtype=np.uint8)
@@ -1135,96 +1174,76 @@ class MoleculeDesign(BaseTrajectory):
                 np.fill_diagonal(p_m, 0.0)
             additive_padding_masks.append(p_m)
         batch_additive_padding_attn_mask = np.stack(additive_padding_masks)
+        # --- End Input Processing Section ---
 
         # --- Batch Level Index (Unchanged) ---
         batch_level_idx = [mol.current_action_level for mol in molecules]
 
-        # --- *** CORRECTED: Batch Feasibility Masks (Padded to GLOBAL Max Sizes) *** ---
-        masks_l0, masks_l1, masks_l2 = [], [], []
-        for mol, n in zip(molecules, num_atoms_per_mol):
-            num_real = n - 1  # Number of real atoms in *this* molecule
+        # --- Batch Feasibility Masks (Padded DYNAMICALLY - Logic remains the same) ---
+        feasibility_masks_per_level = []
+        num_actions_per_level_and_mol = [
+            [n for n in num_atoms_per_mol],  # L0: n actions
+            [2 * vocab_size + n for n in num_atoms_per_mol],  # L1: 2V + n actions
+            [7] * len(molecules)  # L2: 7 actions
+        ]
 
-            # --- Level 0 Mask ---
-            # Expected size for *this molecule*: Terminate/Virtual (1) + Select Existing (num_real)
-            expected_len_l0 = 1 + num_real
-            mask_l0 = mol.current_action_mask if mol.current_action_level == 0 and mol.current_action_mask is not None else np.ones(
-                expected_len_l0, dtype=bool)
-            # Sanity check
-            if len(mask_l0) != expected_len_l0:
-                # print(f"Warning: L0 mask length mismatch for mol {i}. Expected {expected_len_l0}, got {len(mask_l0)}. Using default mask.") # Debug print
-                mask_l0 = np.ones(expected_len_l0, dtype=bool)
-            # Pad to CORRECT GLOBAL total size (global_total_indices_l0 = max_real_atoms + 1)
-            p_mask_l0 = np.pad(mask_l0, (0, global_total_indices_l0 - expected_len_l0), mode='constant',
-                               constant_values=True)  # True = Masked/Infeasible
-            masks_l0.append(p_mask_l0)
+        for lvl, num_actions_this_level_per_mol in enumerate(num_actions_per_level_and_mol):
+            max_num_actions = max(num_actions_this_level_per_mol) if num_actions_this_level_per_mol else 0
+            mask_list_for_level = []
+            for i, mol in enumerate(molecules):
+                num_actions_for_this_mol = num_actions_this_level_per_mol[i]
+                # Use feasible mask (all False) if molecule is not at this level
+                if mol.current_action_level == lvl and mol.current_action_mask is not None:
+                    current_mask = mol.current_action_mask.astype(bool)
+                    if len(current_mask) != num_actions_for_this_mol:
+                        print(
+                            f"Warning: L{lvl} mask length mismatch for mol {i}. Required {num_actions_for_this_mol}, got {len(current_mask)}. Using default (all infeasible).")
+                        current_mask = np.ones(num_actions_for_this_mol, dtype=bool)
+                else:
+                    # Mask is ignored if not at this level, but needs correct shape
+                    current_mask = np.zeros(num_actions_for_this_mol, dtype=bool)
 
-            # --- Level 1 Mask ---
-            # Expected size for *this molecule*: Select Existing (num_real) + Add (V) + Replace (V) + Remove (1)
-            expected_len_l1 = num_real + vocab_size + vocab_size + 1
-            mask_l1 = mol.current_action_mask if mol.current_action_level == 1 and mol.current_action_mask is not None else np.ones(
-                expected_len_l1, dtype=bool)
-            # Sanity check
-            if len(mask_l1) != expected_len_l1:
-                # print(f"Warning: L1 mask length mismatch for mol {i}. Expected {expected_len_l1}, got {len(mask_l1)}. Using default mask.") # Debug print
-                mask_l1 = np.ones(expected_len_l1, dtype=bool)
-            # Pad to CORRECT GLOBAL max size (global_max_l1_actions = max_real_atoms + 2V + 1)
-            p_mask_l1 = np.pad(mask_l1, (0, global_max_l1_actions - expected_len_l1), mode='constant',
-                               constant_values=True)  # True = Masked/Infeasible
-            masks_l1.append(p_mask_l1)
+                # Pad with True (infeasible)
+                padded_mask = np.pad(
+                    current_mask, (0, max_num_actions - num_actions_for_this_mol),
+                    mode='constant', constant_values=True
+                )
+                mask_list_for_level.append(padded_mask)
 
-            # --- Level 2 Mask (Remains fixed size 7) ---
-            expected_len_l2 = 7  # Fixed size
-            mask_l2 = mol.current_action_mask if mol.current_action_level == 2 and mol.current_action_mask is not None else np.ones(
-                expected_len_l2, dtype=bool)
-            # Sanity check
-            if len(mask_l2) != expected_len_l2:
-                # print(f"Warning: L2 mask length mismatch for mol {i}. Expected {expected_len_l2}, got {len(mask_l2)}. Using default mask.") # Debug print
-                mask_l2 = np.ones(expected_len_l2, dtype=bool)
-            # No padding needed as it's fixed size
-            masks_l2.append(mask_l2)
+            batch_mask_for_level = torch.from_numpy(
+                np.stack(mask_list_for_level) if mask_list_for_level else np.empty((0, max_num_actions), dtype=bool)
+            ).bool().to(device)
+            feasibility_masks_per_level.append(batch_mask_for_level)
+        # --- End Feasibility Mask Section ---
 
-        # Convert lists of masks to tensors
-        batch_mask_l0 = torch.from_numpy(np.stack(masks_l0)).bool().to(device)
-        batch_mask_l1 = torch.from_numpy(np.stack(masks_l1)).bool().to(device)
-        batch_mask_l2 = torch.from_numpy(np.stack(masks_l2)).bool().to(device)
+        # --- REMOVED Batch Target Tensors Creation ---
+        # targets_l0, targets_l1, targets_l2 = [], [], []
+        # ... (logic to fill targets based on sample['target_action']) ...
+        # batch_target_l0 = torch.tensor(...)
+        # batch_target_l1 = torch.tensor(...)
+        # batch_target_l2 = torch.tensor(...)
+        # --- END REMOVED SECTION ---
 
-        # --- Batch Target Tensors (Logic remains the same) ---
-        targets_l0, targets_l1, targets_l2 = [], [], []
-        ignore_index = -1  # Value for inactive levels
-
-        for sample in list_of_samples:
-            mol = sample['molecule']
-            target_action = sample['target_action']
-            current_level = mol.current_action_level
-
-            targets_l0.append(target_action if current_level == 0 else ignore_index)
-            targets_l1.append(target_action if current_level == 1 else ignore_index)
-            targets_l2.append(target_action if current_level == 2 else ignore_index)
-
-        batch_target_l0 = torch.tensor(targets_l0, dtype=torch.long, device=device)
-        batch_target_l1 = torch.tensor(targets_l1, dtype=torch.long, device=device)
-        batch_target_l2 = torch.tensor(targets_l2, dtype=torch.long, device=device)
-
-        # --- Construct Final Batch Dictionary ---
+        # --- Construct Final Batch Dictionary (Inputs and Masks ONLY) ---
         return_dict = dict(
-            # Inputs padded to batch_max_atoms (dynamic size for Transformer layers)
+            # Inputs padded to batch_max_atoms
             level_idx=torch.tensor(batch_level_idx, dtype=torch.long, device=device),
             picked_atom_mhe=torch.from_numpy(batch_picked_atom_mhe).long().to(device),
-            num_atoms=torch.tensor(num_atoms_per_mol, dtype=torch.long, device=device),  # Actual atom counts per sample
+            num_atoms=torch.tensor(num_atoms_per_mol, dtype=torch.long, device=device),
             atoms=torch.from_numpy(batch_atoms).long().to(device),
             atoms_degree=torch.from_numpy(batch_atoms_degree).long().to(device),
             bonds=torch.from_numpy(batch_bonds).long().to(device),
             additive_padding_attn_mask=torch.from_numpy(batch_additive_padding_attn_mask).float().to(device),
 
-            # Feasibility masks padded to GLOBAL max sizes (for matching fixed logit shapes)
-            feasibility_mask_level_zero=batch_mask_l0,  # Shape: (B, max_real_atoms + 1)
-            feasibility_mask_level_one=batch_mask_l1,  # Shape: (B, max_real_atoms + 2V + 1)
-            feasibility_mask_level_two=batch_mask_l2,  # Shape: (B, 7)
+            # Feasibility masks padded DYNAMICALLY
+            feasibility_mask_level_zero=feasibility_masks_per_level[0],
+            feasibility_mask_level_one=feasibility_masks_per_level[1],
+            feasibility_mask_level_two=feasibility_masks_per_level[2],
 
-            # Target tensors with ignore_index for inactive levels
-            target_zero=batch_target_l0,  # Shape: (B,)
-            target_one=batch_target_l1,  # Shape: (B,)
-            target_two=batch_target_l2  # Shape: (B,)
+            # --- REMOVED Targets from return dict ---
+            # target_zero=batch_target_l0,
+            # target_one=batch_target_l1,
+            # target_two=batch_target_l2
         )
 
         return return_dict
@@ -1297,7 +1316,7 @@ class MoleculeDesign(BaseTrajectory):
                        break
              # if first_allowed_atom_idx == -1: raise ValueError("No allowed atom found in config.")
         except Exception as e:
-             raise RuntimeError(f"Error finding first allowed atom in config: {e}")
+             raise ValueError(f"Error finding first allowed atom in config: {e}")
 
         # Handle empty input molecule
         if num_heavy_atoms == 0:
@@ -1314,7 +1333,7 @@ class MoleculeDesign(BaseTrajectory):
         try:
             reverse_atom_lookup = build_reverse_atom_lookup(config)
         except Exception as e:
-            raise RuntimeError(f"Failed to build reverse atom lookup needed for from_rdkit_mol: {e}") from e
+            raise ValueError(f"Failed to build reverse atom lookup needed for from_rdkit_mol: {e}") from e
 
         # --- Convert RDKit Mol to Internal State ---
         internal_atoms_list = [0] # Start with virtual atom
@@ -1367,7 +1386,7 @@ class MoleculeDesign(BaseTrajectory):
                 int_idx1, int_idx2 = rdkit_to_internal_map[idx1], rdkit_to_internal_map[idx2]
             except KeyError:
                 # This indicates an issue with the rdkit_to_internal_map construction
-                raise RuntimeError(f"Internal error: RDKit index map failed for bond between atoms {idx1} and {idx2}.")
+                raise ValueError(f"Internal error: RDKit index map failed for bond between atoms {idx1} and {idx2}.")
 
             # Set bond order in the symmetric matrix
             internal_bonds_matrix[int_idx1, int_idx2] = internal_bonds_matrix[int_idx2, int_idx1] = rl_order
@@ -1403,7 +1422,92 @@ class MoleculeDesign(BaseTrajectory):
             instance.update_action_mask()
         except Exception as e:
             # Catch errors during instance creation or state setting
-            raise RuntimeError(f"Error creating/setting MoleculeDesign state from RDKit Mol for {smiles or ''}: {e}") from e
+            raise ValueError(f"Error creating/setting MoleculeDesign state from RDKit Mol for {smiles or ''}: {e}") from e
 
-        # Return the initialized instance and the RDKit-to-internal index map
+        # Return the initializetd instance and the RDKit-to-internal index map
         return instance, rdkit_to_internal_map
+
+
+# if __name__ == "__main__":
+#     import pickle
+#     import torch
+#     import numpy as np
+#     from typing import List, Dict # Make sure these are imported at the top of the file too
+#
+#     # --- Configuration ---
+#     SAMPLE_DATA_PATH = "data/chembl/transformation_datasets/transformations_train.pkl"
+#     NUM_SAMPLES_TO_TEST = 3 # Load this many samples
+#     DEVICE = torch.device("cpu") # Use CPU for easier inspection
+#
+#     print(f"--- Testing list_to_batch with {NUM_SAMPLES_TO_TEST} samples from {SAMPLE_DATA_PATH} ---")
+#
+#     # --- Load Data ---
+#     try:
+#         with open(SAMPLE_DATA_PATH, 'rb') as f:
+#             loaded_data = pickle.load(f)
+#         print(f"Successfully loaded data. Total samples: {len(loaded_data)}")
+#         if len(loaded_data) < NUM_SAMPLES_TO_TEST:
+#             print(f"Warning: Requested {NUM_SAMPLES_TO_TEST} samples, but only {len(loaded_data)} available.")
+#             NUM_SAMPLES_TO_TEST = len(loaded_data)
+#         samples_to_test = loaded_data[:NUM_SAMPLES_TO_TEST]
+#     except FileNotFoundError:
+#         print(f"Error: Sample data file not found at {SAMPLE_DATA_PATH}")
+#         print("Please ensure the path is correct and the file exists.")
+#         exit()
+#     except Exception as e:
+#         print(f"Error loading or processing data: {e}")
+#         exit()
+#
+#     if not samples_to_test:
+#         print("No samples loaded, exiting.")
+#         exit()
+#
+#     # --- Call list_to_batch ---
+#     try:
+#         print(f"\nCalling MoleculeDesign.list_to_batch with {len(samples_to_test)} samples...")
+#         # Assuming MoleculeDesign class is defined above in the same file
+#         batch_dict = MoleculeDesign.list_to_batch(samples_to_test, device=DEVICE)
+#         print("list_to_batch executed successfully.")
+#     except Exception as e:
+#         print(f"\nError during MoleculeDesign.list_to_batch execution: {e}")
+#         import traceback
+#         traceback.print_exc() # Print detailed traceback
+#         exit()
+#
+#     # --- Inspect Output ---
+#     print("\n--- Batch Dictionary Contents ---")
+#     for key, tensor in batch_dict.items():
+#         print(f"\nKey: '{key}'")
+#         if isinstance(tensor, torch.Tensor):
+#             print(f"  Shape: {tensor.shape}")
+#             print(f"  Dtype: {tensor.dtype}")
+#             print(f"  Device: {tensor.device}")
+#             # Print values (convert to numpy for easier display if on CPU)
+#             try:
+#                 # Limit printing for large tensors if needed
+#                 if tensor.numel() > 1000: # Example limit
+#                      print(f"  Values (first 10 elements): {tensor.flatten()[:10].cpu().numpy()}")
+#                 else:
+#                      print(f"  Values:\n{tensor.cpu().numpy()}")
+#             except Exception as e:
+#                 print(f"  Error converting tensor to numpy or printing: {e}")
+#                 print(f"  Tensor: {tensor}") # Print tensor directly as fallback
+#         else:
+#             print(f"  Type: {type(tensor)}")
+#             print(f"  Value: {tensor}")
+#         print("-" * 20)
+#
+#     print("\n--- End of Test ---")
+#
+#     # --- Optional: Add specific checks here ---
+#     # Example: Check if padding values are correct in batch_atoms
+#     # first_mol = samples_to_test[0]['molecule']
+#     # atoms_padding_idx = first_mol.vocab_size + 1
+#     # num_atoms_sample0 = len(first_mol.atoms)
+#     # batch_max_atoms = batch_dict['atoms'].shape[1]
+#     # if num_atoms_sample0 < batch_max_atoms:
+#     #     padding_part = batch_dict['atoms'][0, num_atoms_sample0:].cpu().numpy()
+#     #     if np.all(padding_part == atoms_padding_idx):
+#     #         print("\nCheck PASSED: batch_atoms padding value seems correct for sample 0.")
+#     #     else:
+#     #         print(f"\nCheck FAILED: batch_atoms padding incorrect for sample 0. Expected {atoms_padding_idx}, got {padding_part}")

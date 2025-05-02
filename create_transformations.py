@@ -877,7 +877,7 @@ def main():
                 continue # Skip to the next molecule
 
             # Check for empty SMILES after init (should only happen if input was truly empty)
-            if not smiles_for_mol_design and initial_mol_design.GetNumAtoms() > 0:
+            if not smiles_for_mol_design and len(initial_mol_design.atoms) > 1:
                  if DEBUG_MODE: print(f"\nDEBUG FAIL (Init/SMILES Empty): Initial molecule check yielded empty SMILES despite atoms for {smiles_for_mol_design}.")
                  if smiles_for_mol_design not in all_results: all_results[smiles_for_mol_design] = []
                  datatype_molecules_processed_session += 1; molecules_processed_since_checkpoint += 1; molecules_processed_since_stats += 1; global_total_molecules_processed += 1

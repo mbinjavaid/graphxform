@@ -56,7 +56,8 @@ class MoleculeConfig:
         self.start_from_c_chains = False
         self.start_c_chain_max_len = 1
         # self.start_from_smiles = None  # Give SMILES and set `start_from_c_chains=False`.
-        self.start_from_smiles = True  # Give SMILES and set `start_from_c_chains=False`.
+        # Best molecule from COSMObase 2020 for IBA task:
+        self.start_from_smiles = "CC(C)N(CCO)C(C)C"  # Give SMILES and set `start_from_c_chains=False`.
         self.repeat_start_instances = 1
         # Positive value x, where the actual objective with our molecule score will be set to obj = score - x * SA_score
         self.synthetic_accessibility_in_objective_scale = 0
@@ -69,14 +70,16 @@ class MoleculeConfig:
         self.objective_type = "celecoxib_rediscovery"  # either "IBA" or "DMBA_TMB" for solvent design, or goal-directed task from GuacaMol (see README)
         self.num_predictor_workers = 1  # num of parallel workers that operate on a given list of molecules
         self.objective_predictor_batch_size = 64
-        self.objective_gnn_device = "cpu"  # device on which the GNN should live
+        # self.objective_gnn_device = "cpu"  # device on which the GNN should live
+        self.objective_gnn_device = "cuda:0"  # device on which the GNN should live
 
         # Loading trained checkpoints to resume training or evaluate
         self.load_checkpoint_from_path = None  # If given, model checkpoint is loaded from this path.
-        self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
+        # self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
+        self.load_optimizer_state = True  # If True, the optimizer state is also loaded.
 
         # Training
-        self.num_dataloader_workers = 3  # Number of workers for creating batches for training
+        self.num_dataloader_workers = 4  # Number of workers for creating batches for training
         self.CUDA_VISIBLE_DEVICES = "0,1"  # Must be set, as ray can have problems detecting multiple GPUs
         # self.training_device = "cpu"  # Device on which to perform the supervised training
         # set training device as GPU:
@@ -86,9 +89,11 @@ class MoleculeConfig:
         self.scale_factor_level_two = 1.
 
         self.batch_size_training = 64
+        # self.batch_size_training = 512
         self.batch_size_validation = 512
 
         self.num_batches_per_epoch = 20  # Can be None, then we just do one pass through generated dataset
+        # self.num_batches_per_epoch = 3000  # Can be None, then we just do one pass through generated dataset
 
         # Optimizer
         self.optimizer = {

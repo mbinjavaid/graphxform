@@ -742,7 +742,7 @@ class MoleculeDesign(BaseTrajectory):
                         # Attempt sanitization
                         sanitize_status = Chem.SanitizeMol(rdkit_mol, catchErrors=True)
                         if sanitize_status != Chem.SanitizeFlags.SANITIZE_NONE:
-                             print(f"Warning: Final sanitization failed with status {sanitize_status}.")
+                             # print(f"Warning: Final sanitization failed with status {sanitize_status}.")
                              self._cached_smiles = None # Ensure SMILES is None if sanitize fails
                              # Keep the unsanitized mol in cache? Optional. For now, clear SMILES.
                              self.infeasibility_flag = True # Optionally mark sanitize failure as infeasible
@@ -1083,8 +1083,10 @@ class MoleculeDesign(BaseTrajectory):
         try:
             molecules = [sample['molecule'] for sample in list_of_samples]
             if not molecules: return {}  # Handle case where list_of_samples is not empty but contains no molecules
+            # print(molecules)
+            # print(list_of_samples)
             first_mol = molecules[0]
-            config = first_mol.config
+            # config = first_mol.config
             vocab_size = first_mol.vocab_size
         except (KeyError, IndexError, AttributeError) as e:
             raise ValueError(

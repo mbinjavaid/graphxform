@@ -177,7 +177,7 @@ class TransformationMoleculeDataset(Dataset):
                 # Initialize MoleculeDesign
                 result_tuple = MoleculeDesign.from_smiles(self.config, start_smiles_key)
                 if result_tuple is None:
-                     raise RuntimeError(f"Failed to init from SMILES '{start_smiles_key}' for {sample_identifier}")
+                    raise RuntimeError(f"Failed to init from SMILES '{start_smiles_key}' for {sample_identifier}")
                 molecule, _ = result_tuple
 
                 # Apply actions up to the target step

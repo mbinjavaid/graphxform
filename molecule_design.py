@@ -148,8 +148,8 @@ class MoleculeDesign(BaseTrajectory):
 
         # --- Trajectory State ---
         self.synthesis_done = False
-        self._cached_smiles: Optional[str] = None
-        self._cached_rdkit_mol: Optional[Chem.Mol] = None
+        self.smiles_string: Optional[str] = None
+        self.rdkit_mol: Optional[Chem.Mol] = None
         self.objective: Optional[float] = None
         self.sa_score: float = 0.
         self.infeasibility_flag: bool = False
@@ -709,7 +709,7 @@ class MoleculeDesign(BaseTrajectory):
     def finalize(self, assert_feasible: bool = False):
         """Finalize molecule design: build RDKit mol, sanitize, cache SMILES."""
         # Avoid re-finalizing
-        if self._cached_smiles is not None or self._cached_rdkit_mol is not None: return
+        if self.smiles_string is not None or self.rdkit_mol is not None: return
 
         # Optional feasibility assertion
         if assert_feasible:
@@ -738,35 +738,35 @@ class MoleculeDesign(BaseTrajectory):
                 elif rdkit_mol.GetNumAtoms() > 0:
                     # 2. Attempt Sanitization and SMILES generation
                     try:
-                        self._cached_rdkit_mol = copy.deepcopy(rdkit_mol) # Cache unsanitized version first
+                        self.rdkit_mol = copy.deepcopy(rdkit_mol) # Cache unsanitized version first
                         # Attempt sanitization
                         sanitize_status = Chem.SanitizeMol(rdkit_mol, catchErrors=True)
                         if sanitize_status != Chem.SanitizeFlags.SANITIZE_NONE:
                              # print(f"Warning: Final sanitization failed with status {sanitize_status}.")
-                             self._cached_smiles = None # Ensure SMILES is None if sanitize fails
+                             self.smiles_string = None # Ensure SMILES is None if sanitize fails
                              # Keep the unsanitized mol in cache? Optional. For now, clear SMILES.
                              self.infeasibility_flag = True # Optionally mark sanitize failure as infeasible
                         else:
                              # Sanitization succeeded, update cache and get SMILES
-                             self._cached_rdkit_mol = rdkit_mol # Overwrite cache with sanitized version
-                             self._cached_smiles = Chem.MolToSmiles(rdkit_mol, canonical=True)
+                             self.rdkit_mol = rdkit_mol # Overwrite cache with sanitized version
+                             self.smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True)
                     except Exception as e:
                         # Catch errors during SanitizeMol or MolToSmiles
                         print(f"Warning: Final sanitization/SMILES generation failed: {e}.")
-                        self._cached_smiles = None
+                        self.smiles_string = None
                         # If SMILES failed, likely infeasible
-                        if self._cached_rdkit_mol is None: self.infeasibility_flag = True
+                        if self.rdkit_mol is None: self.infeasibility_flag = True
                 else: # 0 real atoms resulted in 0 RDKit atoms
                     # self._cached_smiles = "" # Empty SMILES for empty molecule
                     # self._cached_rdkit_mol = rdkit_mol # Cache the empty mol
                     raise ValueError("Empty RDKit mol with >0 real atoms.") # Raise to indicate failure
             except Exception as e:
-                 # Catch errors during to_rdkit_mol itself
+                 # Catch errors during rdkit_mol itself
                  print(f"Warning: Error during RDKit mol generation in finalize: {e}")
-                 self.infeasibility_flag = True; self._cached_smiles = None; self._cached_rdkit_mol = None
+                 self.infeasibility_flag = True; self.smiles_string = None; self.rdkit_mol = None
         else:
             # If already infeasible, ensure caches are None
-            self._cached_smiles = None; self._cached_rdkit_mol = None
+            self.smiles_string = None; self.rdkit_mol = None
 
         # Mark synthesis as done regardless of success/failure of finalization steps
         self.synthesis_done = True
@@ -874,7 +874,9 @@ class MoleculeDesign(BaseTrajectory):
                 Chem.SanitizeMol(mol)
             except Exception as e:
                 # Don't raise here, allow returning unsanitized mol, but warn
-                print(f"Warning: RDKit sanitization failed during to_rdkit_mol: {e}")
+                print(f"Warning: RDKit sanitization failed during rdkit_mol: {e}")
+
+        # print(Chem.MolToSmiles(mol))
         return mol
 
     def is_terminable(self):
@@ -896,13 +898,13 @@ class MoleculeDesign(BaseTrajectory):
              self.finalize(assert_feasible=False) # Finalize handles caching
 
         # Return cached SMILES if available and canonical required
-        if canonical and self._cached_smiles is not None:
-             return self._cached_smiles
+        if canonical and self.smiles_string is not None:
+             return self.smiles_string
         # If non-canonical needed or cache miss, try generating from cached mol
-        elif self._cached_rdkit_mol is not None:
+        elif self.rdkit_mol is not None:
              try:
                  # Work on a copy to avoid modifying cache if sanitize needed again
-                 mol_to_use = copy.deepcopy(self._cached_rdkit_mol)
+                 mol_to_use = copy.deepcopy(self.rdkit_mol)
                  # Ensure sanitization before generating SMILES if not guaranteed by finalize
                  sanitize_status = Chem.SanitizeMol(mol_to_use, catchErrors=True)
                  if sanitize_status != Chem.SanitizeFlags.SANITIZE_NONE:
@@ -911,14 +913,14 @@ class MoleculeDesign(BaseTrajectory):
 
                  smiles = Chem.MolToSmiles(mol_to_use, canonical=canonical)
                  # Update canonical cache if generated
-                 if canonical: self._cached_smiles = smiles
+                 if canonical: self.smiles_string = smiles
                  return smiles
              except Exception as e:
                  print(f"Warning: Failed to generate SMILES (canonical={canonical}) from cached mol: {e}")
                  return None
         else:
              # If no cached mol (e.g., finalization failed completely), return None
-             return self._cached_smiles # Which should be None or ""
+             return self.smiles_string # Which should be None or ""
 
     # --- Methods below likely used by RL framework ---
 
@@ -1056,6 +1058,7 @@ class MoleculeDesign(BaseTrajectory):
         return copied_molecule, copied_molecule.synthesis_done
 
     def to_max_evaluation_fn(self) -> float:
+        print(self.objective)
         if self.objective is None:
             raise ValueError("Objective is `None`. Evaluate molecule with `MoleculeObjectiveEvaluator` first.")
 
@@ -1408,8 +1411,8 @@ class MoleculeDesign(BaseTrajectory):
             instance.is_original_atom = np.array([False] + [True] * num_heavy_atoms, dtype=bool)
             # Reset trajectory state variables
             instance.synthesis_done = False
-            instance._cached_smiles = None # Clear cache
-            instance._cached_rdkit_mol = None
+            instance.smiles_string = None # Clear cache
+            instance.rdkit_mol = None
             instance.objective = None
             instance.infeasibility_flag = False
             instance.current_action_level = 0 # Start at Level 0
@@ -1426,7 +1429,7 @@ class MoleculeDesign(BaseTrajectory):
             # Catch errors during instance creation or state setting
             raise ValueError(f"Error creating/setting MoleculeDesign state from RDKit Mol for {smiles or ''}: {e}") from e
 
-        # Return the initializetd instance and the RDKit-to-internal index map
+        # Return the initialized instance and the RDKit-to-internal index map
         return instance, rdkit_to_internal_map
 
 

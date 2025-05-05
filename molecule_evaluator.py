@@ -247,6 +247,9 @@ class MoleculeObjectiveEvaluator:
         We check special constraints such as number of rings, nitrogen-to-nitrogen bond order, etc. and if the
         constraints are not satisfied, return true.
         """
+        # print("mol infeasibility flag: ", mol.infeasibility_flag)
+        # check whether the molecule is synthesis complete
+        # print("mol synthesis done: ", mol.synthesis_done)
         if mol.infeasibility_flag:
             return True
 
@@ -255,6 +258,7 @@ class MoleculeObjectiveEvaluator:
             node_f = [atom_features(atom) for atom in atoms]
         except:
             return True
+            # print("Error in getting atoms of molecule")
 
         if self.config.objective_type in ["IBA", "DMBA_TMB"] and self.config.include_structural_constraints:
             """
@@ -288,7 +292,7 @@ class MoleculeObjectiveEvaluator:
                     nitrogen_count = sum(1 for nbr in neighbors if
                                          nbr.GetAtomicNum() == 7 and
                                          mol.rdkit_mol.GetBondBetweenAtoms(atom.GetIdx(),
-                                                                 nbr.GetIdx()).GetBondType() == Chem.BondType.SINGLE)
+                                                                              nbr.GetIdx()).GetBondType() == Chem.BondType.SINGLE)
 
                     # Check if carbon is also double-bonded to oxygen (C=O)
                     has_carbonyl = any(

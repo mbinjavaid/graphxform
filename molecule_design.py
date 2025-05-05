@@ -1058,7 +1058,7 @@ class MoleculeDesign(BaseTrajectory):
         return copied_molecule, copied_molecule.synthesis_done
 
     def to_max_evaluation_fn(self) -> float:
-        print(self.objective)
+        # print(self.objective)
         if self.objective is None:
             raise ValueError("Objective is `None`. Evaluate molecule with `MoleculeObjectiveEvaluator` first.")
 

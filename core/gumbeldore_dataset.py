@@ -142,9 +142,23 @@ class GumbeldoreDataset:
         instances_dict = dict()  # Use a dict to directly avoid duplicates
         for i, _ in enumerate(problem_instances):
             for molecule in results[i]:  # type: MoleculeDesign
+                # if molecule.objective > float("-inf"):
+                #     instances_dict[molecule.smiles_string] = dict(
+                #         start_atom=molecule.initial_atom,
+                #         action_seq=molecule.history,
+                #         smiles=molecule.smiles_string,
+                #         obj=molecule.objective,
+                #         sa_score=molecule.sa_score
+                #     )
                 if molecule.objective > float("-inf"):
+                    # --- START MODIFIED BLOCK ---
+                    # Determine the starting SMILES key (None if not started from SMILES)
+                    original_start_smiles = getattr(self.config, 'start_from_smiles', None)
+
+                    # Add the start_smiles_key to the dictionary
                     instances_dict[molecule.smiles_string] = dict(
                         start_atom=molecule.initial_atom,
+                        start_smiles_key=original_start_smiles,  # NEW
                         action_seq=molecule.history,
                         smiles=molecule.smiles_string,
                         obj=molecule.objective,

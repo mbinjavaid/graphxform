@@ -744,7 +744,8 @@ class MoleculeDesign(BaseTrajectory):
                         if sanitize_status != Chem.SanitizeFlags.SANITIZE_NONE:
                              # print(f"Warning: Final sanitization failed with status {sanitize_status}.")
                              self.smiles_string = None # Ensure SMILES is None if sanitize fails
-                             # Keep the unsanitized mol in cache? Optional. For now, clear SMILES.
+                             # Keep the unsanitized mol in cache?
+                             self.rdkit_mol = None
                              self.infeasibility_flag = True # Optionally mark sanitize failure as infeasible
                         else:
                              # Sanitization succeeded, update cache and get SMILES

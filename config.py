@@ -55,10 +55,11 @@ class MoleculeConfig:
         # self.start_from_c_chains = True
         self.start_from_c_chains = False
         self.start_c_chain_max_len = 1
-        # self.start_from_smiles = None  # Give SMILES and set `start_from_c_chains=False`.
 
-        # Best molecule from COSMObase 2020 for IBA task:
-        self.start_from_smiles = "CC(C)N(CCO)C(C)C"  # Give SMILES and set `start_from_c_chains=False`.
+        # self.start_from_smiles = "C"  # Give SMILES and set `start_from_c_chains=False`.
+        # # # Best molecule from COSMObase 2020 for IBA task:
+        # self.start_from_smiles = "CC(C)N(CCO)C(C)C"  # Give SMILES and set `start_from_c_chains=False`.
+        self.start_from_smiles = "CCCCCCCCCCCCCCCCCO"  # best list screen for DMBA_TMB task
 
         self.repeat_start_instances = 1
         # Positive value x, where the actual objective with our molecule score will be set to obj = score - x * SA_score
@@ -69,7 +70,8 @@ class MoleculeConfig:
         # Objective molecule predictor
         self.GHGNN_model_path = os.path.join("objective_predictor/GH_GNN_IDAC/models/GHGNN.pth")
         self.GHGNN_hidden_dim = 113
-        self.objective_type = "celecoxib_rediscovery"  # either "IBA" or "DMBA_TMB" for solvent design, or goal-directed task from GuacaMol (see README)
+        # self.objective_type = "celecoxib_rediscovery"  # either "IBA" or "DMBA_TMB" for solvent design, or goal-directed task from GuacaMol (see README)
+        self.objective_type = "DMBA_TMB"  # either "IBA" or "DMBA_TMB" for solvent design, or goal-directed task from GuacaMol (see README)
         self.num_predictor_workers = 1  # num of parallel workers that operate on a given list of molecules
         self.objective_predictor_batch_size = 64
         self.objective_gnn_device = "cpu"  # device on which the GNN should live
@@ -77,6 +79,7 @@ class MoleculeConfig:
 
         # Loading trained checkpoints to resume training or evaluate
         self.load_checkpoint_from_path = "results/best_model.pt"  # If given, model checkpoint is loaded from this path.
+        # self.load_checkpoint_from_path = None  # If given, model checkpoint is loaded from this path.
         # self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
         self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
 
@@ -86,7 +89,7 @@ class MoleculeConfig:
         # self.training_device = "cpu"  # Device on which to perform the supervised training
         # set training device as GPU:
         self.training_device = "cuda:0"  # Device on which to perform the supervised training
-        self.num_epochs = 100  # Number of epochs (i.e., passes through training set) to train
+        self.num_epochs = 1000  # Number of epochs (i.e., passes through training set) to train
         self.scale_factor_level_one = 1.
         self.scale_factor_level_two = 1.
 

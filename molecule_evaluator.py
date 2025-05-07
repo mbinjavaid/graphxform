@@ -319,4 +319,16 @@ class MoleculeObjectiveEvaluator:
                     if n_count >= 1 and o_count >= 1 and h_count == 1:
                         return True  # Restriction is violated
 
+            if self.config.objective_type == 'DMBA_TMB':
+                # The molecule must be an alcohol (-OH group must be present):
+                # Check if any atom has an -OH group
+                has_alcohol = any(
+                    atom.GetAtomicNum() == 8 and  # Oxygen
+                    atom.GetDegree() == 1 and  # Oxygen is connected to only one other atom (the carbon)
+                    atom.GetTotalNumHs() == 1  # Oxygen has one hydrogen
+                    for atom in mol.rdkit_mol.GetAtoms()
+                )
+                if not has_alcohol:
+                    return True
+
         return False

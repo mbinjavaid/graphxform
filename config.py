@@ -65,14 +65,14 @@ class MoleculeConfig:
         # Positive value x, where the actual objective with our molecule score will be set to obj = score - x * SA_score
         self.synthetic_accessibility_in_objective_scale = 0
         # Enforce structural constraints (see molecule evaluator)
-        self.include_structural_constraints = False
+        self.include_structural_constraints = True
 
         # Objective molecule predictor
         self.GHGNN_model_path = os.path.join("objective_predictor/GH_GNN_IDAC/models/GHGNN.pth")
         self.GHGNN_hidden_dim = 113
-        # self.objective_type = "celecoxib_rediscovery"  # either "IBA" or "DMBA_TMB" for solvent design, or goal-directed task from GuacaMol (see README)
+        # self.objective_type = "sitagliptin_replacement"  # either "IBA" or "DMBA_TMB" for solvent design, or goal-directed task from GuacaMol (see README)
         self.objective_type = "DMBA_TMB"  # either "IBA" or "DMBA_TMB" for solvent design, or goal-directed task from GuacaMol (see README)
-        self.num_predictor_workers = 1  # num of parallel workers that operate on a given list of molecules
+        self.num_predictor_workers = 10  # num of parallel workers that operate on a given list of molecules
         self.objective_predictor_batch_size = 64
         self.objective_gnn_device = "cpu"  # device on which the GNN should live
         # self.objective_gnn_device = "cuda:0"  # device on which the GNN should live
@@ -85,7 +85,8 @@ class MoleculeConfig:
 
         # Training
         self.num_dataloader_workers = 4  # Number of workers for creating batches for training
-        self.CUDA_VISIBLE_DEVICES = "0,1"  # Must be set, as ray can have problems detecting multiple GPUs
+        # self.CUDA_VISIBLE_DEVICES = "0,1"  # Must be set, as ray can have problems detecting multiple GPUs
+        self.CUDA_VISIBLE_DEVICES = "0"  # Must be set, as ray can have problems detecting multiple GPUs
         # self.training_device = "cpu"  # Device on which to perform the supervised training
         # set training device as GPU:
         self.training_device = "cuda:0"  # Device on which to perform the supervised training
@@ -116,10 +117,10 @@ class MoleculeConfig:
             # Number of trajectories with the the highest objective function evaluation to keep for training
             "num_trajectories_to_keep": 100,
             "keep_intermediate_trajectories": True,  # if True, we consider all intermediate, terminable trajectories
-            "devices_for_workers": ["cpu"] * 1,
+            "devices_for_workers": ["cuda:0"] * 1,
             "destination_path": "./data/generated_molecules.pickle",
-            "batch_size_per_worker": 1,  # Keep at one, as we only have three atoms from which we can start
-            "batch_size_per_cpu_worker": 1,
+            "batch_size_per_worker": 10,  # Keep at one, as we only have three atoms from which we can start
+            "batch_size_per_cpu_worker": 10,
             "search_type": "tasar",
             "beam_width": 32,
             "replan_steps": 12,

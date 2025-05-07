@@ -212,7 +212,7 @@ class TransformationMoleculeDataset(Dataset):
              raise RuntimeError(f"No molecules successfully reconstructed for batch index {idx}.")
 
         # --- Call list_to_batch internally (Logic Unchanged) ---
-        # Assumes list_to_batch is compatible with the reconstructed partial_molecules
+        # list_to_batch should be compatible with the reconstructed partial_molecules
         try:
             # Assuming list_to_batch takes a list of dicts {'molecule': mol_obj}
             batch_input = MoleculeDesign.list_to_batch(

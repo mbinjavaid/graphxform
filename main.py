@@ -3,16 +3,16 @@ import copy
 import importlib
 import os
 import time
-import datetime # Added for potential default results path
+import datetime
 
 import torch
-from torch import nn # <-- Added for type checking in unfreezing block
+from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-# --- Added for AMP ---
+
 from torch.cuda.amp import GradScaler, autocast
-# --- End Added ---
+
 from tqdm import tqdm
 
 from logger import Logger
@@ -44,7 +44,6 @@ def save_checkpoint(checkpoint: dict, filename: str, config: MoleculeConfig):
             except OSError: pass
 
 
-# --- Updated train_for_one_epoch signature and logic ---
 def train_for_one_epoch(epoch: int,
                         config: MoleculeConfig,
                         network: MoleculeTransformer,
@@ -603,10 +602,10 @@ if __name__ == '__main__':
             )
             # --- End Training ---
 
-            # --- Scheduler Step (After optimizer steps in train_for_one_epoch) ---
+            # --- Scheduler Step
             if scheduler:
                 scheduler.step()
-            # --- End Scheduler Step ---
+
 
             checkpoint["epochs_trained"] = current_epoch_num
 
@@ -666,11 +665,9 @@ if __name__ == '__main__':
                  print(f">> Validation metric ({val_metric:.4f}) did not improve from best ({best_validation_metric:.4f}).")
             # --- End Update Best Model ---
 
-            # --- Check Wall Clock Limit ---
             if start_time_counter is not None and time.perf_counter() - start_time_counter > config.wall_clock_limit:
                 print("Wall clock time limit exceeded. Stopping training.")
                 break
-            # --- End Check Wall Clock Limit ---
 
         # --- End Epoch Loop ---
     elif config.num_epochs > 0:

@@ -25,6 +25,9 @@ class MoleculeTransformer(nn.Module):
         self.max_real_atoms = self.config.max_num_atoms # Max REAL atoms allowed by config
         self.max_atoms_padded = self.max_real_atoms + 1 # Max padded size (incl. virtual)
 
+        bond_types = MoleculeDesign.bond_types.keys()
+        max_bond_actions = len(bond_types) + 1
+
         self.vocab_size = len(self.config.atom_vocabulary)
         valid_valences = [v for data in self.config.atom_vocabulary.values() if (v := data.get("valence")) is not None and v >= 0]
         max_possible_valence = max([0] + valid_valences)
@@ -54,7 +57,8 @@ class MoleculeTransformer(nn.Module):
         self.output_linear_level_one = nn.Linear(self.latent_dim, max_l1_actions_global)
 
         # L2: NEW/OLD style (virtual atom only) -> Fixed Size 7
-        self.output_linear_level_two = nn.Linear(self.latent_dim, 7)
+        # self.output_linear_level_two = nn.Linear(self.latent_dim, 7)
+        self.output_linear_level_two = nn.Linear(self.latent_dim, max_bond_actions)
         # --- End of HYBRID Output Linear Layers ---
 
         # --- Transformer Encoder (Keep from NEW model) ---

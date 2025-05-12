@@ -12,7 +12,7 @@ from scipy.sparse import csr_matrix
 
 # import traceback
 from config import MoleculeConfig
-from core.abstracts import BaseTrajectory  # Assuming this import exists and is correct
+from core.abstracts import BaseTrajectory
 
 from typing import List, Tuple, Dict, Optional
 
@@ -99,15 +99,24 @@ class MoleculeDesign(BaseTrajectory):
             - Remove Selected Atom (Index V+N+V): Remove A (if original & N>1). -> Level 0
         - Level 2 (Atom Pair = A, B from L1): Set Bond Order 1-6 (creates if 0) or Remove Bond. -> Level 0
     """
-    maximum_bond_order = 6
-    virtual_bond_idx = 7 # Used for padding/virtual connections
+
+    # bond_types = {
+    #     1: Chem.rdchem.BondType.SINGLE, 2: Chem.rdchem.BondType.DOUBLE, 3: Chem.rdchem.BondType.TRIPLE,
+    #     4: Chem.rdchem.BondType.QUADRUPLE, 5: Chem.rdchem.BondType.QUINTUPLE, 6: Chem.rdchem.BondType.HEXTUPLE
+    # }
+
     bond_types = {
         1: Chem.rdchem.BondType.SINGLE, 2: Chem.rdchem.BondType.DOUBLE, 3: Chem.rdchem.BondType.TRIPLE,
-        4: Chem.rdchem.BondType.QUADRUPLE, 5: Chem.rdchem.BondType.QUINTUPLE, 6: Chem.rdchem.BondType.HEXTUPLE
+        4: Chem.rdchem.BondType.QUADRUPLE
     }
+
+    # max value in the keys of bond_types:
+    maximum_bond_order = max(bond_types.keys())
+    virtual_bond_idx = maximum_bond_order + 1  # Used for padding/virtual connections
 
     def __init__(self, config: MoleculeConfig, initial_atom: int):
         self.config = config
+
         self.atom_vocabulary = self.config.atom_vocabulary
         # Ensure consistency in vocab access
         if hasattr(config, 'vocabulary_atom_names'):
@@ -232,9 +241,9 @@ class MoleculeDesign(BaseTrajectory):
 
         except Exception as e:
             # print(f"WARNING: Error during SciPy connectivity check ({action_type}): {e}")
-            # return False # Assume disconnected on error
-            # Keep consistent with original code's tendency to raise on unexpected errors
-            raise ValueError(f"Error during SciPy connectivity check ({action_type}): {e}")
+            return False # Assume disconnected on error
+            # # Keep consistent with original code's tendency to raise on unexpected errors
+            # raise ValueError(f"Error during SciPy connectivity check ({action_type}): {e}")
 
     def _get_smiles_for_check(self) -> Optional[str]:
         """
@@ -246,13 +255,13 @@ class MoleculeDesign(BaseTrajectory):
         try:
             temp_mol = self.to_rdkit_mol(sanitize=False)
             if temp_mol is None or temp_mol.GetNumAtoms() == 0:
-                return "" # Empty molecule is valid
+                return ""  # Empty molecule is valid
 
             # Explicitly try sanitization here
             sanitize_status = Chem.SanitizeMol(temp_mol, catchErrors=True)
             if sanitize_status != Chem.SanitizeFlags.SANITIZE_NONE:
                  # print(f"DEBUG: _get_smiles_for_check - Sanitization failed with status {sanitize_status}") # Optional Debug
-                 return None # Sanitization failed
+                 return None  # Sanitization failed
 
             # If sanitization succeeded, get canonical SMILES
             smiles = Chem.MolToSmiles(temp_mol, canonical=True)
@@ -366,17 +375,19 @@ class MoleculeDesign(BaseTrajectory):
 
             # --- Unmask "Replace Atom" (Indices V+N to V+N+V-1) ---
             # (Logic unchanged)
-            replace_start_idx = self.vocab_size + num_real_atoms
-            current_atom_vocab_idx = self.atoms[anchor_atom_internal_idx]
-            current_anchor_usage = self._get_current_valence_usage(anchor_atom_internal_idx)[0]
-            for i in range(self.vocab_size):
-                action_idx = replace_start_idx + i
-                replacement_vocab_idx = i + 1
-                if replacement_vocab_idx == current_atom_vocab_idx: continue
-                if self.atom_feasibility_mask[i]: continue
-                replacement_max_valence = self.vocabulary_valence[replacement_vocab_idx]
-                if current_anchor_usage <= replacement_max_valence:
-                    mask[action_idx] = False
+            # We should only replace original atoms, so check if the anchor is original
+            if self.is_original_atom[anchor_atom_internal_idx]:
+                replace_start_idx = self.vocab_size + num_real_atoms
+                current_atom_vocab_idx = self.atoms[anchor_atom_internal_idx]
+                current_anchor_usage = self._get_current_valence_usage(anchor_atom_internal_idx)[0]
+                for i in range(self.vocab_size):
+                    action_idx = replace_start_idx + i
+                    replacement_vocab_idx = i + 1
+                    if replacement_vocab_idx == current_atom_vocab_idx: continue
+                    if self.atom_feasibility_mask[i]: continue
+                    replacement_max_valence = self.vocabulary_valence[replacement_vocab_idx]
+                    if current_anchor_usage <= replacement_max_valence:
+                        mask[action_idx] = False
 
             # --- Unmask "Remove Selected Atom" (Index V+N+V) ---
             remove_action_idx = 2 * self.vocab_size + num_real_atoms
@@ -396,7 +407,8 @@ class MoleculeDesign(BaseTrajectory):
 
         # --- Level 2 Mask ---
         elif self.current_action_level == 2:
-            action_space_size = 7 # Set Bond 1-6, Remove Bond
+            # action_space_size = 7 # Set Bond 1-6, Remove Bond
+            action_space_size = self.maximum_bond_order + 1  # Set Bond, Remove Bond
             mask = np.ones(action_space_size, dtype=bool) # Start masked
 
             atom_A_internal_idx = self.l0_selected_atom_idx
@@ -411,15 +423,15 @@ class MoleculeDesign(BaseTrajectory):
             # if not (1 <= atom_A_internal_idx <= num_real_atoms and 1 <= atom_B_internal_idx <= num_real_atoms):
             #     raise ValueError(f"L2 Bond Mask Error: Invalid indices A={atom_A_internal_idx}, B={atom_B_internal_idx} (NumReal={num_real_atoms})")
 
-            # --- Rule 2 Check: Prevent immediate reversal ---
-            # (Logic unchanged)
-            current_min_idx = min(atom_A_internal_idx, atom_B_internal_idx)
-            current_max_idx = max(atom_A_internal_idx, atom_B_internal_idx)
-            if (self.last_bond_action_details is not None and self.last_bond_action_details[0] == current_min_idx and
-                    self.last_bond_action_details[1] == current_max_idx):
-                mask[:] = True
-                self.current_action_mask = mask
-                return
+            # # --- Rule 2 Check: Prevent immediate reversal of bond actions --- (commented out for now)
+            # # (Logic unchanged)
+            # current_min_idx = min(atom_A_internal_idx, atom_B_internal_idx)
+            # current_max_idx = max(atom_A_internal_idx, atom_B_internal_idx)
+            # if (self.last_bond_action_details is not None and self.last_bond_action_details[0] == current_min_idx and
+            #         self.last_bond_action_details[1] == current_max_idx):
+            #     mask[:] = True
+            #     self.current_action_mask = mask
+            #     return
 
             # --- Normal L2 Mask Logic (Valence Check for Set Bond) ---
             # (Logic unchanged)
@@ -447,7 +459,8 @@ class MoleculeDesign(BaseTrajectory):
                 # (Only relevant if there's more than 1 real atom)
                 if num_real_atoms <= 1 or self._check_connectivity_after_simulated_removal(action_type="Remove Bond",
                                                                                            bond_indices_to_remove=(atom_A_internal_idx, atom_B_internal_idx)):
-                    mask[6] = False
+                    # mask[6] = False
+                    mask[-1] = False
 
             self.current_action_mask = mask
         else:
@@ -571,7 +584,7 @@ class MoleculeDesign(BaseTrajectory):
 
                     # --- Execute Replacement ---
                     self.atoms[anchor_idx] = replacement_vocab_idx
-                    self.is_original_atom[anchor_idx] = False  # Mark as no longer original
+                    self.is_original_atom[anchor_idx] = False  # Mark as no longer original (because we don't want to replace over and over)
                     self.l1_action_type = ActionType.REPLACE_ATOM
 
                     # --- Post-Replacement Sanitization Check REMOVED ---
@@ -637,17 +650,17 @@ class MoleculeDesign(BaseTrajectory):
                     raise ValueError(f"L2 take_action: Invalid L1 action type context ({self.l1_action_type}).")
 
                 # Validate indices A and B
-                current_num_real_atoms = len(self.atoms) - 1
+                # current_num_real_atoms = len(self.atoms) - 1
                 # if not (1 <= idx_A <= current_num_real_atoms and 1 <= idx_B <= current_num_real_atoms):
                 #     raise ValueError(f"L2 take_action: Invalid indices A={idx_A}, B={idx_B} for {current_num_real_atoms} atoms.")
 
                 # Execute bond action
-                if 0 <= action <= 5:  # Set Bond Order (action 0 -> order 1, ..., action 5 -> order 6)
+                if 0 <= action <= self.maximum_bond_order - 1:  # Set Bond Order (action 0 -> order 1, ..., action 5 -> order 6)
                     order = action + 1
                     self.bonds[idx_A, idx_B] = self.bonds[idx_B, idx_A] = order
                     # NO sanitization check needed here (was never present)
 
-                elif action == 6:  # Remove Bond
+                elif action == self.maximum_bond_order:  # Remove Bond
                     self.bonds[idx_A, idx_B] = self.bonds[idx_B, idx_A] = 0
 
                     # <<< --- Post-Bond-Removal Sanitization Check REMOVED --- >>>
@@ -1096,6 +1109,8 @@ class MoleculeDesign(BaseTrajectory):
             raise ValueError(
                 f"Input list_of_samples is malformed or empty. Expected List[Dict['molecule': MoleculeDesign]]. Error: {e}")
 
+        maximum_bond_order = first_mol.maximum_bond_order
+
         # --- Padding Indices (Same as before) ---
         atoms_padding_idx = vocab_size + 1
         # Ensure vocabulary_valence exists and handle potential None/negative values
@@ -1190,7 +1205,7 @@ class MoleculeDesign(BaseTrajectory):
         num_actions_per_level_and_mol = [
             [n for n in num_atoms_per_mol],  # L0: n actions
             [2 * vocab_size + n for n in num_atoms_per_mol],  # L1: 2V + n actions
-            [7] * len(molecules)  # L2: 7 actions
+            [maximum_bond_order + 1] * len(molecules)  # L2: 7 actions
         ]
 
         for lvl, num_actions_this_level_per_mol in enumerate(num_actions_per_level_and_mol):
@@ -1306,11 +1321,18 @@ class MoleculeDesign(BaseTrajectory):
         """Creates a MoleculeDesign instance from an RDKit Mol object."""
         # (Implementation remains the same)
         # Mapping from RDKit bond types to internal bond orders
+
+        # BOND_TYPE_TO_RL_ORDER = {
+        #     Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, Chem.BondType.TRIPLE: 3,
+        #     Chem.BondType.AROMATIC: -1,  # Should be handled by Kekulize, treat as error if seen
+        #     Chem.BondType.QUADRUPLE: 4, Chem.BondType.QUINTUPLE: 5, Chem.BondType.HEXTUPLE: 6,
+        # }
+
         BOND_TYPE_TO_RL_ORDER = {
             Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, Chem.BondType.TRIPLE: 3,
-            Chem.BondType.AROMATIC: -1,  # Should be handled by Kekulize, treat as error if seen
-            Chem.BondType.QUADRUPLE: 4, Chem.BondType.QUINTUPLE: 5, Chem.BondType.HEXTUPLE: 6,
-        }
+            Chem.BondType.QUADRUPLE: 4, Chem.BondType.AROMATIC: -1}
+        # -1 Should be handled by Kekulize, treat as error if seen
+
         num_heavy_atoms = rdkit_mol.GetNumAtoms()
 
         # Find the first allowed atom in the vocabulary to use for initializing the instance
@@ -1384,8 +1406,8 @@ class MoleculeDesign(BaseTrajectory):
             rl_order = BOND_TYPE_TO_RL_ORDER.get(bond_type)
             # if rl_order is None: # Unsupported bond type
             #      raise ValueError(f"Unsupported RDKit bond type '{bond_type}' found in input SMILES '{smiles or ''}'. Ensure molecule is Kekulized and only contains supported bond types.")
-            # if rl_order == -1: # Aromatic bond type should not be present after Kekulization
-            #      raise ValueError(f"Aromatic bond type found in input SMILES '{smiles or ''}' after preprocessing. Kekulization might have failed.")
+            if rl_order == -1: # Aromatic bond type should not be present after Kekulization
+                raise ValueError(f"Aromatic bond type found in input SMILES '{smiles or ''}' after preprocessing. Kekulization might have failed.")
 
             # Get corresponding internal indices
             try:

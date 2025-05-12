@@ -15,42 +15,50 @@ class MoleculeConfig:
 
         # Environment options
         self.wall_clock_limit = None  # in seconds. If no limit, set to None
-        self.max_num_atoms = 50
+        # self.max_num_atoms = 50
+        # Reduce to 25 for solvent design tasks (IBA, DMBA_TMB)
+        self.max_num_atoms = 25
+
+        # self.atom_vocabulary = {  # Attention! Order matters!
+        #     "C":    {"allowed": True, "atomic_number": 6, "valence": 4},
+        #     "C-":   {"allowed": False, "atomic_number": 6, "valence": 3, "formal_charge": -1},
+        #     "C+":   {"allowed": False, "atomic_number": 6, "valence": 5, "formal_charge": 1},
+        #     "C@":   {"allowed": False, "atomic_number": 6, "valence": 4, "chiral_tag": 1},
+        #     "C@@":  {"allowed": False, "atomic_number": 6, "valence": 4, "chiral_tag": 2},
+        #
+        #     "N":    {"allowed": True, "atomic_number": 7, "valence": 3},
+        #     "N-":   {"allowed": False, "atomic_number": 7, "valence": 2, "formal_charge": -1},
+        #     "N+":   {"allowed": False, "atomic_number": 7, "valence": 4, "formal_charge": 1},
+        #
+        #     "O":    {"allowed": True, "atomic_number": 8, "valence": 2},
+        #     "O-":   {"allowed": False, "atomic_number": 8, "valence": 1, "formal_charge": -1},
+        #     "O+":   {"allowed": False, "atomic_number": 8, "valence": 3, "formal_charge": 1},
+        #
+        #     "F":    {"allowed": False, "atomic_number": 9, "valence": 1},
+        #
+        #     "P":    {"allowed": False, "atomic_number": 15, "valence": 7},
+        #     "P-":   {"allowed": False, "atomic_number": 15, "valence": 6, "formal_charge": -1},
+        #     "P+":   {"allowed": False, "atomic_number": 15, "valence": 8, "formal_charge": 1},
+        #
+        #     "S":    {"allowed": False, "atomic_number": 16, "valence": 6},
+        #     "S-":   {"allowed": False, "atomic_number": 16, "valence": 5, "formal_charge": -1},
+        #     "S+":   {"allowed": False, "atomic_number": 16, "valence": 7, "formal_charge": 1},
+        #     "S@":   {"allowed": False, "atomic_number": 16, "valence": 6, "chiral_tag": 1},
+        #     "S@@":  {"allowed": False, "atomic_number": 16, "valence": 6, "chiral_tag": 2},
+        #
+        #     "Cl": {"allowed": False, "atomic_number": 17, "valence": 1},
+        #     "Br": {"allowed": False, "atomic_number": 35, "valence": 1},
+        #     "I": {"allowed": False, "atomic_number": 53, "valence": 1}
+        # }
 
         self.atom_vocabulary = {  # Attention! Order matters!
-            "C":    {"allowed": True, "atomic_number": 6, "valence": 4},
-            "C-":   {"allowed": True, "atomic_number": 6, "valence": 3, "formal_charge": -1},
-            "C+":   {"allowed": True, "atomic_number": 6, "valence": 5, "formal_charge": 1},
-            "C@":   {"allowed": True, "atomic_number": 6, "valence": 4, "chiral_tag": 1},
-            "C@@":  {"allowed": True, "atomic_number": 6, "valence": 4, "chiral_tag": 2},
-
-            "N":    {"allowed": True, "atomic_number": 7, "valence": 3},
-            "N-":   {"allowed": True, "atomic_number": 7, "valence": 2, "formal_charge": -1},
-            "N+":   {"allowed": True, "atomic_number": 7, "valence": 4, "formal_charge": 1},
-
-            "O":    {"allowed": True, "atomic_number": 8, "valence": 2},
-            "O-":   {"allowed": True, "atomic_number": 8, "valence": 1, "formal_charge": -1},
-            "O+":   {"allowed": True, "atomic_number": 8, "valence": 3, "formal_charge": 1},
-
-            "F":    {"allowed": True, "atomic_number": 9, "valence": 1},
-
-            "P":    {"allowed": True, "atomic_number": 15, "valence": 7},
-            "P-":   {"allowed": True, "atomic_number": 15, "valence": 6, "formal_charge": -1},
-            "P+":   {"allowed": True, "atomic_number": 15, "valence": 8, "formal_charge": 1},
-
-            "S":    {"allowed": True, "atomic_number": 16, "valence": 6},
-            "S-":   {"allowed": True, "atomic_number": 16, "valence": 5, "formal_charge": -1},
-            "S+":   {"allowed": True, "atomic_number": 16, "valence": 7, "formal_charge": 1},
-            "S@":   {"allowed": True, "atomic_number": 16, "valence": 6, "chiral_tag": 1},
-            "S@@":  {"allowed": True, "atomic_number": 16, "valence": 6, "chiral_tag": 2},
-
-            "Cl": {"allowed": True, "atomic_number": 17, "valence": 1},
-            "Br": {"allowed": True, "atomic_number": 35, "valence": 1},
-            "I": {"allowed": True, "atomic_number": 53, "valence": 1}
+            "C": {"allowed": True, "atomic_number": 6, "valence": 4},
+            "N": {"allowed": True, "atomic_number": 7, "valence": 3},
+            "O": {"allowed": True, "atomic_number": 8, "valence": 2}
         }
 
         self.min_actions = 5
-        self.max_actions = 25
+        self.max_actions = 50
 
         # self.start_from_c_chains = True
         self.start_from_c_chains = False
@@ -78,8 +86,8 @@ class MoleculeConfig:
         # self.objective_gnn_device = "cuda:0"  # device on which the GNN should live
 
         # Loading trained checkpoints to resume training or evaluate
-        self.load_checkpoint_from_path = "results/best_model.pt"  # If given, model checkpoint is loaded from this path.
-        # self.load_checkpoint_from_path = None  # If given, model checkpoint is loaded from this path.
+        # self.load_checkpoint_from_path = "results/best_model.pt"  # If given, model checkpoint is loaded from this path.
+        self.load_checkpoint_from_path = None  # If given, model checkpoint is loaded from this path.
         # self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
         self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
 
@@ -90,7 +98,7 @@ class MoleculeConfig:
         # self.training_device = "cpu"  # Device on which to perform the supervised training
         # set training device as GPU:
         self.training_device = "cuda:0"  # Device on which to perform the supervised training
-        self.num_epochs = 1000  # Number of epochs (i.e., passes through training set) to train
+        self.num_epochs = 10000  # Number of epochs (i.e., passes through training set) to train
         self.scale_factor_level_one = 1.
         self.scale_factor_level_two = 1.
 
@@ -119,20 +127,20 @@ class MoleculeConfig:
             "keep_intermediate_trajectories": True,  # if True, we consider all intermediate, terminable trajectories
             "devices_for_workers": ["cuda:0"] * 1,
             "destination_path": "./data/generated_molecules.pickle",
-            "batch_size_per_worker": 10,  # Keep at one, as we only have three atoms from which we can start
-            "batch_size_per_cpu_worker": 10,
+            "batch_size_per_worker": 1,  # Keep at one, as we only have three atoms from which we can start
+            "batch_size_per_cpu_worker": 1,
             "search_type": "tasar",
-            "beam_width": 32,
+            # "beam_width": 32,
+            "beam_width": 512,
             "replan_steps": 12,
+            # "replan_steps": 24,
             "num_rounds": 1,  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
-            "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.
+            "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.z
             "nucleus_top_p": 1.,
             "pin_workers_to_core": False
         }
 
         # Results and logging
-        self.results_path = os.path.join("./results",
-                                         datetime.datetime.now().strftime(
-                                             "%Y-%m-%d--%H-%M-%S"))  # Path to store the model weights
+        # Path to store the model weights
+        self.results_path = os.path.join("./results", datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S"))
         self.log_to_file = True
-

@@ -136,39 +136,49 @@ def train_for_one_epoch(epoch: int,
     # --- Training Loop Setup ---
     network.train() # Set network to training mode
 
-    # Freeze all parameters initially
-    for name, parameter in network.named_parameters():
-        parameter.requires_grad = False
 
-    # Unfreeze only the final output linear layers
-    unfrozen_layers = []
-    # Correct layer names based on MoleculeTransformer definition
-    layers_to_unfreeze = [
-        'linear_l0_terminate',
-        'linear_l0_select_atom',
-        'output_linear_level_one',
-        'output_linear_level_two'
-    ]
-    for layer_name in layers_to_unfreeze:
-        try:
-            if hasattr(network, layer_name):
-                layer = getattr(network, layer_name)
-                # Check if the attribute is actually a PyTorch module
-                if isinstance(layer, nn.Module):
-                    for param in layer.parameters():
-                        param.requires_grad = True
-                    unfrozen_layers.append(layer_name)
-                    print(f"Successfully unfrozen: {layer_name}")
-                else:
-                    print(f"Warning: Attribute '{layer_name}' found but is not an nn.Module.")
-            else:
-                print(f"Warning: Layer '{layer_name}' not found in network.")
-        except Exception as e:
-            print(f"Warning: Error accessing or unfreezing layer '{layer_name}': {e}")
 
-    print(f"Unfrozen layers for training: {unfrozen_layers}")
-    if not unfrozen_layers:
-        print("CRITICAL WARNING: No layers were unfrozen! Check layer names and model structure.")
+
+
+
+    # # Freeze all parameters initially
+    # for name, parameter in network.named_parameters():
+        # parameter.requires_grad = False
+    #
+    # # Unfreeze only the final output linear layers
+    # unfrozen_layers = []
+    # # Correct layer names based on MoleculeTransformer definition
+    # layers_to_unfreeze = [
+    #     'linear_l0_terminate',
+    #     'linear_l0_select_atom',
+    #     'output_linear_level_one',
+    #     'output_linear_level_two'
+    # ]
+    # for layer_name in layers_to_unfreeze:
+    #     try:
+    #         if hasattr(network, layer_name):
+    #             layer = getattr(network, layer_name)
+    #             # Check if the attribute is actually a PyTorch module
+    #             if isinstance(layer, nn.Module):
+    #                 for param in layer.parameters():
+    #                     param.requires_grad = True
+    #                 unfrozen_layers.append(layer_name)
+    #                 print(f"Successfully unfrozen: {layer_name}")
+    #             else:
+    #                 print(f"Warning: Attribute '{layer_name}' found but is not an nn.Module.")
+    #         else:
+    #             print(f"Warning: Layer '{layer_name}' not found in network.")
+    #     except Exception as e:
+    #         print(f"Warning: Error accessing or unfreezing layer '{layer_name}': {e}")
+    #
+    # print(f"Unfrozen layers for training: {unfrozen_layers}")
+    # if not unfrozen_layers:
+    #     print("CRITICAL WARNING: No layers were unfrozen! Check layer names and model structure.")
+
+
+
+
+
 
     # added for AMP
     use_amp_here = (amp_enabled and scaler is not None and config.training_device != "cpu")

@@ -319,6 +319,8 @@ class MoleculeObjectiveEvaluator:
                     if n_count >= 1 and o_count >= 1 and h_count == 1:
                         return True  # Restriction is violated
 
+
+
             if self.config.objective_type == 'DMBA_TMB':
                 # The molecule must be an alcohol (-OH group must be present):
                 # Check if any atom has an -OH group

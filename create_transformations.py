@@ -84,6 +84,9 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS, datatype: s
     if not os.path.exists(path):
         print(f"Error: Input SMILES file not found at {path}")
         return []
+
+    # Load allowed atom keys from config
+    allowed_keys = [k for k, v in CONFIG.atom_vocabulary.items() if v.get("allowed", False)]
     with open(path) as f:
         for line in tqdm(f, desc=f"Filtering {datatype} molecules"):
             smiles = line.strip()
@@ -91,6 +94,30 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS, datatype: s
             try:
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is None: continue
+                # Check if all atoms in the molecule are allowed (their "allowed" field is True, have the same
+                # charge and chirality as in the config)
+                valid_atoms = True
+                for atom in mol.GetAtoms():
+                    atomic_num = atom.GetAtomicNum()
+                    formal_charge = atom.GetFormalCharge()
+                    chiral_tag = atom.GetChiralTag()
+                    atom_found = False
+                    # Look for matching atom in config with same properties
+                    for atom_key in allowed_keys:
+                        atom_config = CONFIG.atom_vocabulary[atom_key]
+                        if (atom_config["atomic_number"] == atomic_num and
+                                atom_config.get("formal_charge", 0) == formal_charge and
+                                atom_config.get("chiral_tag", 0) == chiral_tag):
+                            atom_found = True
+                            break
+
+                    if not atom_found:
+                        valid_atoms = False
+                        break
+
+                if not valid_atoms:
+                    continue
+
                 num_heavy = mol.GetNumHeavyAtoms()
                 if num_heavy == 0 or num_heavy > max_atoms:
                     continue

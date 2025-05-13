@@ -15,9 +15,6 @@ class MoleculeConfig:
 
         # Environment options
         self.wall_clock_limit = None  # in seconds. If no limit, set to None
-        # self.max_num_atoms = 50
-        # Reduce to 25 for solvent design tasks (IBA, DMBA_TMB)
-        self.max_num_atoms = 25
 
         # self.atom_vocabulary = {  # Attention! Order matters!
         #     "C":    {"allowed": True, "atomic_number": 6, "valence": 4},
@@ -59,6 +56,14 @@ class MoleculeConfig:
 
         self.min_actions = 5
         self.max_actions = 50
+
+        # self.max_num_atoms = 50
+        # Reduce to 25 for solvent design tasks (IBA, DMBA_TMB)
+        self.max_num_atoms = 25
+
+        self.max_high_level_actions = 50
+
+        self.high_level_action_penalty_factor = 0.01
 
         # self.start_from_c_chains = True
         self.start_from_c_chains = False

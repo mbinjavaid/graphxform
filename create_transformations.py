@@ -88,7 +88,11 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS, datatype: s
     # Load allowed atom keys from config
     allowed_keys = [k for k, v in CONFIG.atom_vocabulary.items() if v.get("allowed", False)]
     with open(path) as f:
+        iteration = 0
         for line in tqdm(f, desc=f"Filtering {datatype} molecules"):
+            if iteration == 100:
+                print(f"Processed 100 lines, skipping to next file.")
+                break
             smiles = line.strip()
             if not smiles: continue
             try:
@@ -131,6 +135,7 @@ def load_and_filter_molecules(path: str, max_atoms: int = MAX_ATOMS, datatype: s
 
                 filtered_smiles_list.append(canonical_smiles)
                 processed_smiles.add(canonical_smiles)
+                iteration += 1
             except Exception as e:
                  if DEBUG_MODE:
                      print(f"DEBUG WARNING: Error processing SMILES '{smiles}': {e}")

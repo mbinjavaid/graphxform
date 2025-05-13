@@ -117,86 +117,242 @@ class GumbeldoreDataset:
 
         return self.process_results(problem_instances, results)
 
+    # def process_results(self, problem_instances, results):
+    #     """
+    #     Processes the results from Gumbeldore search and save it to a pickle. Each trajectory will be represented as a dict with the
+    #     following keys and values
+    #       "start_atom": [int] the int representing the atom from which to start
+    #       "action_seq": List[List[int]] Actions which need to be taken on each index to create the molecule
+    #       "smiles": [str] Corresponding smiles string
+    #       "obj": [float] Objective function evaluation
+    #
+    #     Then:
+    #     1. The results will be cleaned from duplicate SMILES and molecules which do have an objective of -inf.
+    #     2. If the dataset already exists at the path where to save, we load it, merge them and take the best from the
+    #         merged dataset.
+    #
+    #     Then returns the following dictionary:
+    #     - "mean_best_gen_obj": Mean best generated obj. -> over the unmerged best molecules generated
+    #     - "best_gen_obj": Best generated obj. -> Best obj. of the unmerged molecules generated
+    #     - "worst_gen_obj": Worst generated obj. -> Worst obj. of the unmerged molecules generated
+    #     - "mean_top_20_obj": Mean top 20 obj. -> over the merged best molecules
+    #     - "top_20_molecules": A list of SMILES strings with obj. of the top 20 obj.
+    #     """
+    #     metrics_return = dict()
+    #     instances_dict = dict()  # Use a dict to directly avoid duplicates
+    #     for i, _ in enumerate(problem_instances):
+    #         for molecule in results[i]:  # type: MoleculeDesign
+    #             # if molecule.objective > float("-inf"):
+    #             #     instances_dict[molecule.smiles_string] = dict(
+    #             #         start_atom=molecule.initial_atom,
+    #             #         action_seq=molecule.history,
+    #             #         smiles=molecule.smiles_string,
+    #             #         obj=molecule.objective,
+    #             #         sa_score=molecule.sa_score
+    #             #     )
+    #             if molecule.objective > float("-inf"):
+    #                 # --- START MODIFIED BLOCK ---
+    #                 # Determine the starting SMILES key (None if not started from SMILES)
+    #                 original_start_smiles = getattr(self.config, 'start_from_smiles', None)
+    #
+    #                 # Add the start_smiles_key to the dictionary
+    #                 instances_dict[molecule.smiles_string] = dict(
+    #                     start_atom=molecule.initial_atom,
+    #                     start_smiles_key=original_start_smiles,  # NEW
+    #                     action_seq=molecule.history,
+    #                     smiles=molecule.smiles_string,
+    #                     obj=molecule.objective,
+    #                     sa_score=molecule.sa_score
+    #                 )
+    #     generated_mols = list(instances_dict.values())
+    #     print(generated_mols)
+    #     generated_mols = sorted(generated_mols, key=lambda x: x["obj"], reverse=True)[:self.gumbeldore_config["num_trajectories_to_keep"]]
+    #     generated_objs = np.array([x["obj"] for x in generated_mols])
+    #     generated_sa_scores = np.array([x["sa_score"] for x in generated_mols])
+    #     metrics_return["mean_best_gen_obj"] = generated_objs.mean()
+    #     metrics_return["mean_best_gen_sa_score"] = generated_sa_scores.mean()
+    #     metrics_return["best_gen_obj"] = generated_objs[0]
+    #     metrics_return["best_gen_sa_score"] = generated_sa_scores[0]
+    #     metrics_return["worst_gen_obj"] = generated_objs[-1]
+    #     metrics_return["worst_gen_sa_score"] = generated_sa_scores[-1]
+    #
+    #     # Now check if there already is a data file, and if so, load it and merge it.
+    #     destination_path = self.gumbeldore_config["destination_path"]
+    #     merged_mols = generated_mols
+    #     if destination_path is not None:
+    #         if os.path.isfile(destination_path):
+    #             with open(destination_path, "rb") as f:
+    #                 existing_mols = pickle.load(f)  # list of dicts
+    #             temp_d = {x["smiles"]: x for x in existing_mols + merged_mols}
+    #             merged_mols = list(temp_d.values())
+    #             merged_mols = sorted(merged_mols, key=lambda x: x["obj"], reverse=True)[
+    #                              :self.gumbeldore_config["num_trajectories_to_keep"]]
+    #
+    #         # Pickle the generated data again
+    #         with open(destination_path, "wb") as f:
+    #             pickle.dump(merged_mols, f)
+    #
+    #     # Get overall best metrics and molecules
+    #     metrics_return["mean_top_20_obj"] = np.array([x["obj"] for x in merged_mols[:20]]).mean()
+    #     metrics_return["mean_kept_obj"] = np.array([x["obj"] for x in merged_mols]).mean()
+    #     metrics_return["mean_top_20_sa_score"] = np.array([x["sa_score"] for x in merged_mols[:20]]).mean()
+    #     metrics_return["top_20_molecules"] = [{x["smiles"]: x["obj"] for x in merged_mols[:20]}]
+    #
+    #     return metrics_return
+
     def process_results(self, problem_instances, results):
-        """
-        Processes the results from Gumbeldore search and save it to a pickle. Each trajectory will be represented as a dict with the
-        following keys and values
-          "start_atom": [int] the int representing the atom from which to start
-          "action_seq": List[List[int]] Actions which need to be taken on each index to create the molecule
-          "smiles": [str] Corresponding smiles string
-          "obj": [float] Objective function evaluation
-
-        Then:
-        1. The results will be cleaned from duplicate SMILES and molecules which do have an objective of -inf.
-        2. If the dataset already exists at the path where to save, we load it, merge them and take the best from the
-            merged dataset.
-
-        Then returns the following dictionary:
-        - "mean_best_gen_obj": Mean best generated obj. -> over the unmerged best molecules generated
-        - "best_gen_obj": Best generated obj. -> Best obj. of the unmerged molecules generated
-        - "worst_gen_obj": Worst generated obj. -> Worst obj. of the unmerged molecules generated
-        - "mean_top_20_obj": Mean top 20 obj. -> over the merged best molecules
-        - "top_20_molecules": A list of SMILES strings with obj. of the top 20 obj.
-        """
         metrics_return = dict()
-        instances_dict = dict()  # Use a dict to directly avoid duplicates
-        for i, _ in enumerate(problem_instances):
-            for molecule in results[i]:  # type: MoleculeDesign
-                # if molecule.objective > float("-inf"):
-                #     instances_dict[molecule.smiles_string] = dict(
-                #         start_atom=molecule.initial_atom,
-                #         action_seq=molecule.history,
-                #         smiles=molecule.smiles_string,
-                #         obj=molecule.objective,
-                #         sa_score=molecule.sa_score
-                #     )
-                if molecule.objective > float("-inf"):
-                    # --- START MODIFIED BLOCK ---
-                    # Determine the starting SMILES key (None if not started from SMILES)
-                    original_start_smiles = getattr(self.config, 'start_from_smiles', None)
+        instances_dict = dict()
 
-                    # Add the start_smiles_key to the dictionary
+        for i, problem_instance_result_list in enumerate(results):  # results[i] is a list of MoleculeDesign objects
+            if problem_instance_result_list is None:
+                print(f"Warning: No results for problem instance index {i} (from input problem_instances)")
+                continue
+
+            for molecule in problem_instance_result_list:  # type: MoleculeDesign
+                # Use original_objective for final reporting
+                # molecule.objective contains the penalized score used for search
+                # molecule.original_objective contains the pure score
+
+                # Ensure original_objective is set, otherwise, it's an issue or an unprocessed molecule
+                if not hasattr(molecule, 'original_objective') or molecule.original_objective is None:
+                    print(f"Warning: Molecule {molecule.smiles_string if molecule.smiles_string else molecule.history} "
+                          f"missing 'original_objective'. Defaulting to -inf.")
+                    effective_obj_for_filtering = -np.inf
+                else:
+                    effective_obj_for_filtering = molecule.original_objective
+
+                if effective_obj_for_filtering > float("-inf"):
+                    if molecule.smiles_string is None:  # Should be set if finalized
+                        print(
+                            f"Warning: Molecule from history {molecule.history} has no SMILES. Attempting to finalize.")
+                        molecule.finalize(assert_feasible=False)
+                        if molecule.smiles_string is None:
+                            print(
+                                f"Skipping molecule (history: {molecule.history}) due to missing SMILES after finalize.")
+                            continue
+
+                    original_start_smiles = getattr(self.config, 'start_from_smiles', None)
+                    if problem_instances and i < len(problem_instances):
+                        # If problem_instances was used to get start_atom or start_smiles_key
+                        # For now, let's assume MoleculeDesign.initial_atom is sufficient
+                        start_atom_val = molecule.initial_atom
+                    else:  # Fallback if problem_instances is not aligned or empty
+                        start_atom_val = molecule.initial_atom
+
+                        # Ensure sa_score is present
+                    sa_score_val = molecule.sa_score if hasattr(molecule,
+                                                                'sa_score') and molecule.sa_score is not None else 10.0
+
                     instances_dict[molecule.smiles_string] = dict(
-                        start_atom=molecule.initial_atom,
-                        start_smiles_key=original_start_smiles,  # NEW
+                        start_atom=start_atom_val,
+                        start_smiles_key=original_start_smiles,
                         action_seq=molecule.history,
                         smiles=molecule.smiles_string,
-                        obj=molecule.objective,
-                        sa_score=molecule.sa_score
+                        obj=molecule.original_objective,  # <<< USE ORIGINAL OBJECTIVE HERE
+                        penalized_obj_for_search=molecule.objective,  # Optional: store for debugging
+                        num_high_level_actions=molecule.num_high_level_actions,  # Optional
+                        sa_score=sa_score_val
                     )
-        generated_mols = list(instances_dict.values())
-        print(generated_mols)
-        generated_mols = sorted(generated_mols, key=lambda x: x["obj"], reverse=True)[:self.gumbeldore_config["num_trajectories_to_keep"]]
-        generated_objs = np.array([x["obj"] for x in generated_mols])
-        generated_sa_scores = np.array([x["sa_score"] for x in generated_mols])
-        metrics_return["mean_best_gen_obj"] = generated_objs.mean()
-        metrics_return["mean_best_gen_sa_score"] = generated_sa_scores.mean()
-        metrics_return["best_gen_obj"] = generated_objs[0]
-        metrics_return["best_gen_sa_score"] = generated_sa_scores[0]
-        metrics_return["worst_gen_obj"] = generated_objs[-1]
-        metrics_return["worst_gen_sa_score"] = generated_sa_scores[-1]
 
-        # Now check if there already is a data file, and if so, load it and merge it.
+        if not instances_dict:
+            print("Warning: No valid molecules processed to generate metrics.")
+            # Initialize metrics to default/NaN values to prevent crashes downstream
+            metrics_return.update({
+                "mean_best_gen_obj": np.nan, "mean_best_gen_sa_score": np.nan,
+                "best_gen_obj": np.nan, "best_gen_sa_score": np.nan,
+                "worst_gen_obj": np.nan, "worst_gen_sa_score": np.nan,
+                "mean_top_20_obj": np.nan, "mean_kept_obj": np.nan,
+                "mean_top_20_sa_score": np.nan, "top_20_molecules": []
+            })
+            return metrics_return
+
+        generated_mols = list(instances_dict.values())
+        # Sort by 'obj' which is now original_objective
+        generated_mols = sorted(generated_mols, key=lambda x: x["obj"], reverse=True)
+
+        # Keep only top N if specified, otherwise all valid ones
+        if self.gumbeldore_config.get("num_trajectories_to_keep"):  # Check if key exists and is not None/0
+            generated_mols = generated_mols[:self.gumbeldore_config["num_trajectories_to_keep"]]
+
+        print(generated_mols)
+
+        if not generated_mols:  # If after filtering, no mols are left
+            print("Warning: No molecules left after sorting/filtering in process_results.")
+            # Return NaN metrics as above
+            metrics_return.update({
+                "mean_best_gen_obj": np.nan, "mean_best_gen_sa_score": np.nan,
+                "best_gen_obj": np.nan, "best_gen_sa_score": np.nan,
+                "worst_gen_obj": np.nan, "worst_gen_sa_score": np.nan,
+                "mean_top_20_obj": np.nan, "mean_kept_obj": np.nan,
+                "mean_top_20_sa_score": np.nan, "top_20_molecules": []
+            })
+            return metrics_return
+
+        generated_objs = np.array([x["obj"] for x in generated_mols])
+        generated_sa_scores = np.array(
+            [x["sa_score"] for x in generated_mols if x["sa_score"] is not None])  # Filter None SA scores
+
+        metrics_return["mean_best_gen_obj"] = generated_objs.mean() if generated_objs.size > 0 else np.nan
+        metrics_return[
+            "mean_best_gen_sa_score"] = generated_sa_scores.mean() if generated_sa_scores.size > 0 else np.nan
+        metrics_return["best_gen_obj"] = generated_objs[0] if generated_objs.size > 0 else np.nan
+        metrics_return["best_gen_sa_score"] = generated_sa_scores[0] if generated_sa_scores.size > 0 else np.nan
+        metrics_return["worst_gen_obj"] = generated_objs[-1] if generated_objs.size > 0 else np.nan
+        metrics_return["worst_gen_sa_score"] = generated_sa_scores[-1] if generated_sa_scores.size > 0 else np.nan
+
+        # ... (rest of your merging logic with existing data file, using 'obj' for sorting) ...
         destination_path = self.gumbeldore_config["destination_path"]
-        merged_mols = generated_mols
+        merged_mols = generated_mols  # Start with current batch's best
         if destination_path is not None:
             if os.path.isfile(destination_path):
-                with open(destination_path, "rb") as f:
-                    existing_mols = pickle.load(f)  # list of dicts
-                temp_d = {x["smiles"]: x for x in existing_mols + merged_mols}
-                merged_mols = list(temp_d.values())
-                merged_mols = sorted(merged_mols, key=lambda x: x["obj"], reverse=True)[
-                                 :self.gumbeldore_config["num_trajectories_to_keep"]]
+                try:
+                    with open(destination_path, "rb") as f:
+                        existing_mols = pickle.load(f)
+                    if isinstance(existing_mols, list):  # Basic check for expected format
+                        # Ensure all dicts in existing_mols have 'smiles' and 'obj' keys
+                        valid_existing_mols = [m for m in existing_mols if
+                                               isinstance(m, dict) and 'smiles' in m and 'obj' in m]
+                        temp_d = {x["smiles"]: x for x in valid_existing_mols + generated_mols}
+                        merged_mols = list(temp_d.values())
+                    else:  # existing_mols is not a list, overwrite with current
+                        print(
+                            f"Warning: Existing data at {destination_path} is not in expected list format. Overwriting.")
+                        merged_mols = generated_mols
+                except Exception as e:
+                    print(
+                        f"Error loading existing data from {destination_path}: {e}. Overwriting with current results.")
+                    merged_mols = generated_mols  # Fallback to current results if loading fails
 
-            # Pickle the generated data again
-            with open(destination_path, "wb") as f:
-                pickle.dump(merged_mols, f)
+            # Sort merged results and keep top N
+            merged_mols = sorted(merged_mols, key=lambda x: x["obj"], reverse=True)
+            if self.gumbeldore_config.get("num_trajectories_to_keep"):
+                merged_mols = merged_mols[:self.gumbeldore_config["num_trajectories_to_keep"]]
 
-        # Get overall best metrics and molecules
-        metrics_return["mean_top_20_obj"] = np.array([x["obj"] for x in merged_mols[:20]]).mean()
-        metrics_return["mean_kept_obj"] = np.array([x["obj"] for x in merged_mols]).mean()
-        metrics_return["mean_top_20_sa_score"] = np.array([x["sa_score"] for x in merged_mols[:20]]).mean()
-        metrics_return["top_20_molecules"] = [{x["smiles"]: x["obj"] for x in merged_mols[:20]}]
+            try:
+                with open(destination_path, "wb") as f:
+                    pickle.dump(merged_mols, f)
+            except Exception as e:
+                print(f"Error saving merged data to {destination_path}: {e}")
+
+        if not merged_mols:  # If after merging, no mols are left
+            print("Warning: No molecules left after merging in process_results.")
+            # Return NaN metrics as above
+            metrics_return.update({
+                "mean_top_20_obj": np.nan, "mean_kept_obj": np.nan,
+                "mean_top_20_sa_score": np.nan, "top_20_molecules": []
+            })
+            return metrics_return
+
+        # Get overall best metrics and molecules from merged_mols
+        merged_objs = np.array([x["obj"] for x in merged_mols])
+        merged_sa_scores = np.array([x["sa_score"] for x in merged_mols if x["sa_score"] is not None])
+
+        metrics_return["mean_top_20_obj"] = merged_objs[:20].mean() if merged_objs[:20].size > 0 else np.nan
+        metrics_return["mean_kept_obj"] = merged_objs.mean() if merged_objs.size > 0 else np.nan
+        metrics_return["mean_top_20_sa_score"] = merged_sa_scores[:20].mean() if merged_sa_scores[
+                                                                                 :20].size > 0 else np.nan
+        metrics_return["top_20_molecules"] = [{x["smiles"]: x["obj"]} for x in merged_mols[:20]]
 
         return metrics_return
 

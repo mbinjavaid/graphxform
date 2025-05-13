@@ -193,54 +193,173 @@ class MoleculeObjectiveEvaluator:
             scaffold_hop=guacamol_goal_directed_suite[19]
         )
 
-    def predict_objective(self, molecule_designs: List[Union[MoleculeDesign, str]]) -> np.array:
-        """
-        Takes list of molecules (either as `MoleculeDesign` or directly as SMILES string
-        and predicts the objective function on them. Returns the objectives as a numpy array, but also sets the
-        objective directly on the objects.
-        """
-        # Get molecules that are known to be feasible for the predictor / RDKit / by the constraints,
-        # i.e., molecules that could be sanitized and are not single carbon atoms.
-        feasible_molecules: List[Chem.RWMol] = []
-        feasible_idcs = []  # indices of feasible molecules in the original `molecule_designs` list
+    # def predict_objective(self, molecule_designs: List[Union[MoleculeDesign, str]]) -> np.array:
+    #     """
+    #     Takes list of molecules (either as `MoleculeDesign` or directly as SMILES string
+    #     and predicts the objective function on them. Returns the objectives as a numpy array, but also sets the
+    #     objective directly on the objects.
+    #     """
+    #     # Get molecules that are known to be feasible for the predictor / RDKit / by the constraints,
+    #     # i.e., molecules that could be sanitized and are not single carbon atoms.
+    #     feasible_molecules: List[Chem.RWMol] = []
+    #     feasible_idcs = []  # indices of feasible molecules in the original `molecule_designs` list
+    #
+    #     for i, mol in enumerate(molecule_designs):
+    #         if isinstance(mol, MoleculeDesign):
+    #             assert mol.synthesis_done
+    #             if not self.infeasible_by_special_constraints(mol):
+    #                 feasible_idcs.append(i)
+    #                 feasible_molecules.append(mol.rdkit_mol)
+    #         elif mol != "C":
+    #             # is a string
+    #             try:
+    #                 mol = Chem.MolFromSmiles(mol)
+    #                 Chem.SanitizeMol(mol)
+    #                 feasible_idcs.append(i)
+    #                 feasible_molecules.append(mol)
+    #             except:
+    #                 continue
+    #
+    #     if self.config.objective_type in self.guacamol_benchmarks:
+    #         # Drug design tasks
+    #         objs = np.array([
+    #             self.guacamol_benchmarks[self.config.objective_type].objective.score(
+    #                 Chem.MolToSmiles(rdkit_mol)
+    #             )
+    #             for rdkit_mol in feasible_molecules
+    #         ])
+    #     else:
+    #         # Distribute the list of feasible molecules to the predictor workers.
+    #         num_per_worker = math.ceil(len(feasible_molecules) / len(self.predictor_workers))
+    #         future_objs = [
+    #             worker.predict_objectives_from_rdkit_mols.remote(feasible_molecules[i * num_per_worker: (i+1) * num_per_worker])
+    #             for i, worker in enumerate(self.predictor_workers)
+    #         ]
+    #         future_objs = ray.get(future_objs)
+    #         objs = np.concatenate(future_objs)
+    #     all_objs = np.array([-np.inf] * len(molecule_designs))
+    #     all_objs[feasible_idcs] = objs
+    #
+    #     return all_objs
 
-        for i, mol in enumerate(molecule_designs):
-            if isinstance(mol, MoleculeDesign):
-                assert mol.synthesis_done
-                if not self.infeasible_by_special_constraints(mol):
-                    feasible_idcs.append(i)
-                    feasible_molecules.append(mol.rdkit_mol)
-            elif mol != "C":
-                # is a string
-                try:
-                    mol = Chem.MolFromSmiles(mol)
-                    Chem.SanitizeMol(mol)
-                    feasible_idcs.append(i)
-                    feasible_molecules.append(mol)
-                except:
-                    continue
+    def predict_objective(self, molecule_designs: List[MoleculeDesign]) -> np.array:
+        """
+        Takes list of MoleculeDesign objects, predicts their base objectives,
+        applies penalties, and sets 'original_objective' and 'objective' (penalized)
+        on each MoleculeDesign instance.
+        Returns an array of the *penalized* objectives for search guidance.
+        Also ensures 'sa_score' is set on each MoleculeDesign instance.
+        """
 
-        if self.config.objective_type in self.guacamol_benchmarks:
-            # Drug design tasks
-            objs = np.array([
-                self.guacamol_benchmarks[self.config.objective_type].objective.score(
-                    Chem.MolToSmiles(rdkit_mol)
+        # Ensure all inputs are MoleculeDesign instances, as expected by this refined logic
+        for md_input_idx, md_input in enumerate(molecule_designs):
+            if not isinstance(md_input, MoleculeDesign):
+                raise TypeError(
+                    f"predict_objective expects a list of MoleculeDesign objects. "
+                    f"Got type {type(md_input)} at index {md_input_idx}."
                 )
-                for rdkit_mol in feasible_molecules
-            ])
-        else:
-            # Distribute the list of feasible molecules to the predictor workers.
-            num_per_worker = math.ceil(len(feasible_molecules) / len(self.predictor_workers))
-            future_objs = [
-                worker.predict_objectives_from_rdkit_mols.remote(feasible_molecules[i * num_per_worker: (i+1) * num_per_worker])
-                for i, worker in enumerate(self.predictor_workers)
-            ]
-            future_objs = ray.get(future_objs)
-            objs = np.concatenate(future_objs)
-        all_objs = np.array([-np.inf] * len(molecule_designs))
-        all_objs[feasible_idcs] = objs
+            # Ensure molecule is finalized if it's a leaf being evaluated
+            if not md_input.synthesis_done:
+                md_input.finalize(assert_feasible=False)
 
-        return all_objs
+        # --- Step 1: Prepare lists for base objective calculation ---
+        # These lists will hold items for which base objectives need to be computed.
+        # They will correspond one-to-one with `valid_md_for_objective_calc`.
+        items_for_base_calc: List[Union[str, Chem.RWMol]] = []  # RDKit mols or SMILES strings
+        valid_md_for_objective_calc: List[MoleculeDesign] = []  # Corresponding MoleculeDesign objects
+        original_indices_of_valid_md: List[int] = []  # Original indices of these valid MDs in input list
+
+        for i, md in enumerate(molecule_designs):
+            # `infeasible_by_special_constraints` checks `md.rdkit_mol`
+            if md.rdkit_mol is not None and not self.infeasible_by_special_constraints(md):
+                valid_md_for_objective_calc.append(md)
+                original_indices_of_valid_md.append(i)
+                if self.config.objective_type in self.guacamol_benchmarks:
+                    items_for_base_calc.append(Chem.MolToSmiles(md.rdkit_mol))
+                else:
+                    items_for_base_calc.append(md.rdkit_mol)  # Pass RDKit mol to PredictorWorker
+            else:
+                # This MoleculeDesign instance is infeasible or problematic from the start
+                md.original_objective = -np.inf
+                md.objective = -np.inf  # For search
+                md.sa_score = 10.0  # Worst SA score
+
+        # --- Step 2: Calculate base objectives for the valid items ---
+        base_objectives_for_valid_md = np.array([-np.inf] * len(valid_md_for_objective_calc))
+
+        if items_for_base_calc:  # Only if there are valid items
+            if self.config.objective_type in self.guacamol_benchmarks:
+                # items_for_base_calc contains SMILES strings here
+                base_objectives_for_valid_md = np.array([
+                    self.guacamol_benchmarks[self.config.objective_type].objective.score(smiles)
+                    for smiles in items_for_base_calc
+                ])
+            else:  # Custom objective via PredictorWorker
+                # items_for_base_calc contains RDKit Mols here
+                num_per_worker = math.ceil(
+                    len(items_for_base_calc) / len(self.predictor_workers)) if self.predictor_workers else len(
+                    items_for_base_calc)
+
+                if not self.predictor_workers:  # Should not happen if not GuacaMol task
+                    raise RuntimeError("PredictorWorkers not initialized for non-GuacaMol task.")
+
+                future_objs_promises = [
+                    worker.predict_objectives_from_rdkit_mols.remote(
+                        items_for_base_calc[j * num_per_worker: (j + 1) * num_per_worker]
+                    )
+                    for j, worker in enumerate(self.predictor_workers) if
+                    items_for_base_calc[j * num_per_worker: (j + 1) * num_per_worker]  # Ensure non-empty slice
+                ]
+
+                if future_objs_promises:
+                    future_objs_results = ray.get(future_objs_promises)
+                    # Concatenate results carefully, handling potential empty arrays from workers
+                    concatenated_results_list = [res for res in future_objs_results if
+                                                 isinstance(res, np.ndarray) and res.size > 0]
+                    if concatenated_results_list:
+                        base_objectives_for_valid_md = np.concatenate(concatenated_results_list)
+                    # If all workers returned empty or invalid results, base_objectives_for_valid_md remains -np.inf initialized.
+                # If items_for_base_calc was empty or future_objs_promises was empty, it also remains -np.inf initialized.
+
+        # Check for length mismatch (should only happen if base objective calculation failed for some valid items)
+        if len(base_objectives_for_valid_md) != len(valid_md_for_objective_calc) and items_for_base_calc:
+            print(
+                f"Warning: Mismatch in base objective calculation. Expected {len(valid_md_for_objective_calc)}, got {len(base_objectives_for_valid_md)}. "
+                f"Some base objectives might be -np.inf.")
+            # Ensure base_objectives_for_valid_md is padded to the correct length if it's shorter
+            if len(base_objectives_for_valid_md) < len(valid_md_for_objective_calc):
+                padding = np.array([-np.inf] * (len(valid_md_for_objective_calc) - len(base_objectives_for_valid_md)))
+                base_objectives_for_valid_md = np.concatenate((base_objectives_for_valid_md, padding))
+
+        # --- Step 3: Set original, penalized objectives, and SA score on MoleculeDesign instances ---
+        final_penalized_objectives_to_return = np.array([-np.inf] * len(molecule_designs))
+
+        for i, md_instance in enumerate(valid_md_for_objective_calc):
+            original_input_idx = original_indices_of_valid_md[i]
+
+            base_obj = base_objectives_for_valid_md[i] if i < len(base_objectives_for_valid_md) else -np.inf
+            md_instance.original_objective = base_obj  # This base_obj already includes SA penalty from PredictorWorker if applicable
+
+            penalty = self.config.high_level_action_penalty_factor * md_instance.num_high_level_actions
+            penalized_obj = base_obj - penalty
+
+            md_instance.objective = penalized_obj  # This is used by SBS/search
+            final_penalized_objectives_to_return[original_input_idx] = penalized_obj
+
+            # Set SA score on MoleculeDesign object
+            # PredictorWorker already uses SA score to modify the objective for non-GuacaMol tasks.
+            # For consistent reporting in process_results, we ensure sa_score attribute is set.
+            if md_instance.rdkit_mol:
+                md_instance.sa_score = sascorer.calculateScore(md_instance.rdkit_mol)
+            else:  # Should not happen if it was in valid_md_for_objective_calc
+                md_instance.sa_score = 10.0  # Default worst SA score
+
+        # For any MoleculeDesign instances that were initially infeasible (not in valid_md_for_objective_calc)
+        # their original_objective and objective were already set to -np.inf.
+        # Their sa_score was also set to 10.0.
+        # final_penalized_objectives_to_return is already -np.inf for them.
+
+        return final_penalized_objectives_to_return
 
     def infeasible_by_special_constraints(self, mol: MoleculeDesign) -> bool:
         """

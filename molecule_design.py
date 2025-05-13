@@ -159,7 +159,10 @@ class MoleculeDesign(BaseTrajectory):
         self.synthesis_done = False
         self.smiles_string: Optional[str] = None
         self.rdkit_mol: Optional[Chem.Mol] = None
+
         self.objective: Optional[float] = None
+        self.original_objective: Optional[float] = None
+
         self.sa_score: float = 0.
         self.infeasibility_flag: bool = False
         # self.is_currently_connected: bool = True # Assume connected initially
@@ -172,6 +175,10 @@ class MoleculeDesign(BaseTrajectory):
         self.l1_action_type: Optional[ActionType] = None # Store the type of L1 action taken
         self.l1_new_atom_type: Optional[int] = None # 1-based vocab index (used if ADD_ATOM)
         self.l1_selected_existing_atom_idx: Optional[int] = None # 1-based internal index (used if SELECT_EXISTING_ATOM)
+
+        self.max_actions = self.config.max_high_level_actions
+        self.num_high_level_actions: int = 0  # Count of high-level actions taken
+
         # --- Rule 2 State ---
         self.last_bond_action_details: Optional[Tuple[int, int]] = None # Stores (min_idx, max_idx) of last bond action pair
 
@@ -334,6 +341,13 @@ class MoleculeDesign(BaseTrajectory):
         #     raise ValueError("No real atoms present. Cannot update action mask.")
 
         remaining_valence = self._get_remaining_valence()  # Get remaining valence for all atoms
+
+        # This check happens before regular L0 mask calculation.
+        if self.current_action_level == 0 and self.num_high_level_actions >= self.max_actions:
+            self.synthesis_done = True
+            self.finalize(assert_feasible=False)  # Finalize the molecule as we are forcing termination
+            self.current_action_mask = None  # No further actions are possible
+            return  # Exit early, no further mask calculation needed
 
         # --- Level 0 Mask ---
         if self.current_action_level == 0:
@@ -597,6 +611,8 @@ class MoleculeDesign(BaseTrajectory):
                     self.l0_selected_atom_idx = None
                     self.l1_new_atom_type = None
                     self.l1_selected_existing_atom_idx = None
+
+                    self.num_high_level_actions += 1  # Increment high-level action count
                     # next_level remains 0 (transition back to L0 after replacement)
 
                 # 4. Remove Selected Atom (action == V+N+V)
@@ -630,6 +646,8 @@ class MoleculeDesign(BaseTrajectory):
                     self.l0_selected_atom_idx = None
                     self.l1_new_atom_type = None
                     self.l1_selected_existing_atom_idx = None
+
+                    self.num_high_level_actions += 1  # Increment high-level action count
                     # next_level remains 0 (transition back to L0 after removal)
 
                 else:  # Should not be reachable if mask is correct
@@ -681,6 +699,8 @@ class MoleculeDesign(BaseTrajectory):
                 self.l1_action_type = None
                 self.l1_new_atom_type = None
                 self.l1_selected_existing_atom_idx = None
+
+                self.num_high_level_actions += 1  # Increment high-level action count
                 # next_level remains 0 (transition back to L0 after bond action)
 
             # --- Reset Rule 2 tracker if it wasn't a bond action ---
@@ -1437,6 +1457,7 @@ class MoleculeDesign(BaseTrajectory):
             instance.smiles_string = None # Clear cache
             instance.rdkit_mol = None
             instance.objective = None
+            instance.original_objective = None
             instance.infeasibility_flag = False
             instance.current_action_level = 0 # Start at Level 0
             instance.history = []

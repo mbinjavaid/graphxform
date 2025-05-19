@@ -349,6 +349,12 @@ class MoleculeDesign(BaseTrajectory):
             self.current_action_mask = None  # No further actions are possible
             return  # Exit early, no further mask calculation needed
 
+            # action_space_size = 1 + num_real_atoms  # Terminate + Select Atom 1..N
+            # mask = np.ones(action_space_size, dtype=bool)  # Start with all True (masked)
+            # # Only Terminate is allowed
+            # mask[0] = False  # Terminate is allowed
+            # self.current_action_mask = mask
+
         # --- Level 0 Mask ---
         if self.current_action_level == 0:
             action_space_size = 1 + num_real_atoms # Terminate + Select Atom 1..N
@@ -528,7 +534,7 @@ class MoleculeDesign(BaseTrajectory):
                     self.synthesis_done = True
                     # User change kept: assert_feasible=True
                     self.finalize(assert_feasible=True)  # Final sanitization happens here
-                    next_level = -1  # Special level indicating termination
+                    next_level = -1  # special level indicating termination
                 else:  # Select Atom (action = 1 to N)
                     selected_internal_idx = action
                     # if not (1 <= selected_internal_idx <= num_real_atoms_before):
@@ -1461,6 +1467,7 @@ class MoleculeDesign(BaseTrajectory):
             instance.infeasibility_flag = False
             instance.current_action_level = 0 # Start at Level 0
             instance.history = []
+            instance.num_high_level_actions = 0
             instance.l0_selected_atom_idx = None
             instance.l1_action_type = None
             instance.l1_new_atom_type = None

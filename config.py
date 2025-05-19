@@ -61,9 +61,9 @@ class MoleculeConfig:
         # Reduce to 25 for solvent design tasks (IBA, DMBA_TMB)
         self.max_num_atoms = 25
 
-        self.max_high_level_actions = 50
+        self.max_high_level_actions = 100
 
-        self.high_level_action_penalty_factor = 0.01
+        self.high_level_action_penalty_factor = 0
 
         # self.start_from_c_chains = True
         self.start_from_c_chains = False
@@ -140,7 +140,7 @@ class MoleculeConfig:
             "replan_steps": 12,
             # "replan_steps": 24,
             "num_rounds": 1,  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
-            "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.z
+            "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.
             "nucleus_top_p": 1.,
             "pin_workers_to_core": False
         }

@@ -20,7 +20,9 @@ import numpy as np
 import core.stochastic_beam_search as sbs
 from typing import Callable, List, Optional, Tuple, NoReturn
 
-sys.setrecursionlimit(10000)
+# sys.setrecursionlimit(10000)
+sys.setrecursionlimit(50000)
+
 
 def log_subtract(x: float, y: float) -> float:
     """Returns log(exp(x) - exp(y)), or negative infinity if x <= y."""

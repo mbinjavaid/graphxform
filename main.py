@@ -94,7 +94,6 @@ def train_for_one_epoch(epoch: int,
              print("  All time best mol obj: N/A (empty dict)")
     else: print("  All time best mol obj: N/A (no data or wrong format)")
 
-
     if torch.cuda.is_available(): torch.cuda.empty_cache()
     time.sleep(1) # Keep short delay
     # --- End Generation Step ---
@@ -174,11 +173,6 @@ def train_for_one_epoch(epoch: int,
     # print(f"Unfrozen layers for training: {unfrozen_layers}")
     # if not unfrozen_layers:
     #     print("CRITICAL WARNING: No layers were unfrozen! Check layer names and model structure.")
-
-
-
-
-
 
     # added for AMP
     use_amp_here = (amp_enabled and scaler is not None and config.training_device != "cpu")

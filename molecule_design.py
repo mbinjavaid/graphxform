@@ -185,6 +185,40 @@ class MoleculeDesign(BaseTrajectory):
         # Initialize mask
         self.update_action_mask()
 
+        self._recreate_rdkit_mol_from_state()
+
+    # In your MoleculeDesign class
+    def _recreate_rdkit_mol_from_state(self):
+        """
+        Recreates self.rdkit_mol from the current self.atoms and self.bonds
+        using the existing self.to_rdkit_mol() method.
+        Stores an unsanitized version. Final sanitization happens in finalize().
+        """
+        if self.infeasibility_flag:
+            # If already marked infeasible, don't try to create an RDKit mol,
+            # or ensure it's None.
+            self.rdkit_mol = None
+            return
+
+        try:
+            # Use sanitize=False here, as finalize() will handle the definitive sanitization.
+            # This makes recreation faster.
+            self.rdkit_mol = self.to_rdkit_mol(sanitize=False)
+            if self.rdkit_mol is None and (len(self.atoms) - 1) > 0:
+                # to_rdkit_mol returning None for a non-empty molecule means something went wrong
+                # print("Warning: _recreate_rdkit_mol_from_state: to_rdkit_mol returned None for non-empty atoms.") # Optional debug
+                self.infeasibility_flag = True  # If creation fails for non-empty, mark infeasible
+                self.rdkit_mol = None
+            elif self.rdkit_mol is not None and self.rdkit_mol.GetNumAtoms() == 0 and (len(self.atoms) - 1) > 0:
+                # print("Warning: _recreate_rdkit_mol_from_state: to_rdkit_mol returned empty RDKit mol for non-empty atoms.") # Optional debug
+                self.infeasibility_flag = True  # If creation results in empty for non-empty, mark infeasible
+                self.rdkit_mol = None
+
+        except Exception as e:
+            # print(f"Warning: Error during _recreate_rdkit_mol_from_state using to_rdkit_mol: {e}") # Optional debug
+            self.infeasibility_flag = True  # Mark as infeasible if RDKit creation fails
+            self.rdkit_mol = None
+
     def _check_connectivity_after_simulated_removal(self,
                                 action_type: str,
                                 atom_idx_to_remove: Optional[int] = None,
@@ -275,7 +309,7 @@ class MoleculeDesign(BaseTrajectory):
             return smiles
         except Exception as e:
             # Catch errors during RDKit mol creation or SMILES generation
-            # print(f"DEBUG: _get_smiles_for_check - Exception during mol/SMILES gen: {e}") # Optional Debug
+            print(f"DEBUG: _get_smiles_for_check - Exception during mol/SMILES gen: {e}") # Optional Debug
             return None
 
     def _get_current_valence_usage(self, atom_internal_idx: Optional[int] = None) -> np.array:
@@ -533,7 +567,7 @@ class MoleculeDesign(BaseTrajectory):
                     # External check (is_terminable) should happen before calling take_action(0)
                     self.synthesis_done = True
                     # User change kept: assert_feasible=True
-                    self.finalize(assert_feasible=True)  # Final sanitization happens here
+                    self.finalize(assert_feasible=False)  # Final sanitization happens here
                     next_level = -1  # special level indicating termination
                 else:  # Select Atom (action = 1 to N)
                     selected_internal_idx = action
@@ -723,18 +757,26 @@ class MoleculeDesign(BaseTrajectory):
                 # Action was Terminate, clear mask
                 self.current_action_mask = None
 
+            # If a high-level action completed (returned to L0) and no infeasibility was flagged by the action itself:
+            if self.current_action_level == 0 and not self.infeasibility_flag and not self.synthesis_done:
+                self._recreate_rdkit_mol_from_state()
+                if self.infeasibility_flag:  # If _recreate_rdkit_mol_from_state itself found an issue
+                    self.current_action_mask = None  # Prevent further actions
+
         # --- Exception Handling ---
         except (ValueError, IndexError) as e:
             # Errors related to invalid action indices, masking logic, array bounds
             self.infeasibility_flag = True  # Mark state as infeasible
             self.current_action_mask = None  # Prevent further actions
+            self.rdkit_mol = None
             # Re-raise to signal sequence failure (User change kept: ValueError)
             raise ValueError(f"Masking/Action logic error at L{current_level}, action {action}: {e}") from e
         except RuntimeError as e:
             # Catch specific RuntimeErrors (e.g., from OUR sanitization checks, though now only in finalize)
             # Infeasibility flag should already be set if raised internally by us
-            if not self.infeasibility_flag: self.infeasibility_flag = True
+            self.infeasibility_flag = True
             self.current_action_mask = None
+            self.rdkit_mol = None
             # Re-raise the original RuntimeError
             raise e
         except Exception as e:
@@ -742,19 +784,22 @@ class MoleculeDesign(BaseTrajectory):
             # print(f"CRITICAL: Unexpected error in take_action(action={action}, L{current_level}): {e}") # Optional Debug
             self.infeasibility_flag = True
             self.current_action_mask = None
+            self.rdkit_mol = None
             # Re-raise as ValueError to ensure generate_single_transformation catches it (User change kept: ValueError)
             raise ValueError(f"Unexpected error during action execution: {e}") from e
 
     def finalize(self, assert_feasible: bool = False):
         """Finalize molecule design: build RDKit mol, sanitize, cache SMILES."""
         # Avoid re-finalizing
-        if self.smiles_string is not None or self.rdkit_mol is not None: return
+        # if self.smiles_string is not None or self.rdkit_mol is not None:
+        if self.smiles_string is not None:
+            return
 
         # Optional feasibility assertion
         if assert_feasible:
             try: self.assert_feasible()
             except AssertionError as e:
-                print(f"Warning: Feasibility assertion failed during finalize: {e}"); self.infeasibility_flag = True
+                # print(f"Warning: Feasibility assertion failed during finalize: {e}"); self.infeasibility_flag = True
                 raise RuntimeError("Feasibility assertion failed during finalize.") from e
 
         num_real_atoms = len(self.atoms) - 1
@@ -765,48 +810,68 @@ class MoleculeDesign(BaseTrajectory):
         #     raise ValueError("Final molecule is disconnected.")  # indicate disconnectedness, should not happen
 
         # Attempt to generate RDKit Mol and SMILES only if not already flagged infeasible
-        rdkit_mol = None
+        # rdkit_mol = None
         if not self.infeasibility_flag:
             try:
-                # 1. Generate RDKit Mol (unsanitized first)
-                rdkit_mol = self.to_rdkit_mol(sanitize=False)
+                mol_to_process = None
+                if self.rdkit_mol is not None:
+                    # Use a copy of the cached RDKit mol for sanitization
+                    mol_to_process = copy.deepcopy(self.rdkit_mol)
+                else:
+                    # If no cached RDKit mol, try to generate one now
+                    # This might happen if an action failed subtly before _recreate_rdkit_mol_from_state
+                    # or if finalize is called before any high-level action (e.g. on initial state).
+                    # print("Debug: finalize() creating RDKit mol because self.rdkit_mol was None.") # Optional debug
+                    mol_to_process = self.to_rdkit_mol(sanitize=False)
 
-                # Check if mol creation failed or resulted in empty mol unexpectedly
-                if rdkit_mol is None or (rdkit_mol.GetNumAtoms() == 0 and num_real_atoms > 0):
-                    print("Warning: RDKit mol creation failed or empty despite internal atoms."); self.infeasibility_flag = True
-                elif rdkit_mol.GetNumAtoms() > 0:
-                    # 2. Attempt Sanitization and SMILES generation
+                if mol_to_process is None or (mol_to_process.GetNumAtoms() == 0 and num_real_atoms > 0):
+                    if num_real_atoms > 0:  # Only warn if NumPy state expected atoms
+                        # print("Warning: RDKit mol for finalize is None or empty despite internal atoms."); # Optional debug
+                        self.infeasibility_flag = True
+                    self.smiles_string = None
+                    self.rdkit_mol = None  # Ensure cached mol is also None if processing failed
+                    if num_real_atoms == 0 and (mol_to_process is None or mol_to_process.GetNumAtoms() == 0):
+                        self.smiles_string = ""
+                        self.rdkit_mol = mol_to_process  # Cache the empty mol
+
+                elif mol_to_process.GetNumAtoms() > 0:
                     try:
-                        self.rdkit_mol = copy.deepcopy(rdkit_mol) # Cache unsanitized version first
-                        # Attempt sanitization
-                        sanitize_status = Chem.SanitizeMol(rdkit_mol, catchErrors=True)
+                        # Attempt sanitization on the copy or newly generated mol
+                        sanitize_status = Chem.SanitizeMol(mol_to_process, catchErrors=True)
                         if sanitize_status != Chem.SanitizeFlags.SANITIZE_NONE:
-                             # print(f"Warning: Final sanitization failed with status {sanitize_status}.")
-                             self.smiles_string = None # Ensure SMILES is None if sanitize fails
-                             # Keep the unsanitized mol in cache?
-                             self.rdkit_mol = None
-                             self.infeasibility_flag = True # Optionally mark sanitize failure as infeasible
+                            # print(f"Warning: Final sanitization failed with status {sanitize_status}.") # Optional debug
+                            self.smiles_string = None
+                            self.infeasibility_flag = True
+                            # Keep self.rdkit_mol as its last successfully recreated (unsanitized) state,
+                            # or None if recreation failed. Don't nullify it here unless mol_to_process was from self.rdkit_mol.
+                            # If mol_to_process was from self.to_rdkit_mol(), then self.rdkit_mol might still be valid from a previous step.
+                            # To be safe, if sanitization fails, the canonical SMILES is None.
+                            # The cached self.rdkit_mol remains the last "good" unsanitized version.
                         else:
-                             # Sanitization succeeded, update cache and get SMILES
-                             self.rdkit_mol = rdkit_mol # Overwrite cache with sanitized version
-                             self.smiles_string = Chem.MolToSmiles(rdkit_mol, canonical=True)
-                    except Exception as e:
-                        # Catch errors during SanitizeMol or MolToSmiles
-                        print(f"Warning: Final sanitization/SMILES generation failed: {e}.")
+                            # Sanitization succeeded.
+                            self.smiles_string = Chem.MolToSmiles(mol_to_process, canonical=True)
+                            # Optionally, update self.rdkit_mol to the sanitized version.
+                            # This makes self.rdkit_mol always the latest *sanitized successfully finalized* version.
+                            # Or, keep self.rdkit_mol as the latest unsanitized version from _recreate.
+                            # Let's choose to update self.rdkit_mol to the sanitized one if successful:
+                            self.rdkit_mol = mol_to_process
+                    except Exception as e_sanitize:
+                        # print(f"Warning: Final sanitization/SMILES generation failed: {e_sanitize}.") # Optional debug
                         self.smiles_string = None
-                        # If SMILES failed, likely infeasible
-                        if self.rdkit_mol is None: self.infeasibility_flag = True
-                else: # 0 real atoms resulted in 0 RDKit atoms
-                    # self._cached_smiles = "" # Empty SMILES for empty molecule
-                    # self._cached_rdkit_mol = rdkit_mol # Cache the empty mol
-                    raise ValueError("Empty RDKit mol with >0 real atoms.") # Raise to indicate failure
-            except Exception as e:
-                 # Catch errors during rdkit_mol itself
-                 print(f"Warning: Error during RDKit mol generation in finalize: {e}")
-                 self.infeasibility_flag = True; self.smiles_string = None; self.rdkit_mol = None
-        else:
-            # If already infeasible, ensure caches are None
-            self.smiles_string = None; self.rdkit_mol = None
+                        self.infeasibility_flag = True
+                else:  # 0 real atoms resulted in 0 RDKit atoms in mol_to_process
+                    self.smiles_string = ""
+                    self.rdkit_mol = mol_to_process  # Cache the empty mol (if not already None)
+
+            except Exception as e_finalize_logic:
+                # print(f"Warning: Error during RDKit mol processing in finalize: {e_finalize_logic}") # Optional debug
+                self.infeasibility_flag = True;
+                self.smiles_string = None;
+                self.rdkit_mol = None
+        else:  # self.infeasibility_flag was already True
+            self.smiles_string = None
+            # self.rdkit_mol might still hold the RDKit object from the point before infeasibility was triggered.
+            # Or it could be None if _recreate failed. Let it be.
 
         # Mark synthesis as done regardless of success/failure of finalization steps
         self.synthesis_done = True
@@ -948,7 +1013,7 @@ class MoleculeDesign(BaseTrajectory):
                  # Ensure sanitization before generating SMILES if not guaranteed by finalize
                  sanitize_status = Chem.SanitizeMol(mol_to_use, catchErrors=True)
                  if sanitize_status != Chem.SanitizeFlags.SANITIZE_NONE:
-                      print(f"Warning: Sanitization failed during to_smiles call (status {sanitize_status}).")
+                      # print(f"Warning: Sanitization failed during to_smiles call (status {sanitize_status}).")
                       return None # Cannot generate valid SMILES
 
                  smiles = Chem.MolToSmiles(mol_to_use, canonical=canonical)
@@ -1476,94 +1541,18 @@ class MoleculeDesign(BaseTrajectory):
 
             # Update initial mask based on the loaded state
             instance.update_action_mask()
-        except Exception as e:
+
+            # Populate the instance's RDKit mol cache based on its new NumPy state
+            instance._recreate_rdkit_mol_from_state()
+            if instance.infeasibility_flag:
+                # This implies the loaded SMILES/Mol led to an invalid NumPy state
+                # that couldn't be converted back to a valid RDKit Mol by _recreate.
+                raise ValueError(
+                    f"Failed to create a consistent RDKit mol in instance after loading from SMILES/Mol '{smiles or ''}'. Check vocabulary and input structure.")
+
+        except Exception as e_from_rdkit:  # This is the outer try-except in from_rdkit_mol
             # Catch errors during instance creation or state setting
-            raise ValueError(f"Error creating/setting MoleculeDesign state from RDKit Mol for {smiles or ''}: {e}") from e
+            raise ValueError(
+                f"Error creating/setting MoleculeDesign state from RDKit Mol for {smiles or ''}: {e_from_rdkit}") from e_from_rdkit
 
-        # Return the initialized instance and the RDKit-to-internal index map
         return instance, rdkit_to_internal_map
-
-
-# if __name__ == "__main__":
-#     import pickle
-#     import torch
-#     import numpy as np
-#     from typing import List, Dict # Make sure these are imported at the top of the file too
-#
-#     # --- Configuration ---
-#     SAMPLE_DATA_PATH = "data/chembl/transformation_datasets/transformations_train.pkl"
-#     NUM_SAMPLES_TO_TEST = 3 # Load this many samples
-#     DEVICE = torch.device("cpu") # Use CPU for easier inspection
-#
-#     print(f"--- Testing list_to_batch with {NUM_SAMPLES_TO_TEST} samples from {SAMPLE_DATA_PATH} ---")
-#
-#     # --- Load Data ---
-#     try:
-#         with open(SAMPLE_DATA_PATH, 'rb') as f:
-#             loaded_data = pickle.load(f)
-#         print(f"Successfully loaded data. Total samples: {len(loaded_data)}")
-#         if len(loaded_data) < NUM_SAMPLES_TO_TEST:
-#             print(f"Warning: Requested {NUM_SAMPLES_TO_TEST} samples, but only {len(loaded_data)} available.")
-#             NUM_SAMPLES_TO_TEST = len(loaded_data)
-#         samples_to_test = loaded_data[:NUM_SAMPLES_TO_TEST]
-#     except FileNotFoundError:
-#         print(f"Error: Sample data file not found at {SAMPLE_DATA_PATH}")
-#         print("Please ensure the path is correct and the file exists.")
-#         exit()
-#     except Exception as e:
-#         print(f"Error loading or processing data: {e}")
-#         exit()
-#
-#     if not samples_to_test:
-#         print("No samples loaded, exiting.")
-#         exit()
-#
-#     # --- Call list_to_batch ---
-#     try:
-#         print(f"\nCalling MoleculeDesign.list_to_batch with {len(samples_to_test)} samples...")
-#         # Assuming MoleculeDesign class is defined above in the same file
-#         batch_dict = MoleculeDesign.list_to_batch(samples_to_test, device=DEVICE)
-#         print("list_to_batch executed successfully.")
-#     except Exception as e:
-#         print(f"\nError during MoleculeDesign.list_to_batch execution: {e}")
-#         import traceback
-#         traceback.print_exc() # Print detailed traceback
-#         exit()
-#
-#     # --- Inspect Output ---
-#     print("\n--- Batch Dictionary Contents ---")
-#     for key, tensor in batch_dict.items():
-#         print(f"\nKey: '{key}'")
-#         if isinstance(tensor, torch.Tensor):
-#             print(f"  Shape: {tensor.shape}")
-#             print(f"  Dtype: {tensor.dtype}")
-#             print(f"  Device: {tensor.device}")
-#             # Print values (convert to numpy for easier display if on CPU)
-#             try:
-#                 # Limit printing for large tensors if needed
-#                 if tensor.numel() > 1000: # Example limit
-#                      print(f"  Values (first 10 elements): {tensor.flatten()[:10].cpu().numpy()}")
-#                 else:
-#                      print(f"  Values:\n{tensor.cpu().numpy()}")
-#             except Exception as e:
-#                 print(f"  Error converting tensor to numpy or printing: {e}")
-#                 print(f"  Tensor: {tensor}") # Print tensor directly as fallback
-#         else:
-#             print(f"  Type: {type(tensor)}")
-#             print(f"  Value: {tensor}")
-#         print("-" * 20)
-#
-#     print("\n--- End of Test ---")
-#
-#     # --- Optional: Add specific checks here ---
-#     # Example: Check if padding values are correct in batch_atoms
-#     # first_mol = samples_to_test[0]['molecule']
-#     # atoms_padding_idx = first_mol.vocab_size + 1
-#     # num_atoms_sample0 = len(first_mol.atoms)
-#     # batch_max_atoms = batch_dict['atoms'].shape[1]
-#     # if num_atoms_sample0 < batch_max_atoms:
-#     #     padding_part = batch_dict['atoms'][0, num_atoms_sample0:].cpu().numpy()
-#     #     if np.all(padding_part == atoms_padding_idx):
-#     #         print("\nCheck PASSED: batch_atoms padding value seems correct for sample 0.")
-#     #     else:
-#     #         print(f"\nCheck FAILED: batch_atoms padding incorrect for sample 0. Expected {atoms_padding_idx}, got {padding_part}")
